@@ -35,21 +35,7 @@ fn panic(_info: &PanicInfo) -> ! {
     exit(1);
 }
 
-// Required by alloc crate for exception handling (unused with panic=abort)
-#[no_mangle]
-extern "C" fn rust_eh_personality() {}
-
 // Compiler intrinsics (memcpy, memset)
-#[no_mangle]
-pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
-    let mut i = 0;
-    while i < n {
-        *dest.add(i) = *src.add(i);
-        i += 1;
-    }
-    dest
-}
-
 #[no_mangle]
 pub unsafe extern "C" fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
     let mut i = 0;
@@ -59,6 +45,10 @@ pub unsafe extern "C" fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
     }
     s
 }
+
+// glibc expects this symbol when linking without crt1.o/_start.
+#[no_mangle]
+pub static _IO_stdin_used: i32 = 0x20001;
 
 #[no_mangle]
 pub unsafe extern "C" fn memcmp(s1: *const u8, s2: *const u8, n: usize) -> i32 {
@@ -342,28 +332,6 @@ fn execve(filename: *const u8, argv: *const *const u8, envp: *const *const u8) -
 // String utilities
 fn print(s: &[u8]) {
     write(STDOUT, s);
-}
-
-fn print_number(mut n: usize) {
-    let mut buf = [0u8; 20]; // Enough for 64-bit numbers
-    let mut i = 0;
-
-    if n == 0 {
-        write(STDOUT, b"0");
-        return;
-    }
-
-    while n > 0 {
-        buf[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-        i += 1;
-    }
-
-    // Print in reverse order
-    while i > 0 {
-        i -= 1;
-        write(STDOUT, &buf[i..i+1]);
-    }
 }
 
 fn str_eq(a: &[u8], b: &[u8]) -> bool {

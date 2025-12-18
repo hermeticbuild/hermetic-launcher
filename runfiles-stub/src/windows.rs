@@ -38,10 +38,6 @@ fn panic(_info: &PanicInfo) -> ! {
     unsafe { ExitProcess(1) }
 }
 
-// Required by alloc crate for exception handling (unused with panic=abort)
-#[no_mangle]
-extern "C" fn rust_eh_personality() {}
-
 // Windows API types
 type DWORD = u32;
 type BOOL = i32;
@@ -134,7 +130,6 @@ extern "system" {
     fn GetCommandLineW() -> *const u16;
     fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: DWORD) -> DWORD;
     fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *mut DWORD) -> BOOL;
-    fn GetLastError() -> DWORD;
 }
 
 // We don't use CommandLineToArgvW to avoid shell32.dll dependency
@@ -551,7 +546,6 @@ impl Runfiles {
 // Environment building for export mode
 // Windows environments can be large (32KB+), use 128KB to be safe
 const MAX_ENV_SIZE: usize = 131072;
-const MAX_ENV_VARS: usize = 256;
 
 // External Windows API function for environment access
 extern "system" {
@@ -957,34 +951,6 @@ fn strlen(s: &[u8]) -> usize {
         len += 1;
     }
     len
-}
-
-// Get the length of a null-terminated wide string
-fn wstrlen(s: *const u16) -> usize {
-    let mut len = 0;
-    unsafe {
-        while *s.add(len) != 0 {
-            len += 1;
-        }
-    }
-    len
-}
-
-// Convert UTF-8 to UTF-16 (simplified, ASCII-compatible only)
-fn utf8_to_wide(utf8: &[u8], out: &mut [u16]) -> usize {
-    let mut out_len = 0;
-    for i in 0..utf8.len() {
-        if out_len >= out.len() {
-            break;
-        }
-        if utf8[i] == 0 {
-            break;
-        }
-        // Simple conversion: assume ASCII range
-        out[out_len] = utf8[i] as u16;
-        out_len += 1;
-    }
-    out_len
 }
 
 // Check if placeholder is still in template state

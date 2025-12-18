@@ -4,11 +4,6 @@ finalize-stub/target/
 integration-tests/target/
 tools/create-release-archive/target/
 
-# Cargo.lock for binary crates (libraries should track this)
-runfiles-stub/Cargo.lock
-finalize-stub/Cargo.lock
-integration-tests/Cargo.lock
-
 # Cargo credentials (but keep config.toml)
 .cargo/credentials
 .cargo/credentials.toml
