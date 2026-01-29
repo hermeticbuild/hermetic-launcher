@@ -18,8 +18,17 @@ extern "C" {
     fn access(path: *const u8, mode: i32) -> i32;
     fn execve(path: *const u8, argv: *const *const u8, envp: *const *const u8) -> i32;
 
+    // Access to errno - macOS provides this via __error()
+    // Returns a pointer to the thread-local errno variable
+    fn __error() -> *mut i32;
+
     // Access to environment - macOS provides this
     static mut environ: *const *const u8;
+}
+
+// Get the current errno value
+fn get_errno() -> i32 {
+    unsafe { *__error() }
 }
 
 // Check if a path exists using access() with F_OK
@@ -819,15 +828,14 @@ pub extern "C" fn main(runtime_argc: i32, runtime_argv: *const *const u8) -> ! {
         let ret = execve(executable, resolved_ptrs.as_ptr(), envp);
 
         // If execve returns, it failed
-        print(b"ERROR: execve failed with code ");
-        let digit = if ret < 0 {
-            print(b"-");
-            (-ret) as u8 + b'0'
-        } else {
-            ret as u8 + b'0'
-        };
-        print(&[digit]);
-        print(b"\n");
+        // On macOS, libc's execve() returns -1 on failure and sets errno
+        // We need to read errno to get the actual error code
+        let errno = get_errno();
+        print(b"ERROR: execve failed with errno ");
+        print_number(errno as usize);
+        print(b" (return code ");
+        print_number((-ret) as usize);
+        print(b")\n");
         exit(1);
     }
 }
