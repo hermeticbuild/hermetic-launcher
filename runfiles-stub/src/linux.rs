@@ -1,9 +1,43 @@
+extern crate alloc;
+
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::alloc::{GlobalAlloc, Layout};
+use core::cell::UnsafeCell;
 use core::panic::PanicInfo;
+use talc::{ClaimOnOom, Span, Talc};
+
+// Global allocator using talc with a static memory arena
+// 8 MiB should be plenty for manifest parsing, path resolution, and environment handling
+static mut ARENA: [u8; 8 * 1024 * 1024] = [0; 8 * 1024 * 1024];
+
+// Simple wrapper for single-threaded use (no locking needed)
+struct TalcAllocator(UnsafeCell<Talc<ClaimOnOom>>);
+unsafe impl Sync for TalcAllocator {}
+
+unsafe impl GlobalAlloc for TalcAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        (*self.0.get()).malloc(layout).map_or(core::ptr::null_mut(), |p| p.as_ptr())
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        (*self.0.get()).free(core::ptr::NonNull::new_unchecked(ptr), layout);
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: TalcAllocator = TalcAllocator(UnsafeCell::new(Talc::new(unsafe {
+    ClaimOnOom::new(Span::from_array(core::ptr::addr_of!(ARENA).cast_mut()))
+})));
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     exit(1);
 }
+
+// Required by alloc crate for exception handling (unused with panic=abort)
+#[no_mangle]
+extern "C" fn rust_eh_personality() {}
 
 // Compiler intrinsics (memcpy, memset)
 #[no_mangle]
@@ -360,26 +394,30 @@ fn find_byte(haystack: &[u8], needle: u8) -> Option<usize> {
     None
 }
 
-// Static buffer for reading environment during initialization
-// Using a static buffer here to avoid stack overflow from large stack allocation
-static mut GET_ENV_BUF: [u8; MAX_ENV_SIZE] = [0; MAX_ENV_SIZE];
-
-// Environment variable reading
-fn get_env_var(name: &[u8], buf: &mut [u8]) -> Option<usize> {
-    let environ_buf = unsafe { &mut GET_ENV_BUF };
+// Environment variable reading - returns the value as a String
+// Returns None if the variable doesn't exist or isn't valid UTF-8
+fn get_env_var(name: &[u8]) -> Option<String> {
     let fd = open(b"/proc/self/environ\0");
     if fd < 0 {
         return None;
     }
 
-    let bytes_read = read(fd, environ_buf);
+    // Read environment into Vec
+    let mut environ_data = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let bytes_read = read(fd, &mut chunk);
+        if bytes_read <= 0 {
+            break;
+        }
+        environ_data.extend_from_slice(&chunk[..bytes_read as usize]);
+    }
     close(fd);
 
-    if bytes_read <= 0 {
+    if environ_data.is_empty() {
         return None;
     }
 
-    let environ_data = &environ_buf[..bytes_read as usize];
     let mut pos = 0;
 
     while pos < environ_data.len() {
@@ -394,9 +432,8 @@ fn get_env_var(name: &[u8], buf: &mut [u8]) -> Option<usize> {
             let value = &entry[eq_pos + 1..];
 
             if str_eq(key, name) {
-                let copy_len = value.len().min(buf.len());
-                buf[..copy_len].copy_from_slice(&value[..copy_len]);
-                return Some(copy_len);
+                // Convert to String, returning None if not valid UTF-8
+                return String::from_utf8(value.to_vec()).ok();
             }
         }
 
@@ -406,59 +443,32 @@ fn get_env_var(name: &[u8], buf: &mut [u8]) -> Option<usize> {
     None
 }
 
-// Manifest entry storage (simplified - using static arrays)
-const MAX_ENTRIES: usize = 1024;
-const MAX_PATH_LEN: usize = 256;
-
+// Manifest entry using String for UTF-8 paths
 struct ManifestEntry {
-    key: [u8; MAX_PATH_LEN],
-    key_len: usize,
-    value: [u8; MAX_PATH_LEN],
-    value_len: usize,
+    key: String,
+    value: String,
 }
 
 struct Manifest {
-    entries: [ManifestEntry; MAX_ENTRIES],
-    count: usize,
+    entries: Vec<ManifestEntry>,
 }
 
 impl Manifest {
     fn new() -> Self {
-        const EMPTY_ENTRY: ManifestEntry = ManifestEntry {
-            key: [0; MAX_PATH_LEN],
-            key_len: 0,
-            value: [0; MAX_PATH_LEN],
-            value_len: 0,
-        };
-
-        Self {
-            entries: [EMPTY_ENTRY; MAX_ENTRIES],
-            count: 0,
-        }
+        Self { entries: Vec::new() }
     }
 
-    fn add_entry(&mut self, key: &[u8], value: &[u8]) {
-        if self.count >= MAX_ENTRIES {
-            return;
-        }
-
-        let entry = &mut self.entries[self.count];
-        let key_len = key.len().min(MAX_PATH_LEN);
-        let value_len = value.len().min(MAX_PATH_LEN);
-
-        entry.key[..key_len].copy_from_slice(&key[..key_len]);
-        entry.key_len = key_len;
-        entry.value[..value_len].copy_from_slice(&value[..value_len]);
-        entry.value_len = value_len;
-
-        self.count += 1;
+    fn add_entry(&mut self, key: &str, value: &str) {
+        self.entries.push(ManifestEntry {
+            key: String::from(key),
+            value: String::from(value),
+        });
     }
 
-    fn lookup(&self, key: &[u8]) -> Option<&[u8]> {
-        for i in 0..self.count {
-            let entry = &self.entries[i];
-            if str_eq(&entry.key[..entry.key_len], key) {
-                return Some(&entry.value[..entry.value_len]);
+    fn lookup(&self, key: &str) -> Option<&str> {
+        for entry in &self.entries {
+            if entry.key == key {
+                return Some(&entry.value);
             }
         }
         None
@@ -472,65 +482,62 @@ fn load_manifest(path: &[u8]) -> Option<Manifest> {
         return None;
     }
 
-    let mut file_buf = [0u8; 65536];
-    let bytes_read = read(fd, &mut file_buf);
+    // Read file into Vec, reading in chunks
+    let mut file_data = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let bytes_read = read(fd, &mut chunk);
+        if bytes_read <= 0 {
+            break;
+        }
+        file_data.extend_from_slice(&chunk[..bytes_read as usize]);
+    }
     close(fd);
 
-    if bytes_read <= 0 {
+    if file_data.is_empty() {
         return None;
     }
 
+    // Convert to UTF-8 string for easier parsing
+    let file_str = String::from_utf8(file_data).ok()?;
+
     let mut manifest = Manifest::new();
-    let data = &file_buf[..bytes_read as usize];
-    let mut pos = 0;
 
-    while pos < data.len() {
-        let line_start = pos;
-        while pos < data.len() && data[pos] != b'\n' {
-            pos += 1;
-        }
-
-        let line = &data[line_start..pos];
-
-        if let Some(space_pos) = find_byte(line, b' ') {
-            let key = &line[..space_pos];
-            let value = &line[space_pos + 1..];
+    for line in file_str.lines() {
+        if let Some((key, value)) = line.split_once(' ') {
             manifest.add_entry(key, value);
         }
-
-        pos += 1;
     }
 
     Some(manifest)
 }
 
-// Runfiles implementation
+// Runfiles implementation using String for UTF-8 paths
 enum RunfilesMode {
     ManifestBased(Manifest),
-    DirectoryBased([u8; MAX_PATH_LEN], usize),
+    DirectoryBased(String),
 }
 
 struct Runfiles {
     mode: RunfilesMode,
     // Paths for environment variables (when export_runfiles_env is true)
-    manifest_path: Option<([u8; MAX_PATH_LEN], usize)>, // RUNFILES_MANIFEST_FILE
-    dir_path: Option<([u8; MAX_PATH_LEN], usize)>,      // RUNFILES_DIR and JAVA_RUNFILES
+    manifest_path: Option<String>, // RUNFILES_MANIFEST_FILE
+    dir_path: Option<String>,      // RUNFILES_DIR and JAVA_RUNFILES
 }
 
 impl Runfiles {
     fn create(executable_path: Option<&[u8]>) -> Option<Self> {
-        let mut manifest_path = [0u8; MAX_PATH_LEN];
-
         // Try RUNFILES_MANIFEST_FILE first
-        if let Some(len) = get_env_var(b"RUNFILES_MANIFEST_FILE", &mut manifest_path) {
-            if len > 0 {
-                let mut path_with_null = [0u8; MAX_PATH_LEN + 1];
-                path_with_null[..len].copy_from_slice(&manifest_path[..len]);
+        if let Some(manifest_path) = get_env_var(b"RUNFILES_MANIFEST_FILE") {
+            if !manifest_path.is_empty() {
+                // Create null-terminated path for load_manifest
+                let mut path_with_null = Vec::from(manifest_path.as_bytes());
+                path_with_null.push(0);
 
-                if let Some(manifest) = load_manifest(&path_with_null[..len + 1]) {
+                if let Some(manifest) = load_manifest(&path_with_null) {
                     return Some(Self {
                         mode: RunfilesMode::ManifestBased(manifest),
-                        manifest_path: Some((manifest_path, len)),
+                        manifest_path: Some(manifest_path),
                         dir_path: None,
                     });
                 }
@@ -538,13 +545,12 @@ impl Runfiles {
         }
 
         // Try RUNFILES_DIR
-        let mut runfiles_dir = [0u8; MAX_PATH_LEN];
-        if let Some(len) = get_env_var(b"RUNFILES_DIR", &mut runfiles_dir) {
-            if len > 0 {
+        if let Some(runfiles_dir) = get_env_var(b"RUNFILES_DIR") {
+            if !runfiles_dir.is_empty() {
                 return Some(Self {
-                    mode: RunfilesMode::DirectoryBased(runfiles_dir, len),
+                    mode: RunfilesMode::DirectoryBased(runfiles_dir.clone()),
                     manifest_path: None,
-                    dir_path: Some((runfiles_dir, len)),
+                    dir_path: Some(runfiles_dir),
                 });
             }
         }
@@ -555,60 +561,42 @@ impl Runfiles {
         if let Some(exe_path) = executable_path {
             let exe_len = str_len(exe_path);
             if exe_len > 0 {
+                // Convert executable path to string (if valid UTF-8)
+                let exe_str = core::str::from_utf8(&exe_path[..exe_len]).ok()?;
+
                 // Try <executable>.runfiles_manifest file first
-                if exe_len + 19 < MAX_PATH_LEN {  // +19 for ".runfiles_manifest\0"
-                    let mut manifest_file_path = [0u8; MAX_PATH_LEN + 1];
+                let manifest_file_path = String::from(exe_str) + ".runfiles_manifest";
 
-                    // Copy executable path
-                    manifest_file_path[..exe_len].copy_from_slice(&exe_path[..exe_len]);
+                // Add null terminator for syscall
+                let mut manifest_path_with_null = Vec::from(manifest_file_path.as_bytes());
+                manifest_path_with_null.push(0);
 
-                    // Append ".runfiles_manifest" (18 characters)
-                    manifest_file_path[exe_len..exe_len + 18].copy_from_slice(b".runfiles_manifest");
-                    let manifest_file_len = exe_len + 18;
+                // Try to load the manifest file
+                if let Some(manifest) = load_manifest(&manifest_path_with_null) {
+                    // Also determine the runfiles directory for RUNFILES_DIR envvar
+                    let dir_path = String::from(exe_str) + ".runfiles";
 
-                    // Try to load the manifest file
-                    if let Some(manifest) = load_manifest(&manifest_file_path[..manifest_file_len + 1]) {
-                        // Also determine the runfiles directory for RUNFILES_DIR envvar
-                        // The directory is <executable>.runfiles
-                        let mut dir_path = [0u8; MAX_PATH_LEN];
-                        let dir_len = if exe_len + 9 < MAX_PATH_LEN {
-                            dir_path[..exe_len].copy_from_slice(&exe_path[..exe_len]);
-                            dir_path[exe_len..exe_len + 9].copy_from_slice(b".runfiles");
-                            exe_len + 9
-                        } else {
-                            0
-                        };
-
-                        let mut manifest_path_without_null = [0u8; MAX_PATH_LEN];
-                        manifest_path_without_null[..manifest_file_len].copy_from_slice(&manifest_file_path[..manifest_file_len]);
-
-                        return Some(Self {
-                            mode: RunfilesMode::ManifestBased(manifest),
-                            manifest_path: Some((manifest_path_without_null, manifest_file_len)),
-                            dir_path: if dir_len > 0 { Some((dir_path, dir_len)) } else { None },
-                        });
-                    }
+                    return Some(Self {
+                        mode: RunfilesMode::ManifestBased(manifest),
+                        manifest_path: Some(manifest_file_path),
+                        dir_path: Some(dir_path),
+                    });
                 }
 
                 // Try <executable>.runfiles directory
-                if exe_len + 10 < MAX_PATH_LEN {  // +10 for ".runfiles\0"
-                    let mut runfiles_dir = [0u8; MAX_PATH_LEN];
+                let runfiles_dir = String::from(exe_str) + ".runfiles";
 
-                    // Copy executable path
-                    runfiles_dir[..exe_len].copy_from_slice(&exe_path[..exe_len]);
+                // Add null terminator for path_exists syscall
+                let mut dir_with_null = Vec::from(runfiles_dir.as_bytes());
+                dir_with_null.push(0);
 
-                    // Append ".runfiles"
-                    runfiles_dir[exe_len..exe_len + 9].copy_from_slice(b".runfiles");
-                    runfiles_dir[exe_len + 9] = 0; // null terminator
-
-                    // Check if directory exists using access() syscall
-                    if path_exists(&runfiles_dir[..exe_len + 10]) {
-                        return Some(Self {
-                            mode: RunfilesMode::DirectoryBased(runfiles_dir, exe_len + 9),
-                            manifest_path: None,
-                            dir_path: Some((runfiles_dir, exe_len + 9)),
-                        });
-                    }
+                // Check if directory exists using access() syscall
+                if path_exists(&dir_with_null) {
+                    return Some(Self {
+                        mode: RunfilesMode::DirectoryBased(runfiles_dir.clone()),
+                        manifest_path: None,
+                        dir_path: Some(runfiles_dir),
+                    });
                 }
             }
         }
@@ -616,40 +604,29 @@ impl Runfiles {
         None
     }
 
-    fn rlocation(&self, path: &[u8]) -> Option<[u8; MAX_PATH_LEN]> {
+    fn rlocation(&self, path: &str) -> Option<String> {
         // If path is absolute, don't resolve through runfiles
-        if path.len() > 0 && path[0] == b'/' {
+        if path.starts_with('/') {
             return None;
         }
 
         match &self.mode {
             RunfilesMode::ManifestBased(manifest) => {
                 if let Some(resolved) = manifest.lookup(path) {
-                    let mut result = [0u8; MAX_PATH_LEN];
-                    let len = resolved.len().min(MAX_PATH_LEN);
-                    result[..len].copy_from_slice(&resolved[..len]);
-                    return Some(result);
+                    return Some(String::from(resolved));
                 }
                 None
             }
-            RunfilesMode::DirectoryBased(dir, dir_len) => {
-                let mut result = [0u8; MAX_PATH_LEN];
-                let mut pos = 0;
-
-                // Copy directory
-                let copy_len = (*dir_len).min(MAX_PATH_LEN);
-                result[..copy_len].copy_from_slice(&dir[..copy_len]);
-                pos += copy_len;
+            RunfilesMode::DirectoryBased(dir) => {
+                let mut result = dir.clone();
 
                 // Add separator if needed
-                if pos < MAX_PATH_LEN && pos > 0 && result[pos - 1] != b'/' {
-                    result[pos] = b'/';
-                    pos += 1;
+                if !result.ends_with('/') {
+                    result.push('/');
                 }
 
-                // Copy path
-                let path_len = path.len().min(MAX_PATH_LEN - pos);
-                result[pos..pos + path_len].copy_from_slice(&path[..path_len]);
+                // Append the path
+                result.push_str(path);
 
                 Some(result)
             }
@@ -730,222 +707,143 @@ fn is_template_placeholder(placeholder: &[u8]) -> bool {
     str_starts_with(placeholder, b"@@RUNFILES_")
 }
 
-// Environment variable storage
-// These limits are based on the Linux kernel's ARG_MAX and related limits for execve().
-// Linux supports up to 6 MiB total for argv + envp combined, with a 2 MiB per-string limit.
-// The actual limit is dynamic and derived from RLIMIT_STACK at execution time.
-// See: include/uapi/linux/binfmts.h in the Linux kernel source
-// Reference: https://gist.github.com/malt3/c1439aa16208a74194accb025ab1cc5b
-const MAX_ENV_SIZE: usize = 6291456;  // 6 MiB - matches Linux upper bound for total args+env
-const MAX_ENV_VARS: usize = 1024;     // Max number of environment variables
-
-static mut ENVIRON_DATA: [u8; MAX_ENV_SIZE] = [0; MAX_ENV_SIZE];
-static mut ENVIRON_PTRS: [*const u8; MAX_ENV_VARS + 1] = [core::ptr::null(); MAX_ENV_VARS + 1];
-
 // Read and parse environment variables from /proc/self/environ
-fn get_environ() -> *const *const u8 {
-    unsafe {
-        // Read environment from /proc/self/environ
-        let fd = open(b"/proc/self/environ\0");
-        if fd < 0 {
-            // If we can't read environ, return empty environment
-            ENVIRON_PTRS[0] = core::ptr::null();
-            return ENVIRON_PTRS.as_ptr();
-        }
+// Returns a tuple of (data_vec, pointers_vec) where pointers point into data_vec
+fn read_environ() -> (Vec<u8>, Vec<*const u8>) {
+    // Read environment from /proc/self/environ
+    let fd = open(b"/proc/self/environ\0");
+    if fd < 0 {
+        // If we can't read environ, return empty environment
+        return (Vec::new(), vec![core::ptr::null()]);
+    }
 
-        let bytes_read = read(fd, &mut ENVIRON_DATA);
-        close(fd);
-
+    // Read into Vec
+    let mut environ_data = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let bytes_read = read(fd, &mut chunk);
         if bytes_read <= 0 {
-            ENVIRON_PTRS[0] = core::ptr::null();
-            return ENVIRON_PTRS.as_ptr();
+            break;
+        }
+        environ_data.extend_from_slice(&chunk[..bytes_read as usize]);
+    }
+    close(fd);
+
+    if environ_data.is_empty() {
+        return (Vec::new(), vec![core::ptr::null()]);
+    }
+
+    // Parse environment variables (null-separated entries)
+    let mut env_ptrs = Vec::new();
+    let mut pos = 0;
+    let data_len = environ_data.len();
+
+    while pos < data_len {
+        // Skip empty entries
+        if environ_data[pos] == 0 {
+            pos += 1;
+            continue;
         }
 
-        // Check if environment data was truncated
-        let data_len = bytes_read as usize;
-        if data_len >= MAX_ENV_SIZE {
-            print(b"ERROR: Environment data exceeds buffer limit of ");
-            print_number(MAX_ENV_SIZE);
-            print(b" bytes\n");
-            print(b"Environment was truncated. This indicates the total environment size is too large.\n");
-            print(b"Consider reducing the number or size of environment variables.\n");
-            exit(1);
-        }
+        // Mark start of this environment variable
+        env_ptrs.push(unsafe { environ_data.as_ptr().add(pos) });
 
-        // Parse environment variables (null-separated entries)
-        let mut env_count = 0;
-        let mut pos = 0;
-
-        while pos < data_len && env_count < MAX_ENV_VARS {
-            // Skip empty entries
-            if ENVIRON_DATA[pos] == 0 {
-                pos += 1;
-                continue;
-            }
-
-            // Mark start of this environment variable
-            ENVIRON_PTRS[env_count] = ENVIRON_DATA.as_ptr().add(pos);
-            env_count += 1;
-
-            // Find the end (null byte)
-            while pos < data_len && ENVIRON_DATA[pos] != 0 {
-                pos += 1;
-            }
-
-            // Move past the null byte
+        // Find the end (null byte)
+        while pos < data_len && environ_data[pos] != 0 {
             pos += 1;
         }
 
-        // Check if we hit the max number of environment variables
-        if env_count >= MAX_ENV_VARS && pos < data_len {
-            print(b"ERROR: Number of environment variables exceeds limit of ");
-            print_number(MAX_ENV_VARS);
-            print(b"\n");
-            print(b"Consider reducing the number of environment variables.\n");
-            exit(1);
-        }
-
-        // Null-terminate the pointer array
-        ENVIRON_PTRS[env_count] = core::ptr::null();
-
-        ENVIRON_PTRS.as_ptr()
+        // Move past the null byte
+        pos += 1;
     }
+
+    // Null-terminate the pointer array
+    env_ptrs.push(core::ptr::null());
+
+    (environ_data, env_ptrs)
 }
 
 // Build modified environment with runfiles variables
-// Storage for modified environment
-static mut MODIFIED_ENV_DATA: [u8; MAX_ENV_SIZE] = [0; MAX_ENV_SIZE];
-static mut MODIFIED_ENV_PTRS: [*const u8; MAX_ENV_VARS + 1] = [core::ptr::null(); MAX_ENV_VARS + 1];
+// Returns (data_vec, pointers_vec) - caller must keep data_vec alive while pointers are used
+fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> (Vec<u8>, Vec<*const u8>) {
+    let (base_data, base_ptrs) = read_environ();
 
-fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> *const *const u8 {
-    unsafe {
-        let base_env = get_environ();
+    // If no runfiles info, just return base environment
+    let rf = match runfiles {
+        Some(r) => r,
+        None => return (base_data, base_ptrs),
+    };
 
-        // If no runfiles info, just return base environment
-        let rf = match runfiles {
-            Some(r) => r,
-            None => return base_env,
-        };
+    let mut env_data = Vec::new();
+    let mut env_ptrs = Vec::new();
 
-        let mut new_env_count = 0;
-        let mut data_pos = 0;
+    // Helper to add an environment variable to env_data and record pointer
+    let add_env_var = |data: &mut Vec<u8>, ptrs: &mut Vec<*const u8>, name: &[u8], value: &str| {
+        let start_pos = data.len();
+        data.extend_from_slice(name);
+        data.push(b'=');
+        data.extend_from_slice(value.as_bytes());
+        data.push(0); // null terminator
 
-        // Helper to add an environment variable
-        let mut add_env_var = |name: &[u8], value: &[u8]| {
-            if data_pos + name.len() + 1 + value.len() + 1 > MAX_ENV_SIZE {
-                return false; // Out of space
-            }
-            if new_env_count >= MAX_ENV_VARS {
-                return false; // Too many vars
-            }
+        // We'll fix up pointers after building the data
+        ptrs.push(start_pos as *const u8); // Temporarily store offset, fix up later
+    };
 
-            // Mark start of this var
-            MODIFIED_ENV_PTRS[new_env_count] = MODIFIED_ENV_DATA.as_ptr().add(data_pos);
-            new_env_count += 1;
-
-            // Copy name=value
-            MODIFIED_ENV_DATA[data_pos..data_pos + name.len()].copy_from_slice(name);
-            data_pos += name.len();
-            MODIFIED_ENV_DATA[data_pos] = b'=';
-            data_pos += 1;
-            MODIFIED_ENV_DATA[data_pos..data_pos + value.len()].copy_from_slice(value);
-            data_pos += value.len();
-            MODIFIED_ENV_DATA[data_pos] = 0;
-            data_pos += 1;
-
-            true
-        };
-
-        // Add runfiles environment variables first
-        if let Some((path, len)) = rf.manifest_path {
-            if !add_env_var(b"RUNFILES_MANIFEST_FILE", &path[..len]) {
-                print(b"ERROR: Failed to add RUNFILES_MANIFEST_FILE to environment\n");
-                print(b"Environment buffer limit exceeded. Total size limit: ");
-                print_number(MAX_ENV_SIZE);
-                print(b" bytes, max variables: ");
-                print_number(MAX_ENV_VARS);
-                print(b"\n");
-                exit(1);
-            }
-        }
-
-        if let Some((path, len)) = rf.dir_path {
-            if !add_env_var(b"RUNFILES_DIR", &path[..len]) {
-                print(b"ERROR: Failed to add RUNFILES_DIR to environment\n");
-                print(b"Environment buffer limit exceeded. Total size limit: ");
-                print_number(MAX_ENV_SIZE);
-                print(b" bytes, max variables: ");
-                print_number(MAX_ENV_VARS);
-                print(b"\n");
-                exit(1);
-            }
-            if !add_env_var(b"JAVA_RUNFILES", &path[..len]) {
-                print(b"ERROR: Failed to add JAVA_RUNFILES to environment\n");
-                print(b"Environment buffer limit exceeded. Total size limit: ");
-                print_number(MAX_ENV_SIZE);
-                print(b" bytes, max variables: ");
-                print_number(MAX_ENV_VARS);
-                print(b"\n");
-                exit(1);
-            }
-        }
-
-        // Copy existing environment (skip runfiles vars that we're setting)
-        let mut i = 0;
-        let mut env_dropped = false;
-        while !(*base_env.add(i)).is_null() {
-            let env_ptr = *base_env.add(i);
-            let mut env_len = 0;
-            while *env_ptr.add(env_len) != 0 {
-                env_len += 1;
-            }
-
-            let env_slice = core::slice::from_raw_parts(env_ptr, env_len);
-
-            // Skip if this is a runfiles var we're replacing
-            let is_runfiles_var = env_slice.starts_with(b"RUNFILES_MANIFEST_FILE=")
-                || env_slice.starts_with(b"RUNFILES_DIR=")
-                || env_slice.starts_with(b"JAVA_RUNFILES=");
-
-            if !is_runfiles_var {
-                if data_pos + env_len + 1 <= MAX_ENV_SIZE && new_env_count < MAX_ENV_VARS {
-                    MODIFIED_ENV_PTRS[new_env_count] = MODIFIED_ENV_DATA.as_ptr().add(data_pos);
-                    new_env_count += 1;
-
-                    MODIFIED_ENV_DATA[data_pos..data_pos + env_len].copy_from_slice(env_slice);
-                    data_pos += env_len;
-                    MODIFIED_ENV_DATA[data_pos] = 0;
-                    data_pos += 1;
-                } else {
-                    env_dropped = true;
-                }
-            }
-
-            i += 1;
-        }
-
-        // Check if any environment variables were dropped
-        if env_dropped {
-            print(b"ERROR: Failed to copy all environment variables\n");
-            print(b"Environment buffer limit exceeded. Total size limit: ");
-            print_number(MAX_ENV_SIZE);
-            print(b" bytes, max variables: ");
-            print_number(MAX_ENV_VARS);
-            print(b"\n");
-            print(b"Current usage: ");
-            print_number(data_pos);
-            print(b" bytes, ");
-            print_number(new_env_count);
-            print(b" variables\n");
-            print(b"Consider reducing the number or size of environment variables.\n");
-            exit(1);
-        }
-
-        // Null-terminate the pointer array
-        MODIFIED_ENV_PTRS[new_env_count] = core::ptr::null();
-
-        MODIFIED_ENV_PTRS.as_ptr()
+    // Add runfiles environment variables first
+    if let Some(ref path) = rf.manifest_path {
+        add_env_var(&mut env_data, &mut env_ptrs, b"RUNFILES_MANIFEST_FILE", path);
     }
+
+    if let Some(ref path) = rf.dir_path {
+        add_env_var(&mut env_data, &mut env_ptrs, b"RUNFILES_DIR", path);
+        add_env_var(&mut env_data, &mut env_ptrs, b"JAVA_RUNFILES", path);
+    }
+
+    // Copy existing environment (skip runfiles vars that we're setting)
+    // We need to iterate through the base data directly
+    let mut pos = 0;
+    while pos < base_data.len() {
+        // Skip empty entries
+        if base_data[pos] == 0 {
+            pos += 1;
+            continue;
+        }
+
+        // Find the end of this entry
+        let start = pos;
+        while pos < base_data.len() && base_data[pos] != 0 {
+            pos += 1;
+        }
+
+        let env_entry = &base_data[start..pos];
+
+        // Skip if this is a runfiles var we're replacing
+        let is_runfiles_var = env_entry.starts_with(b"RUNFILES_MANIFEST_FILE=")
+            || env_entry.starts_with(b"RUNFILES_DIR=")
+            || env_entry.starts_with(b"JAVA_RUNFILES=");
+
+        if !is_runfiles_var {
+            let start_pos = env_data.len();
+            env_data.extend_from_slice(env_entry);
+            env_data.push(0); // null terminator
+            env_ptrs.push(start_pos as *const u8); // Temporarily store offset
+        }
+
+        // Move past the null byte
+        pos += 1;
+    }
+
+    // Now fix up all the pointers to point to actual addresses in env_data
+    let base_ptr = env_data.as_ptr();
+    for ptr in env_ptrs.iter_mut() {
+        let offset = *ptr as usize;
+        *ptr = unsafe { base_ptr.add(offset) };
+    }
+
+    // Null-terminate the pointer array
+    env_ptrs.push(core::ptr::null());
+
+    (env_data, env_ptrs)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1049,7 +947,8 @@ pub extern "C" fn _start_rust(initial_sp: *const usize) -> ! {
         let executable_path = if runtime_argc > 0 {
             let argv0_ptr = *runtime_argv;
             let mut exe_len = 0;
-            while *argv0_ptr.add(exe_len) != 0 && exe_len < MAX_PATH_LEN {
+            // Safety limit of 1MB to prevent infinite loop
+            while *argv0_ptr.add(exe_len) != 0 && exe_len < 1048576 {
                 exe_len += 1;
             }
             if exe_len > 0 {
@@ -1088,10 +987,9 @@ pub extern "C" fn _start_rust(initial_sp: *const usize) -> ! {
             &ARG9_PLACEHOLDER,
         ];
 
-        // Storage for resolved paths (embedded args + runtime args)
-        let mut resolved_paths: [[u8; MAX_PATH_LEN]; 128] = [[0; MAX_PATH_LEN]; 128];
-        let mut resolved_ptrs: [*const u8; 129] = [core::ptr::null(); 129];
-        let mut total_argc = 0usize;
+        // Use Vec for dynamic path storage - no fixed size limits
+        // We store as Vec<u8> since we need null-terminated bytes for execve
+        let mut resolved_paths: Vec<Vec<u8>> = Vec::with_capacity(128);
 
         // Resolve embedded arguments
         for i in 0..argc {
@@ -1111,74 +1009,89 @@ pub extern "C" fn _start_rust(initial_sp: *const usize) -> ! {
             // Check if this argument should be transformed
             let should_transform = (transform_flags & (1 << i)) != 0;
 
-            if should_transform {
+            let resolved = if should_transform {
                 // Try to resolve through runfiles (which we know exists if we need transformation)
                 if let Some(ref rf) = runfiles {
-                    if let Some(resolved) = rf.rlocation(arg_slice) {
-                        resolved_paths[i] = resolved;
+                    // Convert argument to &str for rlocation (Bazel args are UTF-8)
+                    if let Ok(arg_str) = core::str::from_utf8(arg_slice) {
+                        if let Some(resolved_str) = rf.rlocation(arg_str) {
+                            // Convert back to bytes with null terminator
+                            let mut path = Vec::from(resolved_str.as_bytes());
+                            path.push(0);
+                            path
+                        } else {
+                            // If not found in runfiles, use the path as-is
+                            let mut path = arg_slice.to_vec();
+                            path.push(0);
+                            path
+                        }
                     } else {
-                        // If not found in runfiles, use the path as-is
-                        let copy_len = arg_len.min(MAX_PATH_LEN);
-                        resolved_paths[i][..copy_len].copy_from_slice(&arg_slice[..copy_len]);
+                        // Not valid UTF-8, use as-is
+                        let mut path = arg_slice.to_vec();
+                        path.push(0);
+                        path
                     }
                 } else {
                     // This should never happen - we checked needs_runfiles before
                     // But use path as-is for safety
-                    let copy_len = arg_len.min(MAX_PATH_LEN);
-                    resolved_paths[i][..copy_len].copy_from_slice(&arg_slice[..copy_len]);
+                    let mut path = arg_slice.to_vec();
+                    path.push(0);
+                    path
                 }
             } else {
                 // Use path as-is without transformation
-                let copy_len = arg_len.min(MAX_PATH_LEN);
-                resolved_paths[i][..copy_len].copy_from_slice(&arg_slice[..copy_len]);
-            }
+                let mut path = arg_slice.to_vec();
+                path.push(0);
+                path
+            };
 
-            resolved_ptrs[i] = resolved_paths[i].as_ptr();
+            resolved_paths.push(resolved);
         }
-        total_argc = argc;
 
         // Append runtime arguments (skip argv[0] which is the stub itself)
         if runtime_argc > 1 {
             for i in 1..runtime_argc {
-                if total_argc >= 128 {
-                    print(b"ERROR: Too many total arguments (embedded + runtime > 128)\n");
-                    exit(1);
-                }
-
                 // Get runtime argument
                 let runtime_arg_ptr = *runtime_argv.add(i);
 
-                // Find length of runtime argument
+                // Find length of runtime argument (scan until null, with safety limit)
                 let mut arg_len = 0;
-                while *runtime_arg_ptr.add(arg_len) != 0 && arg_len < MAX_PATH_LEN {
+                while *runtime_arg_ptr.add(arg_len) != 0 {
                     arg_len += 1;
+                    // Safety limit to prevent infinite loop on malformed input
+                    if arg_len > 1048576 {
+                        print(b"ERROR: Runtime argument exceeds 1MB limit\n");
+                        exit(1);
+                    }
                 }
 
-                // Copy runtime argument to resolved_paths
-                let copy_len = arg_len.min(MAX_PATH_LEN);
-                let runtime_arg_slice = core::slice::from_raw_parts(runtime_arg_ptr, copy_len);
-                resolved_paths[total_argc][..copy_len].copy_from_slice(runtime_arg_slice);
-
-                resolved_ptrs[total_argc] = resolved_paths[total_argc].as_ptr();
-                total_argc += 1;
+                // Copy runtime argument (include null terminator)
+                let runtime_arg_slice = core::slice::from_raw_parts(runtime_arg_ptr, arg_len + 1);
+                resolved_paths.push(runtime_arg_slice.to_vec());
             }
         }
 
+        // Build pointer array from the resolved paths
+        let mut resolved_ptrs: Vec<*const u8> = Vec::with_capacity(resolved_paths.len() + 1);
+        for path in &resolved_paths {
+            resolved_ptrs.push(path.as_ptr());
+        }
         // NULL-terminate the argv array
-        resolved_ptrs[total_argc] = core::ptr::null();
+        resolved_ptrs.push(core::ptr::null());
 
         // Get the executable path (first argument)
         let executable = resolved_ptrs[0];
 
         // Build environment (with runfiles vars if export_runfiles_env is true)
-        let envp = if export_runfiles_env {
+        // We need to keep the env_data alive until execve
+        let (_env_data, env_ptrs) = if export_runfiles_env {
             build_runfiles_environ(runfiles.as_ref())
         } else {
-            get_environ()
+            read_environ()
         };
 
         // Execute the target program
-        let ret = execve(executable, resolved_ptrs.as_ptr(), envp);
+        let ret = execve(executable, resolved_ptrs.as_ptr(), env_ptrs.as_ptr());
 
         // If execve returns, it failed
         print(b"ERROR: execve failed with code ");

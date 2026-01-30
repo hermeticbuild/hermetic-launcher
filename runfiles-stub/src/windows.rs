@@ -1,12 +1,46 @@
 // Windows-specific implementation using Windows API
 // Uses kernel32.dll functions
 
+extern crate alloc;
+
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::alloc::{GlobalAlloc, Layout};
+use core::cell::UnsafeCell;
 use core::panic::PanicInfo;
+use talc::{ClaimOnOom, Span, Talc};
+
+// Global allocator using talc with a static memory arena
+// 8 MiB should be plenty for manifest parsing, path resolution, and environment handling
+static mut ARENA: [u8; 8 * 1024 * 1024] = [0; 8 * 1024 * 1024];
+
+// Simple wrapper for single-threaded use (no locking needed)
+struct TalcAllocator(UnsafeCell<Talc<ClaimOnOom>>);
+unsafe impl Sync for TalcAllocator {}
+
+unsafe impl GlobalAlloc for TalcAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        (*self.0.get()).malloc(layout).map_or(core::ptr::null_mut(), |p| p.as_ptr())
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        (*self.0.get()).free(core::ptr::NonNull::new_unchecked(ptr), layout);
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: TalcAllocator = TalcAllocator(UnsafeCell::new(Talc::new(unsafe {
+    ClaimOnOom::new(Span::from_array(core::ptr::addr_of!(ARENA).cast_mut()))
+})));
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     unsafe { ExitProcess(1) }
 }
+
+// Required by alloc crate for exception handling (unused with panic=abort)
+#[no_mangle]
+extern "C" fn rust_eh_personality() {}
 
 // Windows API types
 type DWORD = u32;
@@ -248,102 +282,80 @@ fn find_byte(haystack: &[u8], needle: u8) -> Option<usize> {
     None
 }
 
-// Environment variable reading
-fn get_env_var(name: &[u8], buf: &mut [u8]) -> Option<usize> {
+// Environment variable reading - returns String
+fn get_env_var(name: &[u8]) -> Option<String> {
     unsafe {
         // Ensure name is null-terminated
-        let mut name_with_null = [0u8; 256];
-        let name_len = name.len().min(255);
-        name_with_null[..name_len].copy_from_slice(&name[..name_len]);
-        name_with_null[name_len] = 0;
+        let mut name_with_null = name.to_vec();
+        name_with_null.push(0);
 
+        // First call to get required size
         let size = GetEnvironmentVariableA(
+            name_with_null.as_ptr(),
+            core::ptr::null_mut(),
+            0,
+        );
+
+        if size == 0 {
+            return None;
+        }
+
+        // Allocate buffer and get value
+        let mut buf = vec![0u8; size as usize];
+        let actual_size = GetEnvironmentVariableA(
             name_with_null.as_ptr(),
             buf.as_mut_ptr(),
             buf.len() as DWORD,
         );
 
-        if size > 0 && size < buf.len() as DWORD {
-            Some(size as usize)
+        if actual_size > 0 && actual_size < buf.len() as DWORD {
+            buf.truncate(actual_size as usize);
+            // Convert to String, returning None if not valid UTF-8
+            String::from_utf8(buf).ok()
         } else {
             None
         }
     }
 }
 
-// Manifest entry storage - use static buffers to avoid stack overflow
-// Windows has a default 1MB stack limit, so we store large data in .bss
-const MAX_ENTRIES: usize = 256;  // Reduced from 1024 to save memory
-const MAX_PATH_LEN: usize = 512; // Increased to support longer Windows paths
-
-// Static storage for manifest data (in .bss segment, not stack)
-static mut MANIFEST_KEYS: [[u8; MAX_PATH_LEN]; MAX_ENTRIES] = [[0; MAX_PATH_LEN]; MAX_ENTRIES];
-static mut MANIFEST_VALUES: [[u8; MAX_PATH_LEN]; MAX_ENTRIES] = [[0; MAX_PATH_LEN]; MAX_ENTRIES];
-static mut MANIFEST_KEY_LENS: [usize; MAX_ENTRIES] = [0; MAX_ENTRIES];
-static mut MANIFEST_VALUE_LENS: [usize; MAX_ENTRIES] = [0; MAX_ENTRIES];
-static mut MANIFEST_COUNT: usize = 0;
-
-// Static storage for file buffer
-static mut FILE_BUF: [u8; 65536] = [0; 65536];
-
-// Static storage for resolved paths
-static mut RESOLVED_PATHS: [[u8; MAX_PATH_LEN]; 128] = [[0; MAX_PATH_LEN]; 128];
+// Manifest entry using String for UTF-8 paths (Bazel-generated)
+struct ManifestEntry {
+    key: String,
+    value: String,
+}
 
 struct Manifest {
-    // Empty struct - all data is in statics
+    entries: Vec<ManifestEntry>,
 }
 
 impl Manifest {
-    fn reset() {
-        unsafe {
-            MANIFEST_COUNT = 0;
-            // No need to zero the arrays - we track lengths
-        }
+    fn new() -> Self {
+        Self { entries: Vec::new() }
     }
 
-    fn add_entry(key: &[u8], value: &[u8]) {
-        unsafe {
-            if MANIFEST_COUNT >= MAX_ENTRIES {
-                return;
-            }
-
-            let idx = MANIFEST_COUNT;
-            let key_len = key.len().min(MAX_PATH_LEN);
-            let value_len = value.len().min(MAX_PATH_LEN);
-
-            MANIFEST_KEYS[idx][..key_len].copy_from_slice(&key[..key_len]);
-            MANIFEST_KEY_LENS[idx] = key_len;
-            MANIFEST_VALUES[idx][..value_len].copy_from_slice(&value[..value_len]);
-            MANIFEST_VALUE_LENS[idx] = value_len;
-
-            MANIFEST_COUNT += 1;
-        }
+    fn add_entry(&mut self, key: &str, value: &str) {
+        self.entries.push(ManifestEntry {
+            key: String::from(key),
+            value: String::from(value),
+        });
     }
 
-    fn lookup(key: &[u8]) -> Option<&'static [u8]> {
-        unsafe {
-            for i in 0..MANIFEST_COUNT {
-                let entry_key = &MANIFEST_KEYS[i][..MANIFEST_KEY_LENS[i]];
-                if str_eq(entry_key, key) {
-                    return Some(&MANIFEST_VALUES[i][..MANIFEST_VALUE_LENS[i]]);
-                }
+    fn lookup(&self, key: &str) -> Option<&str> {
+        for entry in &self.entries {
+            if entry.key == key {
+                return Some(&entry.value);
             }
-            None
         }
+        None
     }
 }
 
-// Load manifest file - uses static FILE_BUF to avoid stack overflow
+// Load manifest file
 fn load_manifest(path: &[u8]) -> Option<Manifest> {
     unsafe {
-        // Reset manifest state
-        Manifest::reset();
-
         // Ensure path is null-terminated
-        let mut path_with_null = [0u8; 1024];
-        let path_len = path.len().min(1023);
-        path_with_null[..path_len].copy_from_slice(&path[..path_len]);
-        path_with_null[path_len] = 0;
+        let mut path_with_null = path.to_vec();
+        path_with_null.push(0);
 
         let handle = CreateFileA(
             path_with_null.as_ptr(),
@@ -359,75 +371,71 @@ fn load_manifest(path: &[u8]) -> Option<Manifest> {
             return None;
         }
 
-        // Use static FILE_BUF instead of stack allocation
-        let mut bytes_read: DWORD = 0;
-        let success = ReadFile(
-            handle,
-            FILE_BUF.as_mut_ptr() as LPVOID,
-            FILE_BUF.len() as DWORD,
-            &mut bytes_read,
-            core::ptr::null_mut(),
-        );
+        // Read file into Vec, reading in chunks
+        let mut file_data = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let mut bytes_read: DWORD = 0;
+            let success = ReadFile(
+                handle,
+                chunk.as_mut_ptr() as LPVOID,
+                chunk.len() as DWORD,
+                &mut bytes_read,
+                core::ptr::null_mut(),
+            );
+            if success == 0 || bytes_read == 0 {
+                break;
+            }
+            file_data.extend_from_slice(&chunk[..bytes_read as usize]);
+        }
         CloseHandle(handle);
 
-        if success == 0 || bytes_read == 0 {
+        if file_data.is_empty() {
             return None;
         }
 
-        let data = &FILE_BUF[..bytes_read as usize];
-        let mut pos = 0;
+        // Convert to UTF-8 string for easier parsing
+        let file_str = String::from_utf8(file_data).ok()?;
 
-        while pos < data.len() {
-            let line_start = pos;
-            while pos < data.len() && data[pos] != b'\n' {
-                pos += 1;
+        let mut manifest = Manifest::new();
+
+        for line in file_str.lines() {
+            // lines() automatically strips \r\n endings
+            if let Some((key, value)) = line.split_once(' ') {
+                manifest.add_entry(key, value);
             }
-
-            let line = &data[line_start..pos];
-
-            if let Some(space_pos) = find_byte(line, b' ') {
-                let key = &line[..space_pos];
-                let mut value = &line[space_pos + 1..];
-
-                // Strip trailing \r if present (Windows line endings)
-                if !value.is_empty() && value[value.len() - 1] == b'\r' {
-                    value = &value[..value.len() - 1];
-                }
-
-                Manifest::add_entry(key, value);
-            }
-
-            pos += 1;
         }
 
-        Some(Manifest {})
+        Some(manifest)
     }
 }
 
-// Runfiles implementation
+// Runfiles implementation using String for dynamic path storage
 enum RunfilesMode {
     ManifestBased(Manifest),
-    DirectoryBased([u8; MAX_PATH_LEN], usize),
+    DirectoryBased(String),
 }
 
 struct Runfiles {
     mode: RunfilesMode,
     // Paths for environment variables (when export_runfiles_env is true)
-    manifest_path: Option<([u8; MAX_PATH_LEN], usize)>, // RUNFILES_MANIFEST_FILE
-    dir_path: Option<([u8; MAX_PATH_LEN], usize)>,      // RUNFILES_DIR and JAVA_RUNFILES
+    manifest_path: Option<String>, // RUNFILES_MANIFEST_FILE
+    dir_path: Option<String>,      // RUNFILES_DIR and JAVA_RUNFILES
 }
 
 impl Runfiles {
     fn create(executable_path: Option<&[u8]>) -> Option<Self> {
-        let mut manifest_path = [0u8; MAX_PATH_LEN];
-
         // Step 1: Try RUNFILES_MANIFEST_FILE envvar first
-        if let Some(len) = get_env_var(b"RUNFILES_MANIFEST_FILE", &mut manifest_path) {
-            if len > 0 {
-                if let Some(manifest) = load_manifest(&manifest_path[..len]) {
+        if let Some(manifest_path) = get_env_var(b"RUNFILES_MANIFEST_FILE") {
+            if !manifest_path.is_empty() {
+                // Create null-terminated path for load_manifest
+                let mut path_with_null = Vec::from(manifest_path.as_bytes());
+                path_with_null.push(0);
+
+                if let Some(manifest) = load_manifest(&path_with_null) {
                     return Some(Self {
                         mode: RunfilesMode::ManifestBased(manifest),
-                        manifest_path: Some((manifest_path, len)),
+                        manifest_path: Some(manifest_path),
                         dir_path: None,
                     });
                 }
@@ -435,13 +443,12 @@ impl Runfiles {
         }
 
         // Step 2: Try RUNFILES_DIR envvar
-        let mut runfiles_dir = [0u8; MAX_PATH_LEN];
-        if let Some(len) = get_env_var(b"RUNFILES_DIR", &mut runfiles_dir) {
-            if len > 0 {
+        if let Some(runfiles_dir) = get_env_var(b"RUNFILES_DIR") {
+            if !runfiles_dir.is_empty() {
                 return Some(Self {
-                    mode: RunfilesMode::DirectoryBased(runfiles_dir, len),
+                    mode: RunfilesMode::DirectoryBased(runfiles_dir.clone()),
                     manifest_path: None,
-                    dir_path: Some((runfiles_dir, len)),
+                    dir_path: Some(runfiles_dir),
                 });
             }
         }
@@ -452,74 +459,55 @@ impl Runfiles {
         if let Some(exe_path) = executable_path {
             let exe_len = strlen(exe_path);
             if exe_len > 0 {
+                // Convert executable path to string (if valid UTF-8)
+                let exe_str = core::str::from_utf8(&exe_path[..exe_len]).ok()?;
+
                 // Try <executable>.runfiles_manifest file first
-                if exe_len + 19 < MAX_PATH_LEN {  // +19 for ".runfiles_manifest\0"
-                    let mut manifest_file_path = [0u8; MAX_PATH_LEN];
+                let manifest_file_path = String::from(exe_str) + ".runfiles_manifest";
 
-                    // Copy executable path
-                    manifest_file_path[..exe_len].copy_from_slice(&exe_path[..exe_len]);
+                // Add null terminator for syscall
+                let mut manifest_path_with_null = Vec::from(manifest_file_path.as_bytes());
+                manifest_path_with_null.push(0);
 
-                    // Append ".runfiles_manifest" (18 characters)
-                    manifest_file_path[exe_len..exe_len + 18].copy_from_slice(b".runfiles_manifest");
-                    let manifest_file_len = exe_len + 18;
+                // Try to load the manifest file
+                if let Some(manifest) = load_manifest(&manifest_path_with_null) {
+                    // Also determine the runfiles directory for RUNFILES_DIR envvar
+                    // The directory is <executable>.runfiles
+                    let dir_path = String::from(exe_str) + ".runfiles";
 
-                    // Try to load the manifest file
-                    if let Some(manifest) = load_manifest(&manifest_file_path[..manifest_file_len]) {
-                        // Also determine the runfiles directory for RUNFILES_DIR envvar
-                        // The directory is <executable>.runfiles
-                        let mut dir_path = [0u8; MAX_PATH_LEN];
-                        if exe_len + 9 < MAX_PATH_LEN {
-                            dir_path[..exe_len].copy_from_slice(&exe_path[..exe_len]);
-                            dir_path[exe_len..exe_len + 9].copy_from_slice(b".runfiles");
-                            let dir_len = exe_len + 9;
-
-                            return Some(Self {
-                                mode: RunfilesMode::ManifestBased(manifest),
-                                manifest_path: Some((manifest_file_path, manifest_file_len)),
-                                dir_path: Some((dir_path, dir_len)),
-                            });
-                        } else {
-                            return Some(Self {
-                                mode: RunfilesMode::ManifestBased(manifest),
-                                manifest_path: Some((manifest_file_path, manifest_file_len)),
-                                dir_path: None,
-                            });
-                        }
-                    }
+                    return Some(Self {
+                        mode: RunfilesMode::ManifestBased(manifest),
+                        manifest_path: Some(manifest_file_path),
+                        dir_path: Some(dir_path),
+                    });
                 }
 
                 // Try <executable>.runfiles directory
-                if exe_len + 9 < MAX_PATH_LEN {  // +9 for ".runfiles\0"
-                    let mut runfiles_dir = [0u8; MAX_PATH_LEN];
+                let runfiles_dir = String::from(exe_str) + ".runfiles";
 
-                    // Copy executable path
-                    runfiles_dir[..exe_len].copy_from_slice(&exe_path[..exe_len]);
+                // Add null terminator for CreateFileA
+                let mut dir_with_null = Vec::from(runfiles_dir.as_bytes());
+                dir_with_null.push(0);
 
-                    // Append ".runfiles"
-                    runfiles_dir[exe_len..exe_len + 9].copy_from_slice(b".runfiles");
-                    runfiles_dir[exe_len + 9] = 0; // null terminator
-
-                    // Check if directory exists by trying to open it
-                    unsafe {
-                        const FILE_FLAG_BACKUP_SEMANTICS: DWORD = 0x02000000;  // Needed to open directories
-                        let handle = CreateFileA(
-                            runfiles_dir.as_ptr(),
-                            GENERIC_READ,
-                            0,
-                            core::ptr::null_mut(),
-                            OPEN_EXISTING,
-                            FILE_FLAG_BACKUP_SEMANTICS,
-                            core::ptr::null_mut(),
-                        );
-                        if handle != INVALID_HANDLE_VALUE {
-                            CloseHandle(handle);
-                            // Remove null terminator for internal storage
-                            return Some(Self {
-                                mode: RunfilesMode::DirectoryBased(runfiles_dir, exe_len + 9),
-                                manifest_path: None,
-                                dir_path: Some((runfiles_dir, exe_len + 9)),
-                            });
-                        }
+                // Check if directory exists by trying to open it
+                unsafe {
+                    const FILE_FLAG_BACKUP_SEMANTICS: DWORD = 0x02000000;  // Needed to open directories
+                    let handle = CreateFileA(
+                        dir_with_null.as_ptr(),
+                        GENERIC_READ,
+                        0,
+                        core::ptr::null_mut(),
+                        OPEN_EXISTING,
+                        FILE_FLAG_BACKUP_SEMANTICS,
+                        core::ptr::null_mut(),
+                    );
+                    if handle != INVALID_HANDLE_VALUE {
+                        CloseHandle(handle);
+                        return Some(Self {
+                            mode: RunfilesMode::DirectoryBased(runfiles_dir.clone()),
+                            manifest_path: None,
+                            dir_path: Some(runfiles_dir),
+                        });
                     }
                 }
             }
@@ -528,55 +516,33 @@ impl Runfiles {
         None
     }
 
-    fn rlocation(&self, path: &[u8], result_idx: usize) -> Option<&'static [u8]> {
+    fn rlocation(&self, path: &str) -> Option<String> {
         // If path is absolute (Windows: starts with drive letter or \\), don't resolve
-        if path.len() >= 2 && ((path[0].is_ascii_alphabetic() && path[1] == b':') || (path[0] == b'\\' && path[1] == b'\\')) {
+        let path_bytes = path.as_bytes();
+        if path_bytes.len() >= 2 && ((path_bytes[0].is_ascii_alphabetic() && path_bytes[1] == b':') || (path_bytes[0] == b'\\' && path_bytes[1] == b'\\')) {
             return None;
         }
 
         match &self.mode {
-            RunfilesMode::ManifestBased(_manifest) => {
-                // Use static lookup
-                if let Some(resolved) = Manifest::lookup(path) {
-                    unsafe {
-                        let len = resolved.len().min(MAX_PATH_LEN);
-                        // Copy path, converting forward slashes to backslashes
-                        // Manifest values may contain Unix-style paths (forward slashes)
-                        for i in 0..len {
-                            RESOLVED_PATHS[result_idx][i] = if resolved[i] == b'/' { b'\\' } else { resolved[i] };
-                        }
-                        RESOLVED_PATHS[result_idx][len] = 0; // null terminate
-                        return Some(&RESOLVED_PATHS[result_idx][..len]);
-                    }
+            RunfilesMode::ManifestBased(manifest) => {
+                if let Some(resolved) = manifest.lookup(path) {
+                    // Convert forward slashes to backslashes
+                    return Some(resolved.replace('/', "\\"));
                 }
                 None
             }
-            RunfilesMode::DirectoryBased(dir, dir_len) => {
-                unsafe {
-                    let mut pos = 0;
+            RunfilesMode::DirectoryBased(dir) => {
+                let mut result = dir.clone();
 
-                    // Copy directory
-                    let copy_len = (*dir_len).min(MAX_PATH_LEN);
-                    RESOLVED_PATHS[result_idx][..copy_len].copy_from_slice(&dir[..copy_len]);
-                    pos += copy_len;
-
-                    // Add separator if needed
-                    if pos < MAX_PATH_LEN && pos > 0 && RESOLVED_PATHS[result_idx][pos - 1] != b'\\' && RESOLVED_PATHS[result_idx][pos - 1] != b'/' {
-                        RESOLVED_PATHS[result_idx][pos] = b'\\';
-                        pos += 1;
-                    }
-
-                    // Copy path, converting forward slashes to backslashes
-                    // Input is always Unix-style (a/b/c), output should be Windows-style (a\b\c)
-                    let path_len = path.len().min(MAX_PATH_LEN - pos);
-                    for i in 0..path_len {
-                        RESOLVED_PATHS[result_idx][pos + i] = if path[i] == b'/' { b'\\' } else { path[i] };
-                    }
-                    let total_len = pos + path_len;
-                    RESOLVED_PATHS[result_idx][total_len] = 0; // null terminate
-
-                    Some(&RESOLVED_PATHS[result_idx][..total_len])
+                // Add separator if needed
+                if !result.ends_with('\\') && !result.ends_with('/') {
+                    result.push('\\');
                 }
+
+                // Append path, converting forward slashes to backslashes
+                result.push_str(&path.replace('/', "\\"));
+
+                Some(result)
             }
         }
     }
@@ -613,8 +579,9 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> *mut core::ffi::c_void
         let env_block = GetEnvironmentStringsW();
         if env_block.is_null() {
             // No parent environment, just add runfiles vars in sorted order
-            let mut add_env = |key: &[u8], value: &[u8]| -> bool {
-                let total_len = key.len() + 1 + value.len() + 1; // key + '=' + value + '\0'
+            let mut add_env = |key: &[u8], value: &str| -> bool {
+                let value_bytes = value.as_bytes();
+                let total_len = key.len() + 1 + value_bytes.len() + 1; // key + '=' + value + '\0'
                 if !check_bounds(data_pos, total_len) {
                     return false;
                 }
@@ -625,7 +592,7 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> *mut core::ffi::c_void
                 }
                 MODIFIED_ENV_DATA[data_pos] = b'=' as u16;
                 data_pos += 1;
-                for &b in value {
+                for &b in value_bytes {
                     MODIFIED_ENV_DATA[data_pos] = b as u16;
                     data_pos += 1;
                 }
@@ -635,15 +602,15 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> *mut core::ffi::c_void
             };
 
             if let Some(rf) = runfiles {
-                if let Some((ref path, len)) = rf.dir_path {
-                    if !add_env(b"JAVA_RUNFILES", &path[..len]) {
+                if let Some(ref path) = rf.dir_path {
+                    if !add_env(b"JAVA_RUNFILES", path) {
                         print(b"ERROR: Failed to add JAVA_RUNFILES to environment\r\n");
                         print(b"Environment buffer limit exceeded. Total size limit: ");
                         print_number(MAX_ENV_SIZE);
                         print(b" bytes\r\n");
                         ExitProcess(1);
                     }
-                    if !add_env(b"RUNFILES_DIR", &path[..len]) {
+                    if !add_env(b"RUNFILES_DIR", path) {
                         print(b"ERROR: Failed to add RUNFILES_DIR to environment\r\n");
                         print(b"Environment buffer limit exceeded. Total size limit: ");
                         print_number(MAX_ENV_SIZE);
@@ -651,8 +618,8 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> *mut core::ffi::c_void
                         ExitProcess(1);
                     }
                 }
-                if let Some((ref path, len)) = rf.manifest_path {
-                    if !add_env(b"RUNFILES_MANIFEST_FILE", &path[..len]) {
+                if let Some(ref path) = rf.manifest_path {
+                    if !add_env(b"RUNFILES_MANIFEST_FILE", path) {
                         print(b"ERROR: Failed to add RUNFILES_MANIFEST_FILE to environment\r\n");
                         print(b"Environment buffer limit exceeded. Total size limit: ");
                         print_number(MAX_ENV_SIZE);
@@ -743,8 +710,9 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> *mut core::ffi::c_void
                     // Insert JAVA_RUNFILES if needed
                     if !java_runfiles_inserted && var_comes_after(b"JAVA_RUNFILES") {
                         if let Some(rf) = runfiles {
-                            if let Some((ref path, len)) = rf.dir_path {
-                                let total_len = 14 + len + 1; // "JAVA_RUNFILES=" + value + '\0'
+                            if let Some(ref path) = rf.dir_path {
+                                let path_bytes = path.as_bytes();
+                                let total_len = 14 + path_bytes.len() + 1; // "JAVA_RUNFILES=" + value + '\0'
                                 if !check_bounds(data_pos, total_len) {
                                     env_dropped = true;
                                 } else {
@@ -752,8 +720,8 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> *mut core::ffi::c_void
                                         MODIFIED_ENV_DATA[data_pos] = b as u16;
                                         data_pos += 1;
                                     }
-                                    for i in 0..len {
-                                        MODIFIED_ENV_DATA[data_pos] = path[i] as u16;
+                                    for &b in path_bytes {
+                                        MODIFIED_ENV_DATA[data_pos] = b as u16;
                                         data_pos += 1;
                                     }
                                     MODIFIED_ENV_DATA[data_pos] = 0;
@@ -767,8 +735,9 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> *mut core::ffi::c_void
                     // Insert RUNFILES_DIR if needed
                     if !runfiles_dir_inserted && var_comes_after(b"RUNFILES_DIR") {
                         if let Some(rf) = runfiles {
-                            if let Some((ref path, len)) = rf.dir_path {
-                                let total_len = 13 + len + 1; // "RUNFILES_DIR=" + value + '\0'
+                            if let Some(ref path) = rf.dir_path {
+                                let path_bytes = path.as_bytes();
+                                let total_len = 13 + path_bytes.len() + 1; // "RUNFILES_DIR=" + value + '\0'
                                 if !check_bounds(data_pos, total_len) {
                                     env_dropped = true;
                                 } else {
@@ -776,8 +745,8 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> *mut core::ffi::c_void
                                         MODIFIED_ENV_DATA[data_pos] = b as u16;
                                         data_pos += 1;
                                     }
-                                    for i in 0..len {
-                                        MODIFIED_ENV_DATA[data_pos] = path[i] as u16;
+                                    for &b in path_bytes {
+                                        MODIFIED_ENV_DATA[data_pos] = b as u16;
                                         data_pos += 1;
                                     }
                                     MODIFIED_ENV_DATA[data_pos] = 0;
@@ -791,8 +760,9 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> *mut core::ffi::c_void
                     // Insert RUNFILES_MANIFEST_FILE if needed
                     if !runfiles_manifest_inserted && var_comes_after(b"RUNFILES_MANIFEST_FILE") {
                         if let Some(rf) = runfiles {
-                            if let Some((ref path, len)) = rf.manifest_path {
-                                let total_len = 23 + len + 1; // "RUNFILES_MANIFEST_FILE=" + value + '\0'
+                            if let Some(ref path) = rf.manifest_path {
+                                let path_bytes = path.as_bytes();
+                                let total_len = 23 + path_bytes.len() + 1; // "RUNFILES_MANIFEST_FILE=" + value + '\0'
                                 if !check_bounds(data_pos, total_len) {
                                     env_dropped = true;
                                 } else {
@@ -800,8 +770,8 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> *mut core::ffi::c_void
                                         MODIFIED_ENV_DATA[data_pos] = b as u16;
                                         data_pos += 1;
                                     }
-                                    for i in 0..len {
-                                        MODIFIED_ENV_DATA[data_pos] = path[i] as u16;
+                                    for &b in path_bytes {
+                                        MODIFIED_ENV_DATA[data_pos] = b as u16;
                                         data_pos += 1;
                                     }
                                     MODIFIED_ENV_DATA[data_pos] = 0;
@@ -830,8 +800,9 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> *mut core::ffi::c_void
             // Add any remaining runfiles vars that weren't inserted yet
             if !java_runfiles_inserted {
                 if let Some(rf) = runfiles {
-                    if let Some((ref path, len)) = rf.dir_path {
-                        let total_len = 14 + len + 1;
+                    if let Some(ref path) = rf.dir_path {
+                        let path_bytes = path.as_bytes();
+                        let total_len = 14 + path_bytes.len() + 1;
                         if !check_bounds(data_pos, total_len) {
                             env_dropped = true;
                         } else {
@@ -839,8 +810,8 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> *mut core::ffi::c_void
                                 MODIFIED_ENV_DATA[data_pos] = b as u16;
                                 data_pos += 1;
                             }
-                            for i in 0..len {
-                                MODIFIED_ENV_DATA[data_pos] = path[i] as u16;
+                            for &b in path_bytes {
+                                MODIFIED_ENV_DATA[data_pos] = b as u16;
                                 data_pos += 1;
                             }
                             MODIFIED_ENV_DATA[data_pos] = 0;
@@ -851,8 +822,9 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> *mut core::ffi::c_void
             }
             if !runfiles_dir_inserted {
                 if let Some(rf) = runfiles {
-                    if let Some((ref path, len)) = rf.dir_path {
-                        let total_len = 13 + len + 1;
+                    if let Some(ref path) = rf.dir_path {
+                        let path_bytes = path.as_bytes();
+                        let total_len = 13 + path_bytes.len() + 1;
                         if !check_bounds(data_pos, total_len) {
                             env_dropped = true;
                         } else {
@@ -860,8 +832,8 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> *mut core::ffi::c_void
                                 MODIFIED_ENV_DATA[data_pos] = b as u16;
                                 data_pos += 1;
                             }
-                            for i in 0..len {
-                                MODIFIED_ENV_DATA[data_pos] = path[i] as u16;
+                            for &b in path_bytes {
+                                MODIFIED_ENV_DATA[data_pos] = b as u16;
                                 data_pos += 1;
                             }
                             MODIFIED_ENV_DATA[data_pos] = 0;
@@ -872,8 +844,9 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> *mut core::ffi::c_void
             }
             if !runfiles_manifest_inserted {
                 if let Some(rf) = runfiles {
-                    if let Some((ref path, len)) = rf.manifest_path {
-                        let total_len = 23 + len + 1;
+                    if let Some(ref path) = rf.manifest_path {
+                        let path_bytes = path.as_bytes();
+                        let total_len = 23 + path_bytes.len() + 1;
                         if !check_bounds(data_pos, total_len) {
                             env_dropped = true;
                         } else {
@@ -881,8 +854,8 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> *mut core::ffi::c_void
                                 MODIFIED_ENV_DATA[data_pos] = b as u16;
                                 data_pos += 1;
                             }
-                            for i in 0..len {
-                                MODIFIED_ENV_DATA[data_pos] = path[i] as u16;
+                            for &b in path_bytes {
+                                MODIFIED_ENV_DATA[data_pos] = b as u16;
                                 data_pos += 1;
                             }
                             MODIFIED_ENV_DATA[data_pos] = 0;
@@ -1110,8 +1083,7 @@ pub extern "C" fn main() -> ! {
         // Parse argv[0] from command line manually
         // Command line format: either "path\to\exe" args... or path\to\exe args...
         // We extract the first token (argv[0]) for runfiles fallback
-        let mut exe_path_buf = [0u8; MAX_PATH_LEN];
-        let mut exe_len = 0;
+        let mut exe_path_buf = Vec::new();
         let mut pos = 0usize;
 
         // Skip leading whitespace
@@ -1125,8 +1097,8 @@ pub extern "C" fn main() -> ! {
             pos += 1; // Skip opening quote
         }
 
-        // Extract argv[0]
-        while exe_len < MAX_PATH_LEN && *cmdline.add(pos) != 0 {
+        // Extract argv[0] (with 1MB safety limit)
+        while exe_path_buf.len() < 1048576 && *cmdline.add(pos) != 0 {
             let wchar = *cmdline.add(pos);
 
             // Check for end of argv[0]
@@ -1141,13 +1113,12 @@ pub extern "C" fn main() -> ! {
             }
 
             // Simple UTF-16 to ASCII conversion
-            exe_path_buf[exe_len] = (wchar & 0xFF) as u8;
-            exe_len += 1;
+            exe_path_buf.push((wchar & 0xFF) as u8);
             pos += 1;
         }
 
-        let executable_path = if exe_len > 0 {
-            Some(&exe_path_buf[..exe_len] as &[u8])
+        let executable_path: Option<&[u8]> = if !exe_path_buf.is_empty() {
+            Some(&exe_path_buf)
         } else {
             None
         };
@@ -1179,7 +1150,10 @@ pub extern "C" fn main() -> ! {
             &ARG9_PLACEHOLDER,
         ];
 
-        // Resolve embedded arguments - uses static RESOLVED_PATHS
+        // Use Vec for dynamic path storage - no fixed size limits
+        let mut resolved_paths: Vec<Vec<u8>> = Vec::with_capacity(128);
+
+        // Resolve embedded arguments
         for i in 0..argc {
             let arg_data = arg_placeholders[i];
             let arg_len = strlen(arg_data);
@@ -1197,62 +1171,62 @@ pub extern "C" fn main() -> ! {
             // Check if this argument should be transformed
             let should_transform = (transform_flags & (1 << i)) != 0;
 
-            if should_transform {
+            let resolved = if should_transform {
                 // Try to resolve through runfiles
                 if let Some(ref rf) = runfiles {
-                    if rf.rlocation(arg_slice, i).is_none() {
-                        // If not found in runfiles, use the path as-is
-                        let copy_len = arg_len.min(MAX_PATH_LEN);
-                        RESOLVED_PATHS[i][..copy_len].copy_from_slice(&arg_slice[..copy_len]);
-                        RESOLVED_PATHS[i][copy_len] = 0;
+                    // Convert argument to &str for rlocation (Bazel args are UTF-8)
+                    if let Ok(arg_str) = core::str::from_utf8(arg_slice) {
+                        if let Some(resolved_str) = rf.rlocation(arg_str) {
+                            // Convert back to bytes
+                            Vec::from(resolved_str.as_bytes())
+                        } else {
+                            // If not found in runfiles, use the path as-is
+                            arg_slice.to_vec()
+                        }
+                    } else {
+                        // Not valid UTF-8, use as-is
+                        arg_slice.to_vec()
                     }
-                    // else: rlocation already wrote to RESOLVED_PATHS[i]
                 } else {
                     // Use path as-is
-                    let copy_len = arg_len.min(MAX_PATH_LEN);
-                    RESOLVED_PATHS[i][..copy_len].copy_from_slice(&arg_slice[..copy_len]);
-                    RESOLVED_PATHS[i][copy_len] = 0;
+                    arg_slice.to_vec()
                 }
             } else {
                 // Use path as-is without transformation
-                let copy_len = arg_len.min(MAX_PATH_LEN);
-                RESOLVED_PATHS[i][..copy_len].copy_from_slice(&arg_slice[..copy_len]);
-                RESOLVED_PATHS[i][copy_len] = 0;
-            }
+                arg_slice.to_vec()
+            };
+
+            resolved_paths.push(resolved);
         }
 
         // Build command line for CreateProcessW (UTF-16)
         // Command line includes embedded args + runtime args
-        let mut cmdline_wide = [0u16; 8192]; // Large buffer for UTF-16
-        let mut cmdline_pos = 0usize;
+        let mut cmdline_wide: Vec<u16> = Vec::with_capacity(8192);
 
         // Add embedded arguments (convert from UTF-8 to UTF-16)
         for i in 0..argc {
-            let arg_len = strlen(&RESOLVED_PATHS[i]);
-            let arg_slice = &RESOLVED_PATHS[i][..arg_len];
+            let arg_slice = &resolved_paths[i];
 
             // Always quote the first argument (executable path) following Bazel's approach
             // For other arguments, only quote if they contain spaces
             let needs_quotes = i == 0 || find_byte(arg_slice, b' ').is_some();
 
-            if needs_quotes && cmdline_pos < cmdline_wide.len() {
-                cmdline_wide[cmdline_pos] = b'"' as u16;
-                cmdline_pos += 1;
+            if needs_quotes {
+                cmdline_wide.push(b'"' as u16);
             }
 
             // Convert UTF-8 to UTF-16 and copy
-            let converted_len = utf8_to_wide(arg_slice, &mut cmdline_wide[cmdline_pos..]);
-            cmdline_pos += converted_len;
+            for &b in arg_slice {
+                cmdline_wide.push(b as u16);
+            }
 
-            if needs_quotes && cmdline_pos < cmdline_wide.len() {
-                cmdline_wide[cmdline_pos] = b'"' as u16;
-                cmdline_pos += 1;
+            if needs_quotes {
+                cmdline_wide.push(b'"' as u16);
             }
 
             // Add space between arguments
-            if (i < argc - 1 || runtime_args_count > 0) && cmdline_pos < cmdline_wide.len() {
-                cmdline_wide[cmdline_pos] = b' ' as u16;
-                cmdline_pos += 1;
+            if i < argc - 1 || runtime_args_count > 0 {
+                cmdline_wide.push(b' ' as u16);
             }
         }
 
@@ -1270,34 +1244,27 @@ pub extern "C" fn main() -> ! {
                 }
             }
 
-            if needs_quotes && cmdline_pos < cmdline_wide.len() {
-                cmdline_wide[cmdline_pos] = b'"' as u16;
-                cmdline_pos += 1;
+            if needs_quotes {
+                cmdline_wide.push(b'"' as u16);
             }
 
             // Copy wide string
-            let copy_len = arg_len.min(cmdline_wide.len() - cmdline_pos);
-            for j in 0..copy_len {
-                cmdline_wide[cmdline_pos + j] = *runtime_arg.add(j);
+            for j in 0..arg_len {
+                cmdline_wide.push(*runtime_arg.add(j));
             }
-            cmdline_pos += copy_len;
 
-            if needs_quotes && cmdline_pos < cmdline_wide.len() {
-                cmdline_wide[cmdline_pos] = b'"' as u16;
-                cmdline_pos += 1;
+            if needs_quotes {
+                cmdline_wide.push(b'"' as u16);
             }
 
             // Add space between arguments (except after last)
-            if i < runtime_args_count - 1 && cmdline_pos < cmdline_wide.len() {
-                cmdline_wide[cmdline_pos] = b' ' as u16;
-                cmdline_pos += 1;
+            if i < runtime_args_count - 1 {
+                cmdline_wide.push(b' ' as u16);
             }
         }
 
         // Null-terminate command line
-        if cmdline_pos < cmdline_wide.len() {
-            cmdline_wide[cmdline_pos] = 0;
-        }
+        cmdline_wide.push(0);
 
         // Build environment with runfiles variables if export is enabled
         let envp = if export_runfiles_env {
