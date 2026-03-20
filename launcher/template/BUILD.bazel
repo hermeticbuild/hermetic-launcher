@@ -1,0 +1,53 @@
+"""Exposes the launcher template as a binary target"""
+
+load("//launcher/private:file_binary_rule.bzl", "file_binary", "host_file_binary")
+
+file_binary(
+    name = "prebuilt_aarch64_linux",
+    exe = "@runfiles_stub_aarch64_linux//file",
+    visibility = ["//visibility:public"],
+)
+
+file_binary(
+    name = "prebuilt_aarch64_macos",
+    exe = "@runfiles_stub_aarch64_macos//file",
+    visibility = ["//visibility:public"],
+)
+
+file_binary(
+    name = "prebuilt_x86_64_linux",
+    exe = "@runfiles_stub_x86_64_linux//file",
+    visibility = ["//visibility:public"],
+)
+
+file_binary(
+    name = "prebuilt_x86_64_macos",
+    exe = "@runfiles_stub_x86_64_macos//file",
+    visibility = ["//visibility:public"],
+)
+
+file_binary(
+    name = "prebuilt_x86_64_windows",
+    exe = "@runfiles_stub_x86_64_windows//file",
+    visibility = ["//visibility:public"],
+)
+
+_select_arms = {
+    "//launcher/private/platform_config_settings:aarch64_linux": ":prebuilt_aarch64_linux",
+    "//launcher/private/platform_config_settings:aarch64_macos": ":prebuilt_aarch64_macos",
+    "//launcher/private/platform_config_settings:x86_64_linux": ":prebuilt_x86_64_linux",
+    "//launcher/private/platform_config_settings:x86_64_macos": ":prebuilt_x86_64_macos",
+    "//launcher/private/platform_config_settings:x86_64_windows": ":prebuilt_x86_64_windows",
+}
+
+file_binary(
+    name = "prebuilt",
+    exe = select(_select_arms),
+    visibility = ["//visibility:public"],
+)
+
+host_file_binary(
+    name = "prebuilt_for_host",
+    exe = select(_select_arms),
+    visibility = ["//visibility:public"],
+)
