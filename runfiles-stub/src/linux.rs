@@ -473,6 +473,25 @@ impl Manifest {
         }
         None
     }
+
+    /// Find the longest manifest entry whose key is a prefix of `path` at a '/' boundary.
+    /// Returns (resolved_value, suffix) where suffix includes the leading '/'.
+    fn prefix_lookup<'a, 'b>(&'a self, path: &'b str) -> Option<(&'a str, &'b str)> {
+        let mut best: Option<(&str, &str)> = None;
+        let mut best_len: usize = 0;
+        for entry in &self.entries {
+            let key = &entry.key;
+            if path.len() > key.len()
+                && path.starts_with(key.as_str())
+                && path.as_bytes()[key.len()] == b'/'
+                && key.len() > best_len
+            {
+                best_len = key.len();
+                best = Some((&entry.value, &path[key.len()..]));
+            }
+        }
+        best
+    }
 }
 
 // Load manifest file
@@ -614,6 +633,12 @@ impl Runfiles {
             RunfilesMode::ManifestBased(manifest) => {
                 if let Some(resolved) = manifest.lookup(path) {
                     return Some(String::from(resolved));
+                }
+                // Prefix match for paths within TreeArtifacts
+                if let Some((resolved_prefix, suffix)) = manifest.prefix_lookup(path) {
+                    let mut result = String::from(resolved_prefix);
+                    result.push_str(suffix);
+                    return Some(result);
                 }
                 None
             }
