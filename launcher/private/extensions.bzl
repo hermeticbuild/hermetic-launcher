@@ -5,53 +5,53 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
 _download_attrs = {
     "finalize-stub-aarch64-linux": {
         "name": "finalize_stub_aarch64_linux",
-        "url": "https://github.com/hermeticbuild/hermetic-launcher/releases/download/binaries-20260129/finalize-stub-aarch64-linux",
-        "sha256": "d10352da70edf2d604b86f2f8d8ac03873678732d70948315f167491eb16efe7",
+        "url": "https://github.com/hermeticbuild/hermetic-launcher/releases/download/binaries-20260323/finalize-stub-aarch64-linux",
+        "sha256": "26f825c68c7fe1d893fc1cbda9d5f8f1525045841fbc13ff353564015ef75b80",
     },
     "finalize-stub-aarch64-macos": {
         "name": "finalize_stub_aarch64_macos",
-        "url": "https://github.com/hermeticbuild/hermetic-launcher/releases/download/binaries-20260129/finalize-stub-aarch64-macos",
-        "sha256": "3b37ffea00198e3f72bb0f0c0fb4d6cc0b4876b8154f082286783aa2a4fcd4ad",
+        "url": "https://github.com/hermeticbuild/hermetic-launcher/releases/download/binaries-20260323/finalize-stub-aarch64-macos",
+        "sha256": "435d35ffaf0b096604102d8c098ae8a54aa60acabb3f02a704158355fee2b8ec",
     },
     "finalize-stub-x86_64-linux": {
         "name": "finalize_stub_x86_64_linux",
-        "url": "https://github.com/hermeticbuild/hermetic-launcher/releases/download/binaries-20260129/finalize-stub-x86_64-linux",
-        "sha256": "797972f9d7fccf28d008041318777974c0d8ba1cb3f5b780c2acc6b1ea695e86",
+        "url": "https://github.com/hermeticbuild/hermetic-launcher/releases/download/binaries-20260323/finalize-stub-x86_64-linux",
+        "sha256": "651aa2b709d8bd2b1ff974c189606a7585173d2e06080455a92007459d4c5964",
     },
     "finalize-stub-x86_64-macos": {
         "name": "finalize_stub_x86_64_macos",
-        "url": "https://github.com/hermeticbuild/hermetic-launcher/releases/download/binaries-20260129/finalize-stub-x86_64-macos",
-        "sha256": "4147b1eb75efa5433b7ff75a49ad26ac5cb5ad148490783e78a9b8ee7c01b759",
+        "url": "https://github.com/hermeticbuild/hermetic-launcher/releases/download/binaries-20260323/finalize-stub-x86_64-macos",
+        "sha256": "c2123321c05f9a16448acbd859375cbe18d4ff4bda4d6b2bfe73bedff2a8afc8",
     },
     "finalize-stub-x86_64-windows.exe": {
         "name": "finalize_stub_x86_64_windows",
-        "url": "https://github.com/hermeticbuild/hermetic-launcher/releases/download/binaries-20260129/finalize-stub-x86_64-windows.exe",
-        "sha256": "205af4c7a50f6316c15d9008b273621affe4c62ec3ad7d054bcfa2c15070ec18",
+        "url": "https://github.com/hermeticbuild/hermetic-launcher/releases/download/binaries-20260323/finalize-stub-x86_64-windows.exe",
+        "sha256": "19ae47ed7d993054c20b657e3938f8104926b775f46d8d979f97c58ddd287f2c",
     },
     "runfiles-stub-aarch64-linux": {
         "name": "runfiles_stub_aarch64_linux",
-        "url": "https://github.com/hermeticbuild/hermetic-launcher/releases/download/binaries-20260129/runfiles-stub-aarch64-linux",
-        "sha256": "1f255c28b084b4659e9054a4cb93bb10df9313c07d184ce14e4fa89c48c0acdb",
+        "url": "https://github.com/hermeticbuild/hermetic-launcher/releases/download/binaries-20260323/runfiles-stub-aarch64-linux",
+        "sha256": "cd07b371ef5cd26fbd80df7ac24d3c328bb6e8af0392567aa0570da4626d6c73",
     },
     "runfiles-stub-aarch64-macos": {
         "name": "runfiles_stub_aarch64_macos",
-        "url": "https://github.com/hermeticbuild/hermetic-launcher/releases/download/binaries-20260129/runfiles-stub-aarch64-macos",
-        "sha256": "0a77f05b60da6d57a1970b181e79c614a883a95b8378c96278bd64d19d4cb923",
+        "url": "https://github.com/hermeticbuild/hermetic-launcher/releases/download/binaries-20260323/runfiles-stub-aarch64-macos",
+        "sha256": "752f8c0580a9624527b8878bc82abd785d2600de4ab7aa7b8452c3a901c58b1d",
     },
     "runfiles-stub-x86_64-linux": {
         "name": "runfiles_stub_x86_64_linux",
-        "url": "https://github.com/hermeticbuild/hermetic-launcher/releases/download/binaries-20260129/runfiles-stub-x86_64-linux",
-        "sha256": "39b67aaf2de42a25ea0e05ec713b1a0cf689d9a81dd64bf4d2aa7d74e6c8ec78",
+        "url": "https://github.com/hermeticbuild/hermetic-launcher/releases/download/binaries-20260323/runfiles-stub-x86_64-linux",
+        "sha256": "d0dc56be9be9c20abe3f3dd01147f0bc686db99221114f3fa424a194f6bc8c70",
     },
     "runfiles-stub-x86_64-macos": {
         "name": "runfiles_stub_x86_64_macos",
-        "url": "https://github.com/hermeticbuild/hermetic-launcher/releases/download/binaries-20260129/runfiles-stub-x86_64-macos",
-        "sha256": "58d708bf32181f05638857cbf8898f0c5c511e1b69ffeac433fcac7b4ca3aa8a",
+        "url": "https://github.com/hermeticbuild/hermetic-launcher/releases/download/binaries-20260323/runfiles-stub-x86_64-macos",
+        "sha256": "bf9edf841c4011cf60979bd3355104cc831b0398c35c0ccf814ba011551f731c",
     },
     "runfiles-stub-x86_64-windows.exe": {
         "name": "runfiles_stub_x86_64_windows",
-        "url": "https://github.com/hermeticbuild/hermetic-launcher/releases/download/binaries-20260129/runfiles-stub-x86_64-windows.exe",
-        "sha256": "833a856a7012fa1a6ee1c525c83cf67ef6f2652d5ff3e5e38d99603e7652c6a6",
+        "url": "https://github.com/hermeticbuild/hermetic-launcher/releases/download/binaries-20260323/runfiles-stub-x86_64-windows.exe",
+        "sha256": "74f6e72e0b04b83ed735721d883364ce1090003bf6d54ec2be1a5760b0136a7c",
     },
 }
 
