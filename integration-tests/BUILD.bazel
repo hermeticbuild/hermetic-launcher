@@ -1,0 +1,98 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load("//integration-tests:copy_to_directory.bzl", "copy_to_directory")
+load("@rules_platform//platform_data:defs.bzl", "platform_data")
+
+config_setting(
+    name = "linux_x86_64",
+    constraint_values = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
+)
+
+config_setting(
+    name = "linux_aarch64",
+    constraint_values = [
+        "@platforms//os:linux",
+        "@platforms//cpu:aarch64",
+    ],
+)
+
+rust_binary(
+    name = "test-runner",
+    srcs = ["src/main.rs"],
+    edition = "2021",
+    visibility = ["//visibility:public"],
+)
+
+rust_binary(
+    name = "hash-file",
+    srcs = ["src/bin/hash_file.rs"],
+    edition = "2021",
+    deps = ["@integration_crates//:sha2"],
+)
+
+rust_binary(
+    name = "add-numbers",
+    srcs = ["src/bin/add_numbers.rs"],
+    edition = "2021",
+)
+
+rust_binary(
+    name = "merge-json",
+    srcs = ["src/bin/merge_json.rs"],
+    edition = "2021",
+    deps = ["@integration_crates//:serde_json"],
+)
+
+rust_binary(
+    name = "orchestrator",
+    srcs = ["src/bin/orchestrator.rs"],
+    edition = "2021",
+)
+
+rust_binary(
+    name = "print-env",
+    srcs = ["src/bin/print_env.rs"],
+    edition = "2021",
+)
+
+platform_data(
+    name = "static-runfiles-stub",
+    target = "//runfiles-stub:runfiles-stub",
+    platform = select({
+        ":linux_x86_64": "@rules_rs//rs/experimental/platforms:x86_64-unknown-linux-musl",
+        ":linux_aarch64": "@rules_rs//rs/experimental/platforms:aarch64-unknown-linux-musl",
+        "//conditions:default": "@platforms//host:host",
+    }),
+)
+
+copy_to_directory(
+    name = "test-binaries",
+    srcs = [
+        ":hash-file",
+        ":add-numbers",
+        ":merge-json",
+        ":orchestrator",
+        ":print-env",
+    ],
+)
+
+sh_test(
+    name = "integration_test",
+    srcs = ["integration_test.sh"],
+    data = [
+        ":static-runfiles-stub",
+        ":test-runner",
+        ":test-binaries",
+        "//finalize-stub:finalize-stub",
+        "@bazel_tools//tools/bash/runfiles",
+    ],
+    env = {
+        "TEMPLATE_BIN_RL": "$(rlocationpath :static-runfiles-stub)",
+        "FINALIZER_BIN_RL": "$(rlocationpath //finalize-stub:finalize-stub)",
+        "TEST_RUNNER_RL": "$(rlocationpath :test-runner)",
+        "TEST_BIN_DIR_RL": "$(rlocationpath :test-binaries)",
+    },
+)
