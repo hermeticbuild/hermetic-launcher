@@ -8,7 +8,7 @@
     }
   ],
   "repository": [
-    "github:malt3/hermetic-launcher"
+    "github:hermeticbuild/hermetic-launcher"
   ],
   "versions": [],
   "yanked_versions": {}

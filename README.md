@@ -57,8 +57,8 @@ This enables Bazel rules to create tiny, platform-agnostic entrypoints that work
 ```bash
 # Download from GitHub releases
 VERSION=<version> # could be "binaries-20251216"
-wget https://github.com/malt3/hermetic-launcher/releases/download/${VERSION}/runfiles-stub-x86_64-linux
-wget https://github.com/malt3/hermetic-launcher/releases/download/${VERSION}/finalize-stub-x86_64-linux
+wget https://github.com/hermeticbuild/hermetic-launcher/releases/download/${VERSION}/runfiles-stub-x86_64-linux
+wget https://github.com/hermeticbuild/hermetic-launcher/releases/download/${VERSION}/finalize-stub-x86_64-linux
 chmod +x runfiles-stub-x86_64-linux
 chmod +x finalize-stub-x86_64-linux
 ```
