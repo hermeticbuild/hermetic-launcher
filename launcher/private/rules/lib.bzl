@@ -2,7 +2,9 @@ def _get_finalizer(ctx):
     toolchain = ctx.toolchains["@hermetic_launcher//launcher:finalizer_toolchain_type"]
     return toolchain.finalizer_info.finalizer
 
-def _get_template(ctx, *, cfg = "target", template_exec_group = None):
+def _get_template(ctx, *, cfg = "target", template_exec_group = None, template_file = None):
+    if template_file != None:
+        return template_file
     toolchain_dict = ctx.toolchains if template_exec_group == None else ctx.exec_groups[template_exec_group].toolchains
     if cfg == "target":
         toolchain = toolchain_dict["@hermetic_launcher//launcher:template_toolchain_type"]
@@ -37,8 +39,8 @@ def _append_raw_transformed_arg(*, arg, embedded_args, transformed_args):
     embedded_args.append(arg)
     return embedded_args, transformed_args
 
-def _compile_stub(*, ctx, embedded_args, transformed_args, output_file, cfg = "target", template_exec_group = None):
-    template = _get_template(ctx, cfg = cfg, template_exec_group = template_exec_group)
+def _compile_stub(*, ctx, embedded_args, transformed_args, output_file, cfg = "target", template_exec_group = None, template_file = None):
+    template = _get_template(ctx, cfg = cfg, template_exec_group = template_exec_group, template_file = template_file)
     args = ctx.actions.args()
     args.add("--template", template)
     args.add("-o", output_file)

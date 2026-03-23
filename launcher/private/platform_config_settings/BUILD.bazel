@@ -1,0 +1,43 @@
+load("@bazel_skylib//lib:selects.bzl", "selects")
+
+package(default_visibility = ["//visibility:public"])
+
+selects.config_setting_group(
+    name = "aarch64_linux",
+    match_all = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:linux",
+    ],
+)
+
+selects.config_setting_group(
+    name = "aarch64_macos",
+    match_all = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:macos",
+    ],
+)
+
+selects.config_setting_group(
+    name = "x86_64_linux",
+    match_all = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+)
+
+selects.config_setting_group(
+    name = "x86_64_macos",
+    match_all = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:macos",
+    ],
+)
+
+selects.config_setting_group(
+    name = "x86_64_windows",
+    match_all = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:windows",
+    ],
+)
