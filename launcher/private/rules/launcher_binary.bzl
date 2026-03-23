@@ -13,10 +13,11 @@ def _launcher_binary_impl(ctx):
 
     should_infer_transformed_args = len(ctx.attr.transformed_args) == 0
     if should_infer_transformed_args:
-        # Auto-detect transformed args.
+        # Auto-detect transformed args. Matches both:
+        #   $(rlocationpath //the:target)
+        #   $(rlocationpath //the:target)/some/suffix
         for (i, arg) in enumerate(ctx.attr.embedded_args):
-            if arg.startswith("$(rlocationpath") and arg.endswith(")"):
-                # This is a simplified heuristic to detect rlocation path expansions.
+            if "$(rlocationpath " in arg or "$(rlocationpaths " in arg:
                 transformed_args.append(i+1)
     else:
         if ctx.attr.transformed_args == [-1]:
