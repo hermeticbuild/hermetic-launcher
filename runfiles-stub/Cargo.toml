@@ -6,11 +6,4 @@ edition = "2021"
 [dependencies]
 # talc allocator configured for stable Rust (disable allocator and nightly_api features)
 # We wrap it manually since we're single-threaded and don't need lock_api
-talc = { version = "4", default-features = false }
-
-[profile.release]
-opt-level = "z"
-lto = true
-codegen-units = 1
-panic = "abort"
-strip = true
+talc = { workspace = true, default-features = false }
