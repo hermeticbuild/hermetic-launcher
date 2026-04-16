@@ -742,6 +742,42 @@ pub extern "C" fn main(runtime_argc: i32, runtime_argv: *const *const u8) -> ! {
             }
         }
 
+        // Preserve argv[0] as a runfiles-relative path.
+        //
+        // The rlocation-resolved path (resolved_paths[0]) is a fully resolved
+        // absolute path, suitable for the kernel to open and execute. However,
+        // many programs (notably aspect_rules_py's venv_shim) read argv[0] and
+        // walk its parent symlinks to locate the .runfiles tree. If argv[0] is
+        // already a fully resolved path, this walk fails because the symlink
+        // chain through .runfiles has been bypassed.
+        //
+        // To fix this, we construct argv[0] as <runfiles_dir>/<original_arg>,
+        // which preserves the path through the .runfiles symlink tree. The
+        // resolved path is still used as the filename argument to execve, so
+        // the kernel can find the actual binary.
+        let argv0_runfiles_path: Option<Vec<u8>> = if let Some(ref rf) = runfiles {
+            if let Some(ref dir_path) = rf.dir_path {
+                // Get the original (pre-resolution) arg0
+                let arg0_data = arg_placeholders[0];
+                let arg0_len = strlen(arg0_data);
+                if arg0_len > 0 {
+                    let mut path = Vec::from(dir_path.as_bytes());
+                    if !dir_path.ends_with('/') {
+                        path.push(b'/');
+                    }
+                    path.extend_from_slice(&arg0_data[..arg0_len]);
+                    path.push(0);
+                    Some(path)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Build pointer array from the resolved paths
         let mut resolved_ptrs: Vec<*const u8> = Vec::with_capacity(resolved_paths.len() + 1);
         for path in &resolved_paths {
@@ -750,8 +786,15 @@ pub extern "C" fn main(runtime_argc: i32, runtime_argv: *const *const u8) -> ! {
         // NULL-terminate the argv array
         resolved_ptrs.push(core::ptr::null());
 
-        // Get the executable path (first argument)
+        // Get the executable path (first argument) — fully resolved for the kernel
         let executable = resolved_ptrs[0];
+
+        // Replace argv[0] with the runfiles-relative path if available.
+        // This must happen after building resolved_ptrs so the executable
+        // pointer captures the resolved path before we overwrite argv[0].
+        if let Some(ref argv0_path) = argv0_runfiles_path {
+            resolved_ptrs[0] = argv0_path.as_ptr();
+        }
 
         // Build environment (with runfiles vars if export_runfiles_env is true)
         // We need to keep the env_data alive until execve
