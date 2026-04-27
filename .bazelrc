@@ -13,8 +13,7 @@ common:release --@rules_rust//rust/settings:codegen_units=1
 common:release --@rules_rust//rust/settings:lto=fat
 common:release --@rules_rust//rust/settings:extra_rustc_flag=-Ccodegen-units=1
 common:release --@rules_rust//rust/settings:extra_rustc_flag=-Copt-level=z
-# Hit some error with rust-objcopy missing, we'll just do our own stripping with llvm-objcopy.
-common:release --@rules_rust//rust/settings:extra_rustc_flag=-Cstrip=none
+common:release --@rules_rust//rust/settings:extra_rustc_flag=-Cstrip=symbols
 
 common:remote --extra_execution_platforms=//:rbe_platform
 common:remote --platforms=//:rbe_platform

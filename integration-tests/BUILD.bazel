@@ -1,7 +1,7 @@
+load("@bazel_lib//lib:copy_to_directory.bzl", "copy_to_directory")
+load("@rules_platform//platform_data:defs.bzl", "platform_data")
 load("@rules_rust//rust:defs.bzl", "rust_binary")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
-load("//integration-tests:copy_to_directory.bzl", "copy_to_directory")
-load("@rules_platform//platform_data:defs.bzl", "platform_data")
 
 config_setting(
     name = "linux_x86_64",
@@ -60,19 +60,19 @@ rust_binary(
 
 platform_data(
     name = "static-runfiles-stub",
-    target = "//runfiles-stub:runfiles-stub",
     platform = select({
         ":linux_x86_64": "@rules_rs//rs/platforms:x86_64-unknown-linux-musl",
         ":linux_aarch64": "@rules_rs//rs/platforms:aarch64-unknown-linux-musl",
         "//conditions:default": "@platforms//host:host",
     }),
+    target = "//runfiles-stub",
 )
 
 copy_to_directory(
     name = "test-binaries",
     srcs = [
-        ":hash-file",
         ":add-numbers",
+        ":hash-file",
         ":merge-json",
         ":orchestrator",
         ":print-env",
@@ -84,9 +84,9 @@ sh_test(
     srcs = ["integration_test.sh"],
     data = [
         ":static-runfiles-stub",
-        ":test-runner",
         ":test-binaries",
-        "//finalize-stub:finalize-stub",
+        ":test-runner",
+        "//finalize-stub",
         "@bazel_tools//tools/bash/runfiles",
     ],
     env = {
