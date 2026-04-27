@@ -20,7 +20,7 @@ bazel_dep(name = "rules_rs", version = "0.0.62", dev_dependency = True)
 toolchains = use_extension("@rules_rs//rs/toolchains:module_extension.bzl", "toolchains")
 toolchains.toolchain(
     edition = "2021",
-    version = "1.92.0",
+    version = "1.95.0",
 )
 use_repo(
     toolchains,
@@ -43,7 +43,7 @@ RUST_TRIPLES = [
     "x86_64-pc-windows-gnullvm",
 ]
 
-# TODO(zbarsky): Use a workspace instead of 2 packages?
+# TODO(zbarsky): Use a workspace instead of 3 packages?
 crate = use_extension("@rules_rs//rs:extensions.bzl", "crate", dev_dependency = True)
 crate.from_cargo(
     name = "finalize_crates",
@@ -63,35 +63,7 @@ crate.from_cargo(
     cargo_toml = "//integration-tests:Cargo.toml",
     platform_triples = RUST_TRIPLES,
 )
-use_repo(crate, "finalize_crates", "runfiles_crates")
-use_repo(crate, "integration_crates")
-
-crate.annotation(
-    additive_build_file_content = """
-load("@rules_cc//cc:defs.bzl", "cc_import")
-
-cc_import(
-    name = "windows_import_lib",
-    static_library = glob(["lib/*.a"])[0],
-)
-""",
-    crate = "windows_x86_64_gnullvm",
-    gen_build_script = "off",
-    deps = [":windows_import_lib"],
-)
-crate.annotation(
-    additive_build_file_content = """
-load("@rules_cc//cc:defs.bzl", "cc_import")
-
-cc_import(
-    name = "windows_import_lib",
-    static_library = glob(["lib/*.a"])[0],
-)
-""",
-    crate = "windows_aarch64_gnullvm",
-    gen_build_script = "off",
-    deps = [":windows_import_lib"],
-)
+use_repo(crate, "finalize_crates", "integration_crates", "runfiles_crates")
 
 bazel_dep(name = "bzip2", version = "1.0.8.bcr.3")
 
@@ -103,11 +75,15 @@ crate.annotation(
 
 inject_repo(crate, "bzip2")
 
-# TODO(zbarsky): BCR module doesn't work on windows arm64 yet
+bazel_dep(name = "xz", version = "5.4.5.bcr.8")
+
 crate.annotation(
     crate = "lzma-sys",
-    gen_build_script = "on",
+    gen_build_script = "off",
+    deps = ["@xz//:lzma"],
 )
+
+inject_repo(crate, "xz")
 
 bazel_dep(name = "llvm", version = "0.7.5", dev_dependency = True)
 
