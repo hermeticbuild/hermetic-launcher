@@ -20,8 +20,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
-      - uses: bazelbuild/setup-bazelisk@v3
-      - run: BAZEL=bazelisk bash tools/build-release-binaries.sh release
+      - run: bash tools/build-release-binaries.sh release
 
       - name: Determine tag
         id: tag

@@ -13,8 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: bazelbuild/setup-bazelisk@v3
-      - run: BAZEL=bazelisk bash tools/build-release-binaries.sh artifacts
+      - run: bash tools/build-release-binaries.sh artifacts
       - uses: actions/upload-artifact@v4
         with:
           name: binaries
@@ -26,21 +25,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: bazelbuild/setup-bazelisk@v3
-      - run: bazelisk test //...
+      - run: bazel test //...
 
   test-macos:
     name: Test macOS
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: bazelbuild/setup-bazelisk@v3
-      - run: bazelisk test //...
+      - run: bazel test //...
 
   test-windows:
     name: Test Windows
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: bazelbuild/setup-bazelisk@v3
-      - run: bazelisk test //...
+      - run: bazel test //...
