@@ -3,262 +3,74 @@ name: Release Binaries
 on:
   push:
     tags:
-      - 'binaries-*'
+      - "binaries-*"
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to release (e.g., binaries-20251215)'
+        description: "Tag to release (e.g., binaries-20251215)"
         required: true
 
 jobs:
-  build-linux:
-    name: Build Linux binaries
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu,x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,x86_64-pc-windows-gnu
-
-      - name: Install cross-compilation dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools mingw-w64
-
-      - name: Setup Cargo config for cross-compilation
-        run: |
-          mkdir -p ~/.cargo
-          cat > ~/.cargo/config.toml << 'EOF'
-          [target.aarch64-unknown-linux-gnu]
-          linker = "aarch64-linux-gnu-gcc"
-
-          [target.aarch64-unknown-linux-musl]
-          linker = "aarch64-linux-gnu-gcc"
-
-          [target.x86_64-pc-windows-gnu]
-          linker = "x86_64-w64-mingw32-gcc"
-          EOF
-
-      - name: Build template - x86_64 Linux
-        working-directory: runfiles-stub
-        run: |
-          cargo build --release --target x86_64-unknown-linux-gnu
-          mkdir -p ../release
-          cp target/x86_64-unknown-linux-gnu/release/runfiles-stub ../release/runfiles-stub-x86_64-linux
-
-      - name: Build template - aarch64 Linux
-        working-directory: runfiles-stub
-        run: |
-          cargo build --release --target aarch64-unknown-linux-gnu
-          cp target/aarch64-unknown-linux-gnu/release/runfiles-stub ../release/runfiles-stub-aarch64-linux
-
-      - name: Build template - x86_64 Windows
-        working-directory: runfiles-stub
-        run: |
-          cargo build --release --target x86_64-pc-windows-gnu
-          cp target/x86_64-pc-windows-gnu/release/runfiles-stub.exe ../release/runfiles-stub-x86_64-windows.exe
-
-      - name: Build finalizer - x86_64 Linux (musl)
-        working-directory: finalize-stub
-        run: |
-          mkdir -p .cargo
-          echo '[target.x86_64-unknown-linux-musl]' > .cargo/config.toml
-          echo 'rustflags = ["-C", "target-feature=+crt-static"]' >> .cargo/config.toml
-          cargo build --release --target x86_64-unknown-linux-musl
-          cp target/x86_64-unknown-linux-musl/release/finalize-stub ../release/finalize-stub-x86_64-linux
-
-      - name: Build finalizer - aarch64 Linux (musl)
-        working-directory: finalize-stub
-        run: |
-          cargo build --release --target aarch64-unknown-linux-musl
-          cp target/aarch64-unknown-linux-musl/release/finalize-stub ../release/finalize-stub-aarch64-linux
-
-      - name: Build finalizer - x86_64 Windows
-        working-directory: finalize-stub
-        run: |
-          cargo build --release --target x86_64-pc-windows-gnu
-          cp target/x86_64-pc-windows-gnu/release/finalize-stub.exe ../release/finalize-stub-x86_64-windows.exe
-
-      - name: Create checksums
-        working-directory: release
-        run: |
-          sha256sum * > SHA256SUMS.txt
-          cat SHA256SUMS.txt
-
-      - name: Upload Linux/Windows artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: binaries-linux-windows
-          path: release/
-
-  build-macos:
-    name: Build macOS binaries
-    runs-on: macos-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-apple-darwin,aarch64-apple-darwin
-
-      - name: Build template - x86_64 macOS
-        working-directory: runfiles-stub
-        run: |
-          mkdir -p ../release
-          cargo build --release --target x86_64-apple-darwin
-          cp target/x86_64-apple-darwin/release/runfiles-stub ../release/runfiles-stub-x86_64-macos
-
-      - name: Build template - aarch64 macOS (Apple Silicon)
-        working-directory: runfiles-stub
-        run: |
-          cargo build --release --target aarch64-apple-darwin
-          cp target/aarch64-apple-darwin/release/runfiles-stub ../release/runfiles-stub-aarch64-macos
-
-      - name: Build finalizer - x86_64 macOS
-        working-directory: finalize-stub
-        run: |
-          cargo build --release --target x86_64-apple-darwin
-          cp target/x86_64-apple-darwin/release/finalize-stub ../release/finalize-stub-x86_64-macos
-
-      - name: Build finalizer - aarch64 macOS (Apple Silicon)
-        working-directory: finalize-stub
-        run: |
-          cargo build --release --target aarch64-apple-darwin
-          cp target/aarch64-apple-darwin/release/finalize-stub ../release/finalize-stub-aarch64-macos
-
-      - name: Create checksums
-        working-directory: release
-        run: |
-          shasum -a 256 * > SHA256SUMS.txt
-          cat SHA256SUMS.txt
-
-      - name: Upload macOS artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: binaries-macos
-          path: release/
-
-  create-release:
-    name: Create GitHub Release
-    needs: [build-linux, build-macos]
+  release:
+    name: Build and publish release
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+      - uses: bazelbuild/setup-bazelisk@v3
+      - run: BAZEL=bazelisk bash tools/build-release-binaries.sh release
 
       - name: Determine tag
         id: tag
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
           else
-            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Download Linux/Windows artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: binaries-linux-windows
-          path: ./release
-
-      - name: Download macOS artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: binaries-macos
-          path: ./release-macos
-
-      - name: Merge artifacts and create combined checksums
-        run: |
-          # Move macOS binaries to release directory
-          mv release-macos/* release/
-          rmdir release-macos
-
-          # Create combined checksums
-          cd release
-          rm -f SHA256SUMS.txt
-          sha256sum * | grep -v SHA256SUMS > SHA256SUMS.txt
-          cat SHA256SUMS.txt
-
-      - name: List release files
-        run: |
-          ls -lh release/
-          echo "Files to be released:"
-          ls release/
-
-      - name: Create release notes
-        id: release_notes
+      - name: Write release notes
         run: |
           cat > release_notes.md << 'EOF'
           ## Hermetic Launcher ${{ steps.tag.outputs.tag }}
 
-          Minimal, dependency-free Bazel runfiles stub runner for Linux, macOS, and Windows.
+          Bazel-built release binaries for Linux, macOS, and Windows.
 
-          ### Download
+          ### Templates
+          - `runfiles-stub-x86_64-linux`
+          - `runfiles-stub-aarch64-linux`
+          - `runfiles-stub-x86_64-macos`
+          - `runfiles-stub-aarch64-macos`
+          - `runfiles-stub-x86_64-windows.exe`
+          - `runfiles-stub-aarch64-windows.exe`
 
-          **Templates** (Platform-specific stub binaries):
-          - `runfiles-stub-x86_64-linux` - Linux x86_64
-          - `runfiles-stub-aarch64-linux` - Linux aarch64
-          - `runfiles-stub-x86_64-macos` - macOS x86_64 (Intel)
-          - `runfiles-stub-aarch64-macos` - macOS aarch64 (Apple Silicon)
-          - `runfiles-stub-x86_64-windows.exe` - Windows x86_64
+          ### Finalizers
+          - `finalize-stub-x86_64-linux`
+          - `finalize-stub-aarch64-linux`
+          - `finalize-stub-x86_64-macos`
+          - `finalize-stub-aarch64-macos`
+          - `finalize-stub-x86_64-windows.exe`
+          - `finalize-stub-aarch64-windows.exe`
 
-          **Finalizers** (Tools to patch templates with arguments):
-          - `finalize-stub-x86_64-linux` - Linux x86_64 (static, musl)
-          - `finalize-stub-aarch64-linux` - Linux aarch64 (static, musl)
-          - `finalize-stub-x86_64-macos` - macOS x86_64 (Intel)
-          - `finalize-stub-aarch64-macos` - macOS aarch64 (Apple Silicon)
-          - `finalize-stub-x86_64-windows.exe` - Windows x86_64
-
-          ### Usage
-
-          1. Download the appropriate template for your target platform
-          2. Download the finalizer for your build platform
-          3. Finalize the template with your arguments:
-             ```bash
-             ./finalize-stub-x86_64-linux \
-               --transform=0 \
-               -o my-stub \
-               -- \
-               runfiles-stub-x86_64-linux \
-               /path/to/executable arg1 arg2
-             ```
-          4. Run the finalized stub with runfiles environment:
-             ```bash
-             RUNFILES_MANIFEST_FILE=manifest.txt ./my-stub
-             ```
-
-          ### Features
-
-          - **No dependencies**: Fully static binaries (Linux), minimal dependencies (macOS/Windows)
-          - **Cross-platform finalizer**: Finalize stubs for any platform from any platform
-          - **Deterministic**: Same input always produces same output, regardless of build platform
-          - **Runtime arguments**: Forward additional arguments at runtime
-          - **Size**: ~10-70KB depending on platform
-
-          ### Verification
-
-          Verify checksums with:
+          Verify downloads with:
           ```bash
           sha256sum -c SHA256SUMS.txt
           ```
           EOF
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
+      - name: List release files
+        run: ls -lh release/
+
+      - uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: Release ${{ steps.tag.outputs.tag }}
           body_path: release_notes.md
           draft: false
           prerelease: false
-          files: |
-            release/*
+          files: release/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
