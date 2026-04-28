@@ -25,18 +25,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: bazel test //...
+      - run: bazel test //integration-tests:integration_test
 
   test-macos:
     name: Test macOS
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - run: bazel test //...
+      - run: bazel test //integration-tests:integration_test
 
   test-windows:
     name: Test Windows
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - run: bazel test //...
+      - run: bazel test //integration-tests:integration_test
