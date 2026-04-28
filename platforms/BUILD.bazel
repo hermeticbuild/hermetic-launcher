@@ -4,6 +4,7 @@ platform(
         "@llvm//constraints/libc:gnu.2.28",
     ],
     parents = ["@platforms//host"],
+    visibility = ["//visibility:public"],
 )
 
 platform(
@@ -12,4 +13,5 @@ platform(
         "@rules_rs//rs/platforms/constraints:windows_msvc",
     ],
     parents = ["@platforms//host"],
+    visibility = ["//visibility:public"],
 )
