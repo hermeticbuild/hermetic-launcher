@@ -1,4 +1,4 @@
 exports_files([
     "llvm-copy-subprojects-on-windows.patch",
-    "rules-rs-expose-rust-lld.patch",
+    "rules-rs-windows-gnullvm-exec.patch",
 ])

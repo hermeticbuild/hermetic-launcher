@@ -14,8 +14,7 @@ common --bes_results_url=https://app.buildbuddy.io/invocation/
 common --bes_backend=grpcs://remote.buildbuddy.io
 
 common:linux --host_platform=//platforms:local_gnu
-common:windows --host_platform=//platforms:local_windows_msvc
-common:windows --@rules_rust//rust/settings:toolchain_linker_preference=rust
+common:windows --host_platform=//platforms:local_windows_gnullvm
 common:windows --@rules_rust//rust/settings:extra_exec_rustc_flag=-Ccodegen-units=1
 
 common:release -c opt

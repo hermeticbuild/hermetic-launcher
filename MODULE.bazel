@@ -20,7 +20,7 @@ bazel_dep(name = "rules_rs", version = "0.0.62", dev_dependency = True)
 single_version_override(
     module_name = "rules_rs",
     patch_strip = 1,
-    patches = ["//patches:rules-rs-expose-rust-lld.patch"],
+    patches = ["//patches:rules-rs-windows-gnullvm-exec.patch"],
     version = "0.0.62",
 )
 
