@@ -26,6 +26,13 @@ config_setting(
     ],
 )
 
+STATIC_BINARY_PLATFORM = select({
+    ":linux_x86_64": "@rules_rs//rs/platforms:x86_64-unknown-linux-musl",
+    ":linux_aarch64": "@rules_rs//rs/platforms:aarch64-unknown-linux-musl",
+    ":windows": "//platforms:local_windows_gnullvm",
+    "//conditions:default": "@platforms//host:host",
+})
+
 rust_binary(
     name = "test-runner",
     srcs = ["src/main.rs"],
@@ -67,13 +74,14 @@ rust_binary(
 
 platform_data(
     name = "static-runfiles-stub",
-    platform = select({
-        ":linux_x86_64": "@rules_rs//rs/platforms:x86_64-unknown-linux-musl",
-        ":linux_aarch64": "@rules_rs//rs/platforms:aarch64-unknown-linux-musl",
-        ":windows": "//platforms:local_windows_gnullvm",
-        "//conditions:default": "@platforms//host:host",
-    }),
+    platform = STATIC_BINARY_PLATFORM,
     target = "//runfiles-stub",
+)
+
+platform_data(
+    name = "static-finalize-stub",
+    platform = STATIC_BINARY_PLATFORM,
+    target = "//finalize-stub",
 )
 
 copy_to_directory(
@@ -91,15 +99,15 @@ sh_test(
     name = "integration_test",
     srcs = ["integration_test.sh"],
     data = [
+        ":static-finalize-stub",
         ":static-runfiles-stub",
         ":test-binaries",
         ":test-runner",
-        "//finalize-stub",
         "@bazel_tools//tools/bash/runfiles",
     ],
     env = {
+        "FINALIZER_BIN_RL": "$(rlocationpath :static-finalize-stub)",
         "TEMPLATE_BIN_RL": "$(rlocationpath :static-runfiles-stub)",
-        "FINALIZER_BIN_RL": "$(rlocationpath //finalize-stub:finalize-stub)",
         "TEST_RUNNER_RL": "$(rlocationpath :test-runner)",
         "TEST_BIN_DIR_RL": "$(rlocationpath :test-binaries)",
     },
