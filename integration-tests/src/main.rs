@@ -55,6 +55,36 @@ struct RunfilesSetup {
     entries: HashMap<String, PathBuf>,
 }
 
+fn resolve_runfile_path(path: PathBuf) -> PathBuf {
+    if path.exists() || path.is_absolute() {
+        return path;
+    }
+
+    let runfiles_key = path.to_string_lossy().replace('\\', "/");
+    for root_var in ["RUNFILES_DIR", "TEST_SRCDIR"] {
+        if let Some(root) = env::var_os(root_var) {
+            let candidate = PathBuf::from(root).join(&runfiles_key);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+
+    if let Some(manifest_path) = env::var_os("RUNFILES_MANIFEST_FILE") {
+        if let Ok(contents) = fs::read_to_string(manifest_path) {
+            for line in contents.lines() {
+                if let Some((key, value)) = line.split_once(' ') {
+                    if key == runfiles_key {
+                        return PathBuf::from(value);
+                    }
+                }
+            }
+        }
+    }
+
+    path
+}
+
 impl TestConfig {
     fn from_args() -> Result<Self, String> {
         let args: Vec<String> = env::args().collect();
@@ -100,10 +130,12 @@ impl TestConfig {
             i += 1;
         }
 
-        let template_path = template_path.ok_or("--template is required")?;
-        let finalizer_path = finalizer_path.ok_or("--finalizer is required")?;
-        let test_binaries_dir = test_binaries_dir.ok_or("--test-binaries is required")?;
-        let work_dir = work_dir.unwrap_or_else(|| env::temp_dir().join("runfiles-stub-tests"));
+        let template_path = resolve_runfile_path(template_path.ok_or("--template is required")?);
+        let finalizer_path = resolve_runfile_path(finalizer_path.ok_or("--finalizer is required")?);
+        let test_binaries_dir = resolve_runfile_path(test_binaries_dir.ok_or("--test-binaries is required")?);
+        let work_dir = work_dir
+            .or_else(|| env::var_os("TEST_TMPDIR").map(|dir| PathBuf::from(dir).join("work")))
+            .unwrap_or_else(|| env::temp_dir().join("runfiles-stub-tests"));
 
         // Validate paths exist
         if !template_path.exists() {

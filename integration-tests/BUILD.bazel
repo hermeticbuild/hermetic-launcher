@@ -1,7 +1,6 @@
 load("@bazel_lib//lib:copy_to_directory.bzl", "copy_to_directory")
 load("@rules_platform//platform_data:defs.bzl", "platform_data")
-load("@rules_rust//rust:defs.bzl", "rust_binary")
-load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
 
 config_setting(
     name = "linux_x86_64",
@@ -32,13 +31,6 @@ STATIC_BINARY_PLATFORM = select({
     ":windows": "//platforms:local_windows_gnullvm",
     "//conditions:default": "@platforms//host:host",
 })
-
-rust_binary(
-    name = "test-runner",
-    srcs = ["src/main.rs"],
-    edition = "2021",
-    visibility = ["//visibility:public"],
-)
 
 rust_binary(
     name = "hash-file",
@@ -95,20 +87,22 @@ copy_to_directory(
     ],
 )
 
-sh_test(
+rust_test(
     name = "integration_test",
-    srcs = ["integration_test.sh"],
+    srcs = ["src/main.rs"],
+    args = [
+        "--template",
+        "$(rlocationpath :static-runfiles-stub)",
+        "--finalizer",
+        "$(rlocationpath :static-finalize-stub.exe)",
+        "--test-binaries",
+        "$(rlocationpath :test-binaries)",
+    ],
     data = [
         ":static-finalize-stub.exe",
         ":static-runfiles-stub",
         ":test-binaries",
-        ":test-runner",
-        "@bazel_tools//tools/bash/runfiles",
     ],
-    env = {
-        "FINALIZER_BIN_RL": "$(rlocationpath :static-finalize-stub.exe)",
-        "TEMPLATE_BIN_RL": "$(rlocationpath :static-runfiles-stub)",
-        "TEST_RUNNER_RL": "$(rlocationpath :test-runner)",
-        "TEST_BIN_DIR_RL": "$(rlocationpath :test-binaries)",
-    },
+    edition = "2021",
+    use_libtest_harness = False,
 )
