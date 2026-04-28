@@ -1,5 +1,4 @@
 exports_files([
-    "llvm-copy-subprojects-on-windows.patch",
     "rules-rust-skip-unused-cc-runtime.patch",
     "rules-rs-windows-rust-linker.patch",
 ])
