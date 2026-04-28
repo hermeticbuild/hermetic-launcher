@@ -103,6 +103,7 @@ rust_test(
         ":static-runfiles-stub",
         ":test-binaries",
     ],
+    deps = ["@rules_rust//rust/runfiles"],
     edition = "2021",
     use_libtest_harness = False,
 )

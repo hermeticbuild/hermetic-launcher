@@ -5,7 +5,6 @@ module(
 bazel_dep(name = "bazel_skylib", version = "1.9.0")
 bazel_dep(name = "bazel_lib", version = "3.2.2")
 bazel_dep(name = "platforms", version = "1.0.0")
-bazel_dep(name = "rules_shell", version = "0.6.1")
 
 non_module_dependencies = use_extension("//launcher/private:extensions.bzl", "non_module_dependencies")
 use_repo(non_module_dependencies, "finalize_stub_aarch64_linux", "finalize_stub_aarch64_macos", "finalize_stub_x86_64_linux", "finalize_stub_x86_64_macos", "finalize_stub_x86_64_windows", "runfiles_stub_aarch64_linux", "runfiles_stub_aarch64_macos", "runfiles_stub_x86_64_linux", "runfiles_stub_x86_64_macos", "runfiles_stub_x86_64_windows")
@@ -16,12 +15,12 @@ register_toolchains("//launcher/private/prebuilt:all")
 
 bazel_dep(name = "rules_cc", version = "0.2.18", dev_dependency = True)
 bazel_dep(name = "rules_platform", version = "0.1.0", dev_dependency = True)
-bazel_dep(name = "rules_rs", version = "0.0.62", dev_dependency = True)
+bazel_dep(name = "rules_rs", version = "0.0.64", dev_dependency = True)
 single_version_override(
     module_name = "rules_rs",
     patch_strip = 1,
     patches = ["//patches:rules-rs-windows-rust-linker.patch"],
-    version = "0.0.62",
+    version = "0.0.64",
 )
 
 toolchains = use_extension("@rules_rs//rs/toolchains:module_extension.bzl", "toolchains")
@@ -101,10 +100,11 @@ inject_repo(crate, "xz")
 bazel_dep(name = "llvm", version = "0.7.5", dev_dependency = True)
 single_version_override(
     module_name = "llvm",
-    patch_strip = 1,
-    patches = ["//patches:llvm-copy-subprojects-on-windows.patch"],
     version = "0.7.5",
 )
+
+osx = use_extension("@llvm//extensions:osx.bzl", "osx", dev_dependency = True)
+use_repo(osx, "macos_sdk")
 
 register_toolchains(
     "@llvm//toolchain:all",
