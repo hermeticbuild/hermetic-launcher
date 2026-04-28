@@ -15,6 +15,7 @@ common --bes_backend=grpcs://remote.buildbuddy.io
 
 common:linux --host_platform=//platforms:local_gnu
 common:windows --repo_env=BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=0
+common:windows --extra_toolchains=@local_config_cc_toolchains//:all
 common:windows --host_platform=//platforms:local_windows_msvc
 
 common:release -c opt
