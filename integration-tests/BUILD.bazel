@@ -70,7 +70,7 @@ platform_data(
     platform = select({
         ":linux_x86_64": "@rules_rs//rs/platforms:x86_64-unknown-linux-musl",
         ":linux_aarch64": "@rules_rs//rs/platforms:aarch64-unknown-linux-musl",
-        ":windows": "//platforms:local_windows_msvc",
+        ":windows": "//platforms:local_windows_gnullvm",
         "//conditions:default": "@platforms//host:host",
     }),
     target = "//runfiles-stub",
