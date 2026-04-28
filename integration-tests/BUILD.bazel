@@ -1,0 +1,109 @@
+load("@bazel_lib//lib:copy_to_directory.bzl", "copy_to_directory")
+load("@rules_platform//platform_data:defs.bzl", "platform_data")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+
+config_setting(
+    name = "linux_x86_64",
+    constraint_values = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
+)
+
+config_setting(
+    name = "linux_aarch64",
+    constraint_values = [
+        "@platforms//os:linux",
+        "@platforms//cpu:aarch64",
+    ],
+)
+
+config_setting(
+    name = "windows",
+    constraint_values = [
+        "@platforms//os:windows",
+    ],
+)
+
+STATIC_BINARY_PLATFORM = select({
+    ":linux_x86_64": "@rules_rs//rs/platforms:x86_64-unknown-linux-musl",
+    ":linux_aarch64": "@rules_rs//rs/platforms:aarch64-unknown-linux-musl",
+    ":windows": "//platforms:local_windows_gnullvm",
+    "//conditions:default": "@platforms//host:host",
+})
+
+rust_binary(
+    name = "hash-file",
+    srcs = ["src/bin/hash_file.rs"],
+    edition = "2021",
+    deps = ["@integration_crates//:sha2"],
+)
+
+rust_binary(
+    name = "add-numbers",
+    srcs = ["src/bin/add_numbers.rs"],
+    edition = "2021",
+)
+
+rust_binary(
+    name = "merge-json",
+    srcs = ["src/bin/merge_json.rs"],
+    edition = "2021",
+    deps = ["@integration_crates//:serde_json"],
+)
+
+rust_binary(
+    name = "orchestrator",
+    srcs = ["src/bin/orchestrator.rs"],
+    edition = "2021",
+)
+
+rust_binary(
+    name = "print-env",
+    srcs = ["src/bin/print_env.rs"],
+    edition = "2021",
+)
+
+platform_data(
+    name = "static-runfiles-stub",
+    platform = STATIC_BINARY_PLATFORM,
+    target = "//runfiles-stub",
+)
+
+platform_data(
+    name = "static-finalize-stub.exe",
+    platform = STATIC_BINARY_PLATFORM,
+    target = "//finalize-stub",
+)
+
+copy_to_directory(
+    name = "test-binaries",
+    srcs = [
+        ":add-numbers",
+        ":hash-file",
+        ":merge-json",
+        ":orchestrator",
+        ":print-env",
+    ],
+)
+
+rust_test(
+    name = "integration_test",
+    srcs = ["src/main.rs"],
+    args = [
+        "--template",
+        "$(rlocationpath :static-runfiles-stub)",
+        "--finalizer",
+        "$(rlocationpath :static-finalize-stub.exe)",
+        "--test-binaries",
+        "$(rlocationpath :test-binaries)",
+    ],
+    data = [
+        ":static-finalize-stub.exe",
+        ":static-runfiles-stub",
+        ":test-binaries",
+    ],
+    deps = ["@rules_rust//rust/runfiles"],
+    edition = "2021",
+    use_libtest_harness = False,
+)

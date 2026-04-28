@@ -1,0 +1,8 @@
+platform(
+    name = "rbe_platform",
+    exec_properties = {
+        "container-image": "docker://ubuntu:22.04",
+        "OSFamily": "Linux",
+    },
+    parents = ["@rules_rs//rs/platforms:x86_64-unknown-linux-gnu"],
+)

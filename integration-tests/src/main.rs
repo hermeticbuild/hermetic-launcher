@@ -18,6 +18,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+use runfiles::{rlocation, Runfiles};
+
 /// Platform-specific path separator for manifest values
 #[cfg(windows)]
 const PATH_SEP: char = '\\';
@@ -53,6 +55,15 @@ struct RunfilesSetup {
     manifest_path: PathBuf,
     /// Mapping from rlocation paths to absolute paths
     entries: HashMap<String, PathBuf>,
+}
+
+fn resolve_runfile_path(runfiles: &Runfiles, path: PathBuf) -> PathBuf {
+    if path.exists() || path.is_absolute() {
+        return path;
+    }
+
+    let runfiles_key = path.to_string_lossy().replace('\\', "/");
+    rlocation!(runfiles, runfiles_key.as_str()).unwrap_or(path)
 }
 
 impl TestConfig {
@@ -100,10 +111,19 @@ impl TestConfig {
             i += 1;
         }
 
-        let template_path = template_path.ok_or("--template is required")?;
-        let finalizer_path = finalizer_path.ok_or("--finalizer is required")?;
-        let test_binaries_dir = test_binaries_dir.ok_or("--test-binaries is required")?;
-        let work_dir = work_dir.unwrap_or_else(|| env::temp_dir().join("runfiles-stub-tests"));
+        let runfiles = Runfiles::create()
+            .map_err(|err| format!("Failed to create runfiles resolver: {err}"))?;
+        let template_path =
+            resolve_runfile_path(&runfiles, template_path.ok_or("--template is required")?);
+        let finalizer_path =
+            resolve_runfile_path(&runfiles, finalizer_path.ok_or("--finalizer is required")?);
+        let test_binaries_dir = resolve_runfile_path(
+            &runfiles,
+            test_binaries_dir.ok_or("--test-binaries is required")?,
+        );
+        let work_dir = work_dir
+            .or_else(|| env::var_os("TEST_TMPDIR").map(|dir| PathBuf::from(dir).join("work")))
+            .unwrap_or_else(|| env::temp_dir().join("runfiles-stub-tests"));
 
         // Validate paths exist
         if !template_path.exists() {

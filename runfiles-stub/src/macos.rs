@@ -4,7 +4,6 @@
 extern crate alloc;
 
 use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
@@ -37,10 +36,6 @@ static ALLOCATOR: TalcAllocator = TalcAllocator(UnsafeCell::new(Talc::new(unsafe
 fn panic(_info: &PanicInfo) -> ! {
     unsafe { exit(1) }
 }
-
-// Required by alloc crate for exception handling (unused with panic=abort)
-#[no_mangle]
-extern "C" fn rust_eh_personality() {}
 
 // External libc functions
 extern "C" {

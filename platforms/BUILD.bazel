@@ -1,0 +1,17 @@
+platform(
+    name = "local_gnu",
+    parents = ["@rules_rs//rs/platforms:x86_64-unknown-linux-gnu"],
+    visibility = ["//visibility:public"],
+)
+
+platform(
+    name = "local_windows_msvc",
+    parents = ["@rules_rs//rs/platforms:x86_64-pc-windows-msvc"],
+    visibility = ["//visibility:public"],
+)
+
+platform(
+    name = "local_windows_gnullvm",
+    parents = ["@rules_rs//rs/platforms:x86_64-pc-windows-gnullvm"],
+    visibility = ["//visibility:public"],
+)
