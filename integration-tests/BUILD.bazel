@@ -19,6 +19,13 @@ config_setting(
     ],
 )
 
+config_setting(
+    name = "windows",
+    constraint_values = [
+        "@platforms//os:windows",
+    ],
+)
+
 rust_binary(
     name = "test-runner",
     srcs = ["src/main.rs"],
@@ -63,6 +70,7 @@ platform_data(
     platform = select({
         ":linux_x86_64": "@rules_rs//rs/platforms:x86_64-unknown-linux-musl",
         ":linux_aarch64": "@rules_rs//rs/platforms:aarch64-unknown-linux-musl",
+        ":windows": "//platforms:local_windows_msvc",
         "//conditions:default": "@platforms//host:host",
     }),
     target = "//runfiles-stub",
