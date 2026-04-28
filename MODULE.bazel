@@ -18,14 +18,6 @@ bazel_dep(name = "rules_cc", version = "0.2.18", dev_dependency = True)
 bazel_dep(name = "rules_platform", version = "0.1.0", dev_dependency = True)
 bazel_dep(name = "rules_rs", version = "0.0.62", dev_dependency = True)
 
-cc_configure = use_extension("@rules_cc//cc:extensions.bzl", "cc_configure_extension", dev_dependency = True)
-use_repo(cc_configure, "local_config_cc", "local_config_cc_toolchains")
-
-register_toolchains(
-    "@local_config_cc_toolchains//:all",
-    dev_dependency = True,
-)
-
 toolchains = use_extension("@rules_rs//rs/toolchains:module_extension.bzl", "toolchains")
 toolchains.toolchain(
     edition = "2021",
