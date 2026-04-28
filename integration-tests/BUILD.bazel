@@ -79,7 +79,7 @@ platform_data(
 )
 
 platform_data(
-    name = "static-finalize-stub",
+    name = "static-finalize-stub.exe",
     platform = STATIC_BINARY_PLATFORM,
     target = "//finalize-stub",
 )
@@ -99,14 +99,14 @@ sh_test(
     name = "integration_test",
     srcs = ["integration_test.sh"],
     data = [
-        ":static-finalize-stub",
+        ":static-finalize-stub.exe",
         ":static-runfiles-stub",
         ":test-binaries",
         ":test-runner",
         "@bazel_tools//tools/bash/runfiles",
     ],
     env = {
-        "FINALIZER_BIN_RL": "$(rlocationpath :static-finalize-stub)",
+        "FINALIZER_BIN_RL": "$(rlocationpath :static-finalize-stub.exe)",
         "TEMPLATE_BIN_RL": "$(rlocationpath :static-runfiles-stub)",
         "TEST_RUNNER_RL": "$(rlocationpath :test-runner)",
         "TEST_BIN_DIR_RL": "$(rlocationpath :test-binaries)",
