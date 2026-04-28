@@ -8,6 +8,15 @@ platform(
 )
 
 platform(
+    name = "local_windows_msvc",
+    constraint_values = [
+        "@rules_rs//rs/platforms/constraints:windows_msvc",
+    ],
+    parents = ["@platforms//host"],
+    visibility = ["//visibility:public"],
+)
+
+platform(
     name = "local_windows_gnullvm",
     constraint_values = [
         "@rules_rs//rs/platforms/constraints:windows_gnullvm",
