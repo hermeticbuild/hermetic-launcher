@@ -15,6 +15,7 @@ common --bes_backend=grpcs://remote.buildbuddy.io
 
 common:linux --host_platform=//platforms:local_gnu
 common:windows --host_platform=//platforms:local_windows_msvc
+common:windows --@rules_rust//rust/settings:toolchain_linker_preference=rust
 
 common:release -c opt
 common:release --@rules_rust//rust/settings:codegen_units=1

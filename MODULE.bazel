@@ -17,6 +17,12 @@ register_toolchains("//launcher/private/prebuilt:all")
 bazel_dep(name = "rules_cc", version = "0.2.18", dev_dependency = True)
 bazel_dep(name = "rules_platform", version = "0.1.0", dev_dependency = True)
 bazel_dep(name = "rules_rs", version = "0.0.62", dev_dependency = True)
+single_version_override(
+    module_name = "rules_rs",
+    patch_strip = 1,
+    patches = ["//patches:rules-rs-expose-rust-lld.patch"],
+    version = "0.0.62",
+)
 
 toolchains = use_extension("@rules_rs//rs/toolchains:module_extension.bzl", "toolchains")
 toolchains.toolchain(
