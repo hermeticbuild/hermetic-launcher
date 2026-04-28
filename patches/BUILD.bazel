@@ -1,0 +1,3 @@
+exports_files([
+    "llvm-copy-subprojects-on-windows.patch",
+])

@@ -1,0 +1,44 @@
+--- a/extensions/llvm_source.bzl
++++ b/extensions/llvm_source.bzl
+@@ -194,13 +194,39 @@
+             strip_prefix = params.strip_prefix,
+             urls = params.urls,
+         )
++
++def _powershell_quote(value):
++    return "'" + str(value).replace("'", "''") + "'"
++
++def _copy_tree_with_powershell(rctx, src_dir):
++    command = "; ".join([
++        "$ErrorActionPreference = 'Stop'",
++        "Copy-Item -Path {src} -Destination {dst} -Recurse -Force".format(
++            src = _powershell_quote(str(src_dir).replace("\\", "/") + "/*"),
++            dst = _powershell_quote(str(rctx.path(".")).replace("\\", "/")),
++        ),
++    ])
++    result = rctx.execute([
++        "powershell.exe",
++        "-NoProfile",
++        "-NonInteractive",
++        "-ExecutionPolicy",
++        "Bypass",
++        "-Command",
++        command,
++    ])
++    if result.return_code:
++        fail("Failed to copy LLVM subproject tree: " + result.stderr)
+ 
+ def _llvm_subproject_repository_impl(rctx):
+     llvm_root = rctx.path(Label("@llvm-raw//:WORKSPACE")).dirname
+     src_dir = llvm_root.get_child(rctx.attr.dir)
+ 
+-    for entry in src_dir.readdir():
+-        rctx.symlink(entry, entry.basename)
++    if rctx.os.name.lower().startswith("windows"):
++        _copy_tree_with_powershell(rctx, src_dir)
++    else:
++        for entry in src_dir.readdir():
++            rctx.symlink(entry, entry.basename)
+ 
+     rctx.file("BUILD.bazel", rctx.read(rctx.attr.build_file))
+     return rctx.repo_metadata(reproducible = True)

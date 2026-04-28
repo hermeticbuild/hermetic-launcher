@@ -89,6 +89,12 @@ crate.annotation(
 inject_repo(crate, "xz")
 
 bazel_dep(name = "llvm", version = "0.7.5", dev_dependency = True)
+single_version_override(
+    module_name = "llvm",
+    patch_strip = 1,
+    patches = ["//patches:llvm-copy-subprojects-on-windows.patch"],
+    version = "0.7.5",
+)
 
 register_toolchains(
     "@llvm//toolchain:all",
