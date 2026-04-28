@@ -14,14 +14,15 @@ index ce34973..420f9de 100644
 +        prefer_rust_linker = False
 +
 +    if not ld or prefer_rust_linker:
-@@ -2531 +2541,6 @@ def _add_native_link_flags(
+@@ -2531 +2541,9 @@ def _add_native_link_flags(
 -    args.add_all(make_link_flags_args, map_each = _libraries_dirnames, uniquify = True, format_each = "-Lnative=%s")
-+    has_native_link_inputs = bool(make_link_flags_args) or bool(ambiguous_libs)
-+    link_cc_runtime = has_native_link_inputs or not (
++    link_cc_runtime = not (
 +        toolchain.target_os == "windows" and
 +        toolchain.target_abi == "msvc"
 +    )
++    # The LLVM cc runtime archives are GNU-style .a files; lld-link asks for .lib names.
++    # The Windows MSVC Rust links here do not need those C++ runtime archives.
 +    args.add_all(make_link_flags_args, map_each = _libraries_dirnames, uniquify = True, format_each = "-Lnative=%s")
-@@ -2543 +2558 @@ def _add_native_link_flags(
+@@ -2543 +2561 @@ def _add_native_link_flags(
 -    if cc_toolchain:
 +    if cc_toolchain and link_cc_runtime:
