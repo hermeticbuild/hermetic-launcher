@@ -19,6 +19,14 @@ selects.config_setting_group(
 )
 
 selects.config_setting_group(
+    name = "s390x_linux",
+    match_all = [
+        "@platforms//cpu:s390x",
+        "@platforms//os:linux",
+    ],
+)
+
+selects.config_setting_group(
     name = "x86_64_linux",
     match_all = [
         "@platforms//cpu:x86_64",
