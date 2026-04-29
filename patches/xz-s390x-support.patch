@@ -1,0 +1,44 @@
+diff --git a/BUILD.bazel b/BUILD.bazel
+--- a/BUILD.bazel
++++ b/BUILD.bazel
+@@ -52,6 +52,14 @@
+     ],
+ )
+ 
++config_setting(
++    name = "linux_s390x",
++    constraint_values = [
++        "@platforms//os:linux",
++        "@platforms//cpu:s390x",
++    ],
++)
++
+ config_setting(
+     name = "wasm32",
+     constraint_values = [
+@@ -82,6 +90,17 @@
+     template = "config.lzma-linux.h",
+ )
+ 
++expand_template(
++    name = "config_linux_s390x",
++    out = "config.lzma-linux-s390x.h",
++    substitutions = {
++        "{HAVE_IMMINTRIN_H}": "#undef HAVE_IMMINTRIN_H",
++        "{HAVE_CPUID_H}": "#undef HAVE_CPUID_H",
++        "{HAVE_USABLE_CLMUL}": "#undef HAVE_USABLE_CLMUL",
++    },
++    template = "config.lzma-linux.h",
++)
++
+ expand_template(
+     name = "config_linux_x86_64",
+     out = "config.lzma-linux-x86_64.h",
+@@ -105,6 +124,7 @@
+         ":linux_arm64": "config.lzma-linux-arm64.h",
+         ":linux_riscv64": "config.lzma-linux-riscv64.h",
+         ":linux_x86_64": "config.lzma-linux-x86_64.h",
++        ":linux_s390x": "config.lzma-linux-s390x.h",
+         ":osx_arm64": "config.lzma-osx-arm64.h",
+         ":osx_x86_64": "config.lzma-osx-x86_64.h",
+         ":wasm32": "config.lzma-wasm32.h",
