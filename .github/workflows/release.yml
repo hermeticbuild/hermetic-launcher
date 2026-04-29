@@ -41,6 +41,7 @@ jobs:
           ### Templates
           - `runfiles-stub-x86_64-linux`
           - `runfiles-stub-aarch64-linux`
+          - `runfiles-stub-s390x-linux` (IBM Z)
           - `runfiles-stub-x86_64-macos`
           - `runfiles-stub-aarch64-macos`
           - `runfiles-stub-x86_64-windows.exe`
@@ -49,6 +50,7 @@ jobs:
           ### Finalizers
           - `finalize-stub-x86_64-linux`
           - `finalize-stub-aarch64-linux`
+          - `finalize-stub-s390x-linux` (IBM Z)
           - `finalize-stub-x86_64-macos`
           - `finalize-stub-aarch64-macos`
           - `finalize-stub-x86_64-windows.exe`
