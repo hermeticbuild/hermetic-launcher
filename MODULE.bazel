@@ -98,9 +98,14 @@ crate.annotation(
 inject_repo(crate, "xz")
 
 bazel_dep(name = "llvm", version = "0.7.5", dev_dependency = True)
-single_version_override(
+
+LLVM_COMMIT = "a0ec45f696e74980914e8f9f88ff9132da098acc"
+
+archive_override(
     module_name = "llvm",
-    version = "0.7.5",
+    integrity = "sha256-bQldhQn3L0kruQemoaCaJ7Gwc8fHqvyNqNyBbvZwx5w=",
+    strip_prefix = "hermetic-llvm-{}".format(LLVM_COMMIT),
+    urls = ["https://github.com/hermeticbuild/hermetic-llvm/archive/{}.tar.gz".format(LLVM_COMMIT)],
 )
 
 osx = use_extension("@llvm//extensions:osx.bzl", "osx", dev_dependency = True)
