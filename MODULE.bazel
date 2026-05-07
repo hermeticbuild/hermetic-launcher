@@ -97,10 +97,10 @@ crate.annotation(
 
 inject_repo(crate, "xz")
 
-bazel_dep(name = "llvm", version = "0.7.5", dev_dependency = True)
+bazel_dep(name = "llvm", version = "0.7.9", dev_dependency = True)
 single_version_override(
     module_name = "llvm",
-    version = "0.7.5",
+    version = "0.7.9",
 )
 
 osx = use_extension("@llvm//extensions:osx.bzl", "osx", dev_dependency = True)
