@@ -12,7 +12,7 @@ def _get_template(ctx, *, cfg = "target", template_exec_group = None, template_f
         toolchain = toolchain_dict["@hermetic_launcher//launcher:template_exec_toolchain_type"]
     else:
         fail("Invalid cfg '%s': must be 'target' or 'exec'" % cfg)
-    return toolchain.tempaltetoolchaininfo.template_exe
+    return toolchain.templatetoolchaininfo.template_exe
 
 def _to_rlocation_path(f):
     if f.short_path.startswith("../"):
