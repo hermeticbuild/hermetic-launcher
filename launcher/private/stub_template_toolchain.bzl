@@ -24,6 +24,10 @@ def _stub_template_toolchain_impl(ctx):
         template_exe = ctx.file.template_exe,
     )
     toolchain_info = platform_common.ToolchainInfo(
+        templatetoolchaininfo = stub_template_toolchain_info,
+        # FIXME: This typoed name was used by accident.
+        # rulesets should use the correct spelling.
+        # We will remove this field in a few releases.
         tempaltetoolchaininfo = stub_template_toolchain_info,
     )
 
