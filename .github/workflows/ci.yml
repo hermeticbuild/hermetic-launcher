@@ -19,6 +19,13 @@ jobs:
           name: binaries
           path: artifacts/
           retention-days: 7
+  
+  test-works-without-dev-deps:
+    name: Ensure hermetic launcher works without dev deps
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bazel query --ignore_dev_dependency //launcher/...
 
   test-linux:
     name: Test Linux

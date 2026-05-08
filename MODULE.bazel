@@ -23,7 +23,7 @@ single_version_override(
     version = "0.0.64",
 )
 
-toolchains = use_extension("@rules_rs//rs/toolchains:module_extension.bzl", "toolchains")
+toolchains = use_extension("@rules_rs//rs/toolchains:module_extension.bzl", "toolchains", dev_dependency = True)
 toolchains.toolchain(
     edition = "2021",
     version = "1.95.0",
@@ -35,7 +35,7 @@ use_repo(
 
 register_toolchains("@default_rust_toolchains//:all")
 
-rules_rust = use_extension("@rules_rs//rs:rules_rust.bzl", "rules_rust")
+rules_rust = use_extension("@rules_rs//rs:rules_rust.bzl", "rules_rust", dev_dependency = True)
 rules_rust.patch(
     patches = ["//patches:rules-rust-skip-unused-cc-runtime.patch"],
     strip = 1,
