@@ -20,12 +20,13 @@ jobs:
           path: artifacts/
           retention-days: 7
   
-  test-works-without-dev-deps:
-    name: Ensure hermetic launcher works without dev deps
+  test-query:
+    name: Query test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: bazel query --ignore_dev_dependency //launcher/...
+      - run: bazel query //...
 
   test-linux:
     name: Test Linux
@@ -33,6 +34,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: bazel test //integration-tests:integration_test
+      - run: bazel test //...
+        working-directory: e2e/bzlmod
 
   test-macos:
     name: Test macOS
@@ -40,6 +43,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: bazel test //integration-tests:integration_test
+      - run: bazel test //...
+        working-directory: e2e/bzlmod
 
   test-windows:
     name: Test Windows
@@ -47,3 +52,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: bazel --output_user_root=C:/b test //integration-tests:integration_test
+      - run: bazel test //...
+        working-directory: e2e/bzlmod
