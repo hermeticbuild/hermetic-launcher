@@ -57,6 +57,10 @@ fn create_release_archive(output_path: &str) -> Result<()> {
     let launcher_dir = repo_root.join("launcher");
     add_directory_to_archive(&mut archive, &launcher_dir, "launcher")?;
 
+    // Add e2e directory recursively
+    let e2e_dir = repo_root.join("e2e");
+    add_directory_to_archive(&mut archive, &e2e_dir, "e2e")?;
+
     // Finish writing the archive
     archive.finish()
         .context("Failed to finalize archive")?;
