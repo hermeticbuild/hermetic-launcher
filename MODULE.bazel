@@ -33,7 +33,7 @@ use_repo(
     "default_rust_toolchains",
 )
 
-register_toolchains("@default_rust_toolchains//:all")
+register_toolchains("@default_rust_toolchains//:all", dev_dependency = True)
 
 rules_rust = use_extension("@rules_rs//rs:rules_rust.bzl", "rules_rust", dev_dependency = True)
 rules_rust.patch(
