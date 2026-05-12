@@ -4,7 +4,7 @@ module(
 
 bazel_dep(name = "bazel_skylib", version = "1.9.0")
 bazel_dep(name = "bazel_lib", version = "3.2.2")
-bazel_dep(name = "platforms", version = "1.0.0")
+bazel_dep(name = "platforms", version = "1.1.0")
 
 non_module_dependencies = use_extension("//launcher/private:extensions.bzl", "non_module_dependencies")
 use_repo(non_module_dependencies, "finalize_stub_aarch64_linux", "finalize_stub_aarch64_macos", "finalize_stub_aarch64_windows", "finalize_stub_s390x_linux", "finalize_stub_x86_64_linux", "finalize_stub_x86_64_macos", "finalize_stub_x86_64_windows", "runfiles_stub_aarch64_linux", "runfiles_stub_aarch64_macos", "runfiles_stub_aarch64_windows", "runfiles_stub_s390x_linux", "runfiles_stub_x86_64_linux", "runfiles_stub_x86_64_macos", "runfiles_stub_x86_64_windows")
@@ -15,12 +15,12 @@ register_toolchains("//launcher/private/prebuilt:all")
 
 bazel_dep(name = "rules_cc", version = "0.2.18", dev_dependency = True)
 bazel_dep(name = "rules_platform", version = "0.1.0", dev_dependency = True)
-bazel_dep(name = "rules_rs", version = "0.0.64", dev_dependency = True)
+bazel_dep(name = "rules_rs", version = "0.0.77", dev_dependency = True)
 single_version_override(
     module_name = "rules_rs",
     patch_strip = 1,
     patches = ["//patches:rules-rs-windows-rust-linker.patch"],
-    version = "0.0.64",
+    version = "0.0.77",
 )
 
 toolchains = use_extension("@rules_rs//rs/toolchains:module_extension.bzl", "toolchains", dev_dependency = True)
@@ -48,7 +48,7 @@ RUST_TRIPLES = [
     "aarch64-apple-darwin",
     "aarch64-pc-windows-gnullvm",
     "aarch64-pc-windows-msvc",
-    "s390x-unknown-linux-gnu",
+    "s390x-unknown-linux-musl",
     "x86_64-unknown-linux-gnu",
     "x86_64-unknown-linux-musl",
     "x86_64-apple-darwin",
