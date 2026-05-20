@@ -1,5 +1,7 @@
+_FINALIZER_TOOLCHAIN_TYPE = "@hermetic_launcher//launcher:finalizer_toolchain_type"
+
 def _get_finalizer(ctx):
-    toolchain = ctx.toolchains["@hermetic_launcher//launcher:finalizer_toolchain_type"]
+    toolchain = ctx.toolchains[_FINALIZER_TOOLCHAIN_TYPE]
     return toolchain.finalizer_info.finalizer
 
 def _get_template(ctx, *, cfg = "target", template_exec_group = None, template_file = None):
@@ -52,6 +54,7 @@ def _compile_stub(*, ctx, embedded_args, transformed_args, output_file, cfg = "t
         executable = _get_finalizer(ctx),
         arguments = [args],
         inputs = [template],
+        toolchain = _FINALIZER_TOOLCHAIN_TYPE,
     )
     return output_file
 
@@ -62,7 +65,7 @@ launcher = struct(
     append_embedded_arg = _append_embedded_arg,
     append_raw_transformed_arg = _append_raw_transformed_arg,
     compile_stub = _compile_stub,
-    finalizer_toolchain_type = "@hermetic_launcher//launcher:finalizer_toolchain_type",
+    finalizer_toolchain_type = _FINALIZER_TOOLCHAIN_TYPE,
     template_toolchain_type = "@hermetic_launcher//launcher:template_toolchain_type",
     template_exec_toolchain_type = "@hermetic_launcher//launcher:template_exec_toolchain_type",
 )
