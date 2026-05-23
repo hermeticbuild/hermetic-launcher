@@ -4,10 +4,5 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-apple-codesign = { version = "0.27", default-features = false }
-clap = { version = "4.5", features = ["derive"] }
-
-[profile.release]
-opt-level = 3
-lto = true
-strip = true
+apple-codesign = { workspace = true, default-features = false }
+clap = { workspace = true, features = ["derive"] }
