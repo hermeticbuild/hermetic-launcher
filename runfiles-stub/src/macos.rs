@@ -42,10 +42,13 @@ extern "C" {
     fn exit(code: i32) -> !;
     fn write(fd: i32, buf: *const u8, count: usize) -> isize;
     fn open(path: *const u8, flags: i32, ...) -> i32;
-    fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
     fn close(fd: i32) -> i32;
     fn access(path: *const u8, mode: i32) -> i32;
     fn execve(path: *const u8, argv: *const *const u8, envp: *const *const u8) -> i32;
+
+    // Memory-map a file read-only (used for the runfiles manifest).
+    fn mmap(addr: *mut core::ffi::c_void, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut core::ffi::c_void;
+    fn lseek(fd: i32, offset: i64, whence: i32) -> i64;
 
     // Access to errno - macOS provides this via __error()
     // Returns a pointer to the thread-local errno variable
@@ -70,6 +73,12 @@ fn path_exists(path: &[u8]) -> bool {
 // File open flags
 const O_RDONLY: i32 = 0;
 const STDOUT: i32 = 1;
+
+// mmap parameters for read-only file mapping
+const PROT_READ: i32 = 1;
+const MAP_PRIVATE: i32 = 2;
+const SEEK_END: i32 = 2;
+const MAP_FAILED: *mut core::ffi::c_void = (-1isize) as *mut core::ffi::c_void;
 
 // String utilities
 fn print(s: &[u8]) {
@@ -167,32 +176,28 @@ fn get_env_var(name: &[u8]) -> Option<String> {
     None
 }
 
-// Manifest entry using String for UTF-8 paths (Bazel-generated)
-struct ManifestEntry {
-    key: String,
-    value: String,
-}
-
+// Memory-mapped manifest: a pointer/length pair into the mapped file. The
+// manifest is scanned lazily on each lookup (O(n)), so no per-entry allocation
+// is needed and arbitrarily large manifests are supported. The kernel caches
+// the file's pages for us.
 struct Manifest {
-    entries: Vec<ManifestEntry>,
+    ptr: *const u8,
+    len: usize,
 }
 
 impl Manifest {
-    fn new() -> Self {
-        Self { entries: Vec::new() }
-    }
-
-    fn add_entry(&mut self, key: &str, value: &str) {
-        self.entries.push(ManifestEntry {
-            key: String::from(key),
-            value: String::from(value),
-        });
+    #[inline]
+    fn data(&self) -> &[u8] {
+        // Safety: ptr/len come from a successful mmap that we leak for the
+        // lifetime of the process (until execve replaces the address space).
+        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
     }
 
     fn lookup(&self, key: &str) -> Option<&str> {
-        for entry in &self.entries {
-            if entry.key == key {
-                return Some(&entry.value);
+        let key_bytes = key.as_bytes();
+        for (k, v) in ManifestLines::new(self.data()) {
+            if k == key_bytes {
+                return core::str::from_utf8(v).ok();
             }
         }
         None
@@ -201,24 +206,66 @@ impl Manifest {
     /// Find the longest manifest entry whose key is a prefix of `path` at a '/' boundary.
     /// Returns (resolved_value, suffix) where suffix includes the leading '/'.
     fn prefix_lookup<'a, 'b>(&'a self, path: &'b str) -> Option<(&'a str, &'b str)> {
-        let mut best: Option<(&str, &str)> = None;
+        let path_bytes = path.as_bytes();
+        let mut best: Option<(&'a str, &'b str)> = None;
         let mut best_len: usize = 0;
-        for entry in &self.entries {
-            let key = &entry.key;
-            if path.len() > key.len()
-                && path.starts_with(key.as_str())
-                && path.as_bytes()[key.len()] == b'/'
-                && key.len() > best_len
+        for (k, v) in ManifestLines::new(self.data()) {
+            if path_bytes.len() > k.len()
+                && k.len() > best_len
+                && &path_bytes[..k.len()] == k
+                && path_bytes[k.len()] == b'/'
             {
-                best_len = key.len();
-                best = Some((&entry.value, &path[key.len()..]));
+                // Values were owned UTF-8 Strings before; keep that guarantee by
+                // only considering candidates whose value is valid UTF-8.
+                if let Ok(value) = core::str::from_utf8(v) {
+                    best_len = k.len();
+                    best = Some((value, &path[k.len()..]));
+                }
             }
         }
         best
     }
 }
 
-// Load manifest file
+/// Iterator over `(key, value)` byte slices of a Bazel runfiles MANIFEST.
+/// Replicates `str::lines()` + `split_once(' ')`: split on '\n', strip one
+/// trailing '\r' (CRLF), and skip lines without a space (e.g. the
+/// "<workspace>/.runfile" marker).
+struct ManifestLines<'a> {
+    rest: &'a [u8],
+}
+
+impl<'a> ManifestLines<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { rest: data }
+    }
+}
+
+impl<'a> Iterator for ManifestLines<'a> {
+    type Item = (&'a [u8], &'a [u8]);
+
+    fn next(&mut self) -> Option<(&'a [u8], &'a [u8])> {
+        while !self.rest.is_empty() {
+            let (mut line, remainder) = match find_byte(self.rest, b'\n') {
+                Some(nl) => (&self.rest[..nl], &self.rest[nl + 1..]),
+                None => (self.rest, &self.rest[self.rest.len()..]),
+            };
+            self.rest = remainder;
+            // Strip one trailing '\r' (handles CRLF line endings).
+            if let Some((&b'\r', head)) = line.split_last() {
+                line = head;
+            }
+            if let Some(sp) = find_byte(line, b' ') {
+                return Some((&line[..sp], &line[sp + 1..]));
+            }
+            // No space -> skip this line and continue.
+        }
+        None
+    }
+}
+
+// Load manifest file by memory-mapping it read-only. Returns None on open
+// failure, empty file (mmap of zero bytes is invalid), or mmap failure.
 fn load_manifest(path: &[u8]) -> Option<Manifest> {
     unsafe {
         let fd = open(path.as_ptr(), O_RDONLY);
@@ -226,34 +273,22 @@ fn load_manifest(path: &[u8]) -> Option<Manifest> {
             return None;
         }
 
-        // Read file into Vec, reading in chunks
-        let mut file_data = Vec::new();
-        let mut chunk = [0u8; 8192];
-        loop {
-            let bytes_read = read(fd, chunk.as_mut_ptr(), chunk.len());
-            if bytes_read <= 0 {
-                break;
-            }
-            file_data.extend_from_slice(&chunk[..bytes_read as usize]);
+        let size = lseek(fd, 0, SEEK_END);
+        if size <= 0 {
+            close(fd);
+            return None;
         }
-        close(fd);
+        let len = size as usize;
 
-        if file_data.is_empty() {
+        let addr = mmap(core::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, fd, 0);
+        // The mapping keeps its own reference to the file; the fd can be closed.
+        close(fd);
+        if addr == MAP_FAILED || addr.is_null() {
             return None;
         }
 
-        // Convert to UTF-8 string for easier parsing
-        let file_str = String::from_utf8(file_data).ok()?;
-
-        let mut manifest = Manifest::new();
-
-        for line in file_str.lines() {
-            if let Some((key, value)) = line.split_once(' ') {
-                manifest.add_entry(key, value);
-            }
-        }
-
-        Some(manifest)
+        // Leak the mapping: execve replaces the address space.
+        Some(Manifest { ptr: addr as *const u8, len })
     }
 }
 
