@@ -509,14 +509,20 @@ impl RuntimeArgs {
 
 // Append one argument to a Windows command line using MSVCRT/CommandLineToArgvW
 // quoting rules, so the child re-parses each argument exactly as intended:
-//   * wrap the argument in double quotes when it needs them (or `force_quotes`,
-//     used for argv[0] per the Bazel launcher.cc convention);
+//   * wrap the argument in double quotes when it needs them (space, tab, or empty)
+//     or `force_quotes` is set (used for argv[0] per the Bazel launcher.cc
+//     convention);
 //   * double every run of backslashes that immediately precedes a double quote
 //     (including the closing quote we add), and escape embedded double quotes.
 // Without this, embedded `"` characters and trailing `\` (common in Windows paths
 // like `C:\dir\`) corrupt or merge arguments.
 fn append_arg(cmdline: &mut Vec<u16>, arg: &[u16], force_quotes: bool) {
-    let quote = force_quotes || arg.iter().any(|&c| c == b' ' as u16);
+    // Quote when the argument would otherwise re-split or vanish: any space or tab
+    // (parse_command_line and the CRT both split on both), or an empty argument
+    // (which would disappear entirely without surrounding quotes).
+    let quote = force_quotes
+        || arg.is_empty()
+        || arg.iter().any(|&c| c == b' ' as u16 || c == b'\t' as u16);
     if quote {
         cmdline.push(b'"' as u16);
     }
