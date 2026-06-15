@@ -85,6 +85,8 @@ mod syscall_numbers {
     pub const SYS_WRITE: usize = 1;
     pub const SYS_OPEN: usize = 2;
     pub const SYS_CLOSE: usize = 3;
+    pub const SYS_LSEEK: usize = 8;
+    pub const SYS_MMAP: usize = 9;
     pub const SYS_ACCESS: usize = 21;
     pub const SYS_EXECVE: usize = 59;
     pub const SYS_EXIT: usize = 60;
@@ -96,6 +98,8 @@ mod syscall_numbers {
     pub const SYS_WRITE: usize = 64;
     pub const SYS_OPENAT: usize = 56;  // openat is used on aarch64
     pub const SYS_CLOSE: usize = 57;
+    pub const SYS_LSEEK: usize = 62;
+    pub const SYS_MMAP: usize = 222;
     pub const SYS_FACCESSAT: usize = 48;  // faccessat is used on aarch64
     pub const SYS_EXECVE: usize = 221;
     pub const SYS_EXIT: usize = 93;
@@ -109,14 +113,21 @@ mod syscall_numbers {
     pub const SYS_WRITE: usize = 4;
     pub const SYS_OPEN: usize = 5;
     pub const SYS_CLOSE: usize = 6;
+    pub const SYS_LSEEK: usize = 19;
     pub const SYS_EXECVE: usize = 11;
     pub const SYS_ACCESS: usize = 33;
+    pub const SYS_MMAP: usize = 90;
 }
 
 use syscall_numbers::*;
 
 const O_RDONLY: i32 = 0;
 const STDOUT: i32 = 1;
+
+// mmap parameters for read-only file mapping
+const PROT_READ: usize = 1;
+const MAP_PRIVATE: usize = 2;
+const SEEK_END: i32 = 2;
 
 #[cfg(target_arch = "x86_64")]
 fn exit(code: i32) -> ! {
@@ -343,6 +354,119 @@ fn close(fd: i32) {
     }
 }
 
+// Seek to the end of the file and return its size in bytes (lseek with SEEK_END).
+// Returns a negative value on error.
+#[cfg(target_arch = "x86_64")]
+fn lseek_end(fd: i32) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_LSEEK,
+            in("rdi") fd,
+            in("rsi") 0i64,      // offset
+            in("rdx") SEEK_END,  // whence
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    ret
+}
+
+#[cfg(target_arch = "aarch64")]
+fn lseek_end(fd: i32) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_LSEEK,
+            in("x0") fd,
+            in("x1") 0i64,      // offset
+            in("x2") SEEK_END,  // whence
+            lateout("x0") ret,
+        );
+    }
+    ret
+}
+
+#[cfg(target_arch = "s390x")]
+fn lseek_end(fd: i32) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "svc 0",
+            in("r1") SYS_LSEEK,
+            in("r2") fd,
+            in("r3") 0i64,      // offset
+            in("r4") SEEK_END,  // whence
+            lateout("r2") ret,
+        );
+    }
+    ret
+}
+
+// Memory-map `len` bytes of `fd` read-only (PROT_READ, MAP_PRIVATE, offset 0).
+// Returns a null pointer on error. The kernel returns a negative errno in
+// [-4095, -1] on failure; user-space addresses are positive on these arches.
+#[cfg(target_arch = "x86_64")]
+fn mmap_read(fd: i32, len: usize) -> *const u8 {
+    let ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_MMAP,
+            in("rdi") 0usize,       // addr = NULL
+            in("rsi") len,          // length
+            in("rdx") PROT_READ,    // prot
+            in("r10") MAP_PRIVATE,  // flags (NOTE: r10, not rcx, for syscalls)
+            in("r8") fd,            // fd
+            in("r9") 0usize,        // offset
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    if ret < 0 { core::ptr::null() } else { ret as *const u8 }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn mmap_read(fd: i32, len: usize) -> *const u8 {
+    let ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_MMAP,
+            in("x0") 0usize,       // addr = NULL
+            in("x1") len,          // length
+            in("x2") PROT_READ,    // prot
+            in("x3") MAP_PRIVATE,  // flags
+            in("x4") fd,           // fd
+            in("x5") 0usize,       // offset
+            lateout("x0") ret,
+        );
+    }
+    if ret < 0 { core::ptr::null() } else { ret as *const u8 }
+}
+
+#[cfg(target_arch = "s390x")]
+fn mmap_read(fd: i32, len: usize) -> *const u8 {
+    // s390x uses the old mmap convention: r2 holds a pointer to an array of
+    // 6 unsigned longs { addr, len, prot, flags, fd, offset }.
+    let args: [usize; 6] = [0, len, PROT_READ, MAP_PRIVATE, fd as usize, 0];
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "svc 0",
+            in("r1") SYS_MMAP,
+            in("r2") args.as_ptr(),
+            lateout("r2") ret,
+            // No options(nomem): the kernel reads the args array through r2.
+        );
+    }
+    if ret < 0 { core::ptr::null() } else { ret as usize as *const u8 }
+}
+
 // Check if a path exists using access() syscall with F_OK (0)
 #[cfg(target_arch = "x86_64")]
 fn path_exists(path: &[u8]) -> bool {
@@ -525,32 +649,28 @@ fn get_env_var(name: &[u8]) -> Option<String> {
     None
 }
 
-// Manifest entry using String for UTF-8 paths
-struct ManifestEntry {
-    key: String,
-    value: String,
-}
-
+// Memory-mapped manifest: a pointer/length pair into the mapped file. The
+// manifest is scanned lazily on each lookup (O(n)), so no per-entry allocation
+// is needed and arbitrarily large manifests are supported. The kernel caches
+// the file's pages for us.
 struct Manifest {
-    entries: Vec<ManifestEntry>,
+    ptr: *const u8,
+    len: usize,
 }
 
 impl Manifest {
-    fn new() -> Self {
-        Self { entries: Vec::new() }
-    }
-
-    fn add_entry(&mut self, key: &str, value: &str) {
-        self.entries.push(ManifestEntry {
-            key: String::from(key),
-            value: String::from(value),
-        });
+    #[inline]
+    fn data(&self) -> &[u8] {
+        // Safety: ptr/len come from a successful mmap that we leak for the
+        // lifetime of the process (until execve replaces the address space).
+        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
     }
 
     fn lookup(&self, key: &str) -> Option<&str> {
-        for entry in &self.entries {
-            if entry.key == key {
-                return Some(&entry.value);
+        let key_bytes = key.as_bytes();
+        for (k, v) in ManifestLines::new(self.data()) {
+            if k == key_bytes {
+                return core::str::from_utf8(v).ok();
             }
         }
         None
@@ -559,58 +679,88 @@ impl Manifest {
     /// Find the longest manifest entry whose key is a prefix of `path` at a '/' boundary.
     /// Returns (resolved_value, suffix) where suffix includes the leading '/'.
     fn prefix_lookup<'a, 'b>(&'a self, path: &'b str) -> Option<(&'a str, &'b str)> {
-        let mut best: Option<(&str, &str)> = None;
+        let path_bytes = path.as_bytes();
+        let mut best: Option<(&'a str, &'b str)> = None;
         let mut best_len: usize = 0;
-        for entry in &self.entries {
-            let key = &entry.key;
-            if path.len() > key.len()
-                && path.starts_with(key.as_str())
-                && path.as_bytes()[key.len()] == b'/'
-                && key.len() > best_len
+        for (k, v) in ManifestLines::new(self.data()) {
+            if path_bytes.len() > k.len()
+                && k.len() > best_len
+                && &path_bytes[..k.len()] == k
+                && path_bytes[k.len()] == b'/'
             {
-                best_len = key.len();
-                best = Some((&entry.value, &path[key.len()..]));
+                // Values were owned UTF-8 Strings before; keep that guarantee by
+                // only considering candidates whose value is valid UTF-8.
+                if let Ok(value) = core::str::from_utf8(v) {
+                    best_len = k.len();
+                    best = Some((value, &path[k.len()..]));
+                }
             }
         }
         best
     }
 }
 
-// Load manifest file
+/// Iterator over `(key, value)` byte slices of a Bazel runfiles MANIFEST.
+/// Replicates `str::lines()` + `split_once(' ')`: split on '\n', strip one
+/// trailing '\r' (CRLF), and skip lines without a space (e.g. the
+/// "<workspace>/.runfile" marker).
+struct ManifestLines<'a> {
+    rest: &'a [u8],
+}
+
+impl<'a> ManifestLines<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { rest: data }
+    }
+}
+
+impl<'a> Iterator for ManifestLines<'a> {
+    type Item = (&'a [u8], &'a [u8]);
+
+    fn next(&mut self) -> Option<(&'a [u8], &'a [u8])> {
+        while !self.rest.is_empty() {
+            let (mut line, remainder) = match find_byte(self.rest, b'\n') {
+                Some(nl) => (&self.rest[..nl], &self.rest[nl + 1..]),
+                None => (self.rest, &self.rest[self.rest.len()..]),
+            };
+            self.rest = remainder;
+            // Strip one trailing '\r' (handles CRLF line endings).
+            if let Some((&b'\r', head)) = line.split_last() {
+                line = head;
+            }
+            if let Some(sp) = find_byte(line, b' ') {
+                return Some((&line[..sp], &line[sp + 1..]));
+            }
+            // No space -> skip this line and continue.
+        }
+        None
+    }
+}
+
+// Load manifest file by memory-mapping it read-only. Returns None on open
+// failure, empty file (mmap of zero bytes is invalid), or mmap failure.
 fn load_manifest(path: &[u8]) -> Option<Manifest> {
     let fd = open(path);
     if fd < 0 {
         return None;
     }
 
-    // Read file into Vec, reading in chunks
-    let mut file_data = Vec::new();
-    let mut chunk = [0u8; 8192];
-    loop {
-        let bytes_read = read(fd, &mut chunk);
-        if bytes_read <= 0 {
-            break;
-        }
-        file_data.extend_from_slice(&chunk[..bytes_read as usize]);
+    let size = lseek_end(fd);
+    if size <= 0 {
+        close(fd);
+        return None;
     }
-    close(fd);
+    let len = size as usize;
 
-    if file_data.is_empty() {
+    let ptr = mmap_read(fd, len);
+    // The mapping keeps its own reference to the file; the fd can be closed.
+    close(fd);
+    if ptr.is_null() {
         return None;
     }
 
-    // Convert to UTF-8 string for easier parsing
-    let file_str = String::from_utf8(file_data).ok()?;
-
-    let mut manifest = Manifest::new();
-
-    for line in file_str.lines() {
-        if let Some((key, value)) = line.split_once(' ') {
-            manifest.add_entry(key, value);
-        }
-    }
-
-    Some(manifest)
+    // Leak the mapping: execve replaces the address space.
+    Some(Manifest { ptr, len })
 }
 
 // Runfiles implementation using String for UTF-8 paths

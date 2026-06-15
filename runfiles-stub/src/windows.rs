@@ -54,6 +54,11 @@ const FILE_ATTRIBUTE_NORMAL: DWORD = 0x80;
 const INFINITE: DWORD = 0xFFFFFFFF;
 const CREATE_UNICODE_ENVIRONMENT: DWORD = 0x00000400;
 
+// File sharing and memory-mapping parameters (for the runfiles manifest)
+const FILE_SHARE_READ: DWORD = 0x00000001;
+const PAGE_READONLY: DWORD = 0x02;
+const FILE_MAP_READ: DWORD = 0x04;
+
 // STARTUPINFOW structure (wide char version for CreateProcessW)
 #[repr(C)]
 struct STARTUPINFOW {
@@ -106,13 +111,22 @@ extern "system" {
         dwFlagsAndAttributes: DWORD,
         hTemplateFile: HANDLE,
     ) -> HANDLE;
-    fn ReadFile(
+    fn GetFileSizeEx(hFile: HANDLE, lpFileSize: *mut i64) -> BOOL;
+    fn CreateFileMappingA(
         hFile: HANDLE,
-        lpBuffer: LPVOID,
-        nNumberOfBytesToRead: DWORD,
-        lpNumberOfBytesRead: *mut DWORD,
-        lpOverlapped: LPVOID,
-    ) -> BOOL;
+        lpFileMappingAttributes: LPVOID,
+        flProtect: DWORD,
+        dwMaximumSizeHigh: DWORD,
+        dwMaximumSizeLow: DWORD,
+        lpName: LPCSTR,
+    ) -> HANDLE;
+    fn MapViewOfFile(
+        hFileMappingObject: HANDLE,
+        dwDesiredAccess: DWORD,
+        dwFileOffsetHigh: DWORD,
+        dwFileOffsetLow: DWORD,
+        dwNumberOfBytesToMap: usize,
+    ) -> LPVOID;
     fn CloseHandle(hObject: HANDLE) -> BOOL;
     fn GetEnvironmentVariableA(lpName: LPCSTR, lpBuffer: LPSTR, nSize: DWORD) -> DWORD;
     fn CreateProcessW(
@@ -313,32 +327,27 @@ fn get_env_var(name: &[u8]) -> Option<String> {
     }
 }
 
-// Manifest entry using String for UTF-8 paths (Bazel-generated)
-struct ManifestEntry {
-    key: String,
-    value: String,
-}
-
+// Memory-mapped manifest: a pointer/length pair into the mapped file view. The
+// manifest is scanned lazily on each lookup (O(n)), so no per-entry allocation
+// is needed and arbitrarily large manifests are supported.
 struct Manifest {
-    entries: Vec<ManifestEntry>,
+    ptr: *const u8,
+    len: usize,
 }
 
 impl Manifest {
-    fn new() -> Self {
-        Self { entries: Vec::new() }
-    }
-
-    fn add_entry(&mut self, key: &str, value: &str) {
-        self.entries.push(ManifestEntry {
-            key: String::from(key),
-            value: String::from(value),
-        });
+    #[inline]
+    fn data(&self) -> &[u8] {
+        // Safety: ptr/len come from a successful MapViewOfFile that we leak for
+        // the lifetime of the process (until ExitProcess reclaims it).
+        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
     }
 
     fn lookup(&self, key: &str) -> Option<&str> {
-        for entry in &self.entries {
-            if entry.key == key {
-                return Some(&entry.value);
+        let key_bytes = key.as_bytes();
+        for (k, v) in ManifestLines::new(self.data()) {
+            if k == key_bytes {
+                return core::str::from_utf8(v).ok();
             }
         }
         None
@@ -347,80 +356,121 @@ impl Manifest {
     /// Find the longest manifest entry whose key is a prefix of `path` at a '/' boundary.
     /// Returns (resolved_value, suffix) where suffix includes the leading '/'.
     fn prefix_lookup<'a, 'b>(&'a self, path: &'b str) -> Option<(&'a str, &'b str)> {
-        let mut best: Option<(&str, &str)> = None;
+        let path_bytes = path.as_bytes();
+        let mut best: Option<(&'a str, &'b str)> = None;
         let mut best_len: usize = 0;
-        for entry in &self.entries {
-            let key = &entry.key;
-            if path.len() > key.len()
-                && path.starts_with(key.as_str())
-                && path.as_bytes()[key.len()] == b'/'
-                && key.len() > best_len
+        for (k, v) in ManifestLines::new(self.data()) {
+            if path_bytes.len() > k.len()
+                && k.len() > best_len
+                && &path_bytes[..k.len()] == k
+                && path_bytes[k.len()] == b'/'
             {
-                best_len = key.len();
-                best = Some((&entry.value, &path[key.len()..]));
+                // Values were owned UTF-8 Strings before; keep that guarantee by
+                // only considering candidates whose value is valid UTF-8.
+                if let Ok(value) = core::str::from_utf8(v) {
+                    best_len = k.len();
+                    best = Some((value, &path[k.len()..]));
+                }
             }
         }
         best
     }
 }
 
-// Load manifest file
+/// Iterator over `(key, value)` byte slices of a Bazel runfiles MANIFEST.
+/// Replicates `str::lines()` + `split_once(' ')`: split on '\n', strip one
+/// trailing '\r' (CRLF), and skip lines without a space (e.g. the
+/// "<workspace>/.runfile" marker).
+struct ManifestLines<'a> {
+    rest: &'a [u8],
+}
+
+impl<'a> ManifestLines<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { rest: data }
+    }
+}
+
+impl<'a> Iterator for ManifestLines<'a> {
+    type Item = (&'a [u8], &'a [u8]);
+
+    fn next(&mut self) -> Option<(&'a [u8], &'a [u8])> {
+        while !self.rest.is_empty() {
+            let (mut line, remainder) = match find_byte(self.rest, b'\n') {
+                Some(nl) => (&self.rest[..nl], &self.rest[nl + 1..]),
+                None => (self.rest, &self.rest[self.rest.len()..]),
+            };
+            self.rest = remainder;
+            // Strip one trailing '\r' (handles CRLF line endings).
+            if let Some((&b'\r', head)) = line.split_last() {
+                line = head;
+            }
+            if let Some(sp) = find_byte(line, b' ') {
+                return Some((&line[..sp], &line[sp + 1..]));
+            }
+            // No space -> skip this line and continue.
+        }
+        None
+    }
+}
+
+// Load manifest file by memory-mapping it read-only. Returns None on open
+// failure, empty file (CreateFileMapping of zero bytes fails), or mapping
+// failure.
 fn load_manifest(path: &[u8]) -> Option<Manifest> {
     unsafe {
         // Ensure path is null-terminated
         let mut path_with_null = path.to_vec();
         path_with_null.push(0);
 
-        let handle = CreateFileA(
+        // FILE_SHARE_READ lets the child process (which inherits
+        // RUNFILES_MANIFEST_FILE) open the same manifest for reading.
+        let file = CreateFileA(
             path_with_null.as_ptr(),
             GENERIC_READ,
-            0,
+            FILE_SHARE_READ,
             core::ptr::null_mut(),
             OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL,
             core::ptr::null_mut(),
         );
 
-        if handle == INVALID_HANDLE_VALUE {
+        if file == INVALID_HANDLE_VALUE {
             return None;
         }
 
-        // Read file into Vec, reading in chunks
-        let mut file_data = Vec::new();
-        let mut chunk = [0u8; 8192];
-        loop {
-            let mut bytes_read: DWORD = 0;
-            let success = ReadFile(
-                handle,
-                chunk.as_mut_ptr() as LPVOID,
-                chunk.len() as DWORD,
-                &mut bytes_read,
-                core::ptr::null_mut(),
-            );
-            if success == 0 || bytes_read == 0 {
-                break;
-            }
-            file_data.extend_from_slice(&chunk[..bytes_read as usize]);
+        let mut size: i64 = 0;
+        if GetFileSizeEx(file, &mut size) == 0 || size <= 0 {
+            CloseHandle(file);
+            return None;
         }
-        CloseHandle(handle);
+        let len = size as usize;
 
-        if file_data.is_empty() {
+        // CreateFileMappingA returns NULL (not INVALID_HANDLE_VALUE) on failure.
+        let mapping = CreateFileMappingA(
+            file,
+            core::ptr::null_mut(),
+            PAGE_READONLY,
+            0,
+            0,
+            core::ptr::null(),
+        );
+        if mapping.is_null() {
+            CloseHandle(file);
             return None;
         }
 
-        // Convert to UTF-8 string for easier parsing
-        let file_str = String::from_utf8(file_data).ok()?;
-
-        let mut manifest = Manifest::new();
-
-        for line in file_str.lines() {
-            // lines() automatically strips \r\n endings
-            if let Some((key, value)) = line.split_once(' ') {
-                manifest.add_entry(key, value);
-            }
+        let view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+        // The view keeps its own reference to the section; both handles can be
+        // closed and the view stays valid.
+        CloseHandle(mapping);
+        CloseHandle(file);
+        if view.is_null() {
+            return None;
         }
 
-        Some(manifest)
+        // Leak the view: ExitProcess reclaims it.
+        Some(Manifest { ptr: view as *const u8, len })
     }
 }
 

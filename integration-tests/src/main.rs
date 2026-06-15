@@ -860,6 +860,85 @@ fn test_print_env(config: &TestConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Regression test for issue #35: a multi-megabyte manifest must not OOM.
+///
+/// The previous implementation copied the entire manifest into a growable `Vec`
+/// and re-allocated every line into owned `String`s, all served from the stub's
+/// 8 MiB static arena. Manifests larger than ~3 MiB exhausted the arena and the
+/// stub aborted with a silent `exit(1)`. The mmap-based loader scans the file in
+/// place with zero allocation, so arbitrarily large manifests work.
+fn test_large_manifest(config: &TestConfig) -> Result<(), String> {
+    println!("  Running test: large_manifest");
+
+    let test_dir = config.work_dir.join("test_large_manifest");
+    fs::create_dir_all(&test_dir).map_err(|e| format!("Failed to create test dir: {}", e))?;
+
+    let mut runfiles = RunfilesSetup::new(&test_dir, "large_stub")
+        .map_err(|e| format!("Failed to create runfiles: {}", e))?;
+
+    // The single real entry we actually resolve.
+    let add_binary = config.test_binaries_dir.join(format!("add-numbers{}", EXE_EXT));
+    runfiles
+        .add_file(&format!("{}/bin/add-numbers{}", WORKSPACE_NAME, EXE_EXT), &add_binary)
+        .map_err(|e| format!("Failed to add add-numbers: {}", e))?;
+
+    // Write the normal manifest (workspace marker + the real entry), then append
+    // a large block of unused entries to push the file well past the old 8 MiB
+    // arena. These keys are never looked up and the values point nowhere; only
+    // the file's size matters for reproducing the OOM.
+    runfiles
+        .write_manifest()
+        .map_err(|e| format!("Failed to write manifest: {}", e))?;
+
+    {
+        // ~100k lines averaging ~84 bytes => ~8 MiB of padding.
+        let mut blob = String::with_capacity(9 * 1024 * 1024);
+        for i in 0..100_000u32 {
+            blob.push_str(&format!(
+                "{ws}/pad/unused_entry_number_{i:08} /tmp/nonexistent/padding/path/value_{i:08}\n",
+                ws = WORKSPACE_NAME,
+            ));
+        }
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(&runfiles.manifest_path)
+            .map_err(|e| format!("Failed to open manifest for append: {}", e))?;
+        f.write_all(blob.as_bytes())
+            .map_err(|e| format!("Failed to append padding: {}", e))?;
+    }
+
+    let manifest_size = fs::metadata(&runfiles.manifest_path)
+        .map_err(|e| format!("Failed to stat manifest: {}", e))?
+        .len();
+    if manifest_size <= 5 * 1024 * 1024 {
+        return Err(format!(
+            "Padded manifest too small ({} bytes); expected > 5 MiB",
+            manifest_size
+        ));
+    }
+
+    // Finalize a stub that resolves the real binary plus two literal numbers.
+    let stub_path = test_dir.join(format!("large_stub{}", EXE_EXT));
+    let add_rlocation = format!("{}/bin/add-numbers{}", WORKSPACE_NAME, EXE_EXT);
+    finalize_stub(config, &stub_path, &[&add_rlocation, "40", "2"], &[0])?;
+
+    // Manifest mode: this is the path that OOM'd before the fix.
+    let (stdout, stderr, exit_code) = run_stub(&stub_path, &runfiles, &[], true)?;
+    if exit_code != 0 {
+        return Err(format!(
+            "Large-manifest stub failed with exit code {} (issue #35 regression).\nManifest size: {} bytes\nstdout: {}\nstderr: {}",
+            exit_code, manifest_size, stdout, stderr
+        ));
+    }
+    if !stdout.contains("SUM:42") {
+        return Err(format!("Unexpected output: {}. Expected 'SUM:42'", stdout));
+    }
+
+    println!("    PASS ({} byte manifest, manifest mode)", manifest_size);
+
+    Ok(())
+}
+
 fn main() -> ExitCode {
     println!("=== Runfiles Stub Test Suite ===");
     println!();
@@ -900,6 +979,7 @@ fn main() -> ExitCode {
         ("fallback_runfiles_dir", test_fallback_runfiles_dir),
         ("fallback_runfiles_manifest", test_fallback_runfiles_manifest),
         ("print_env", test_print_env),
+        ("large_manifest", test_large_manifest),
     ];
 
     let mut passed = 0;
