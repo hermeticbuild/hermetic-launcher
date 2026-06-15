@@ -13,6 +13,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Configure BuildBuddy RBE
+        env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+        run: |
+          if [ -n "${BUILDBUDDY_API_KEY}" ]; then
+            echo "common:remote --remote_header=x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}" >> ~/.bazelrc
+            echo "common --config=remote" >> ~/.bazelrc
+          fi
       - run: bash tools/build-release-binaries.sh artifacts
       - uses: actions/upload-artifact@v4
         with:
@@ -33,6 +41,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Configure BuildBuddy RBE
+        env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+        run: |
+          if [ -n "${BUILDBUDDY_API_KEY}" ]; then
+            echo "common:remote --remote_header=x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}" >> ~/.bazelrc
+            echo "common --config=remote" >> ~/.bazelrc
+          fi
       - run: bazel test //integration-tests:integration_test
       - run: bazel test //...
         working-directory: e2e/bzlmod
