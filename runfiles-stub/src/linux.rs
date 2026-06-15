@@ -1,41 +1,17 @@
-extern crate alloc;
+// Linux backend: raw syscalls (no libc), a custom `_start` entry, and an
+// execve-based launch. The per-architecture syscall asm and the compiler-intrinsic
+// symbols stay here; everything above the syscall layer is shared.
 
-use alloc::string::String;
 use alloc::vec;
+use alloc::string::String;
 use alloc::vec::Vec;
-use core::alloc::{GlobalAlloc, Layout};
-use core::cell::UnsafeCell;
-use core::panic::PanicInfo;
-use talc::{ClaimOnOom, Span, Talc};
 
-// Global allocator using talc with a static memory arena
-// 8 MiB should be plenty for manifest parsing, path resolution, and environment handling
-static mut ARENA: [u8; 8 * 1024 * 1024] = [0; 8 * 1024 * 1024];
+use crate::common::Manifest;
+use crate::run::Launch;
+use crate::runfiles::Runfiles;
 
-// Simple wrapper for single-threaded use (no locking needed)
-struct TalcAllocator(UnsafeCell<Talc<ClaimOnOom>>);
-unsafe impl Sync for TalcAllocator {}
-
-unsafe impl GlobalAlloc for TalcAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        (*self.0.get()).malloc(layout).map_or(core::ptr::null_mut(), |p| p.as_ptr())
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        (*self.0.get()).free(core::ptr::NonNull::new_unchecked(ptr), layout);
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: TalcAllocator = TalcAllocator(UnsafeCell::new(Talc::new(unsafe {
-    ClaimOnOom::new(Span::from_array(core::ptr::addr_of!(ARENA).cast_mut()))
-})));
-
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    exit(1);
-}
-
-// Compiler intrinsics (memcpy, memset)
+// Compiler intrinsics and glibc-compat symbols. These are needed because we link
+// without crt startup files (-nostartfiles) and provide our own _start.
 #[no_mangle]
 pub unsafe extern "C" fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
     let mut i = 0;
@@ -129,486 +105,251 @@ const PROT_READ: usize = 1;
 const MAP_PRIVATE: usize = 2;
 const SEEK_END: i32 = 2;
 
+// --- path semantics ---
+pub const SEP: char = '/';
+pub const NEWLINE: &[u8] = b"\n";
+
+pub fn is_absolute(path: &str) -> bool {
+    path.starts_with('/')
+}
+
+pub fn to_native_path(s: &str) -> String {
+    String::from(s)
+}
+
+// --- syscall instruction layer ---
+//
+// One macro per (arch, arity), cfg-gated so exactly one set is compiled. Each
+// expansion is token-identical to the previous hand-written per-syscall asm (same
+// instruction, registers, clobbers, operand types and return type), so the generated
+// machine code is unchanged — this only removes the 3x per-arch source duplication.
+// `_noreturn` is for exit; `_void` discards the return register (close); the rest
+// return a value of the caller-specified type.
+
 #[cfg(target_arch = "x86_64")]
-fn exit(code: i32) -> ! {
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            in("rax") SYS_EXIT,
-            in("rdi") code,
-            options(noreturn)
-        );
+mod sc {
+    macro_rules! syscall_noreturn {
+        ($nr:expr, $a1:expr) => {
+            core::arch::asm!("syscall", in("rax") $nr, in("rdi") $a1, options(noreturn))
+        };
     }
+    macro_rules! syscall_void {
+        ($nr:expr, $a1:expr) => {
+            core::arch::asm!("syscall", in("rax") $nr, in("rdi") $a1,
+                lateout("rax") _, lateout("rcx") _, lateout("r11") _)
+        };
+    }
+    macro_rules! syscall2 {
+        ($ty:ty; $nr:expr, $a1:expr, $a2:expr) => {{
+            let ret: $ty;
+            core::arch::asm!("syscall", in("rax") $nr, in("rdi") $a1, in("rsi") $a2,
+                lateout("rax") ret, lateout("rcx") _, lateout("r11") _);
+            ret
+        }};
+    }
+    macro_rules! syscall3 {
+        ($ty:ty; $nr:expr, $a1:expr, $a2:expr, $a3:expr) => {{
+            let ret: $ty;
+            core::arch::asm!("syscall", in("rax") $nr, in("rdi") $a1, in("rsi") $a2, in("rdx") $a3,
+                lateout("rax") ret, lateout("rcx") _, lateout("r11") _);
+            ret
+        }};
+    }
+    macro_rules! syscall6 {
+        ($ty:ty; $nr:expr, $a1:expr, $a2:expr, $a3:expr, $a4:expr, $a5:expr, $a6:expr) => {{
+            let ret: $ty;
+            core::arch::asm!("syscall", in("rax") $nr, in("rdi") $a1, in("rsi") $a2, in("rdx") $a3,
+                in("r10") $a4, in("r8") $a5, in("r9") $a6,
+                lateout("rax") ret, lateout("rcx") _, lateout("r11") _);
+            ret
+        }};
+    }
+    pub(super) use {syscall2, syscall3, syscall6, syscall_noreturn, syscall_void};
 }
 
 #[cfg(target_arch = "aarch64")]
-fn exit(code: i32) -> ! {
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_EXIT,
-            in("x0") code,
-            options(noreturn)
-        );
+mod sc {
+    macro_rules! syscall_noreturn {
+        ($nr:expr, $a1:expr) => {
+            core::arch::asm!("svc #0", in("x8") $nr, in("x0") $a1, options(noreturn))
+        };
     }
+    macro_rules! syscall_void {
+        ($nr:expr, $a1:expr) => {
+            core::arch::asm!("svc #0", in("x8") $nr, in("x0") $a1, lateout("x0") _)
+        };
+    }
+    macro_rules! syscall3 {
+        ($ty:ty; $nr:expr, $a1:expr, $a2:expr, $a3:expr) => {{
+            let ret: $ty;
+            core::arch::asm!("svc #0", in("x8") $nr, in("x0") $a1, in("x1") $a2, in("x2") $a3,
+                lateout("x0") ret);
+            ret
+        }};
+    }
+    macro_rules! syscall4 {
+        ($ty:ty; $nr:expr, $a1:expr, $a2:expr, $a3:expr, $a4:expr) => {{
+            let ret: $ty;
+            core::arch::asm!("svc #0", in("x8") $nr, in("x0") $a1, in("x1") $a2, in("x2") $a3,
+                in("x3") $a4, lateout("x0") ret);
+            ret
+        }};
+    }
+    macro_rules! syscall6 {
+        ($ty:ty; $nr:expr, $a1:expr, $a2:expr, $a3:expr, $a4:expr, $a5:expr, $a6:expr) => {{
+            let ret: $ty;
+            core::arch::asm!("svc #0", in("x8") $nr, in("x0") $a1, in("x1") $a2, in("x2") $a3,
+                in("x3") $a4, in("x4") $a5, in("x5") $a6, lateout("x0") ret);
+            ret
+        }};
+    }
+    pub(super) use {syscall3, syscall4, syscall6, syscall_noreturn, syscall_void};
 }
 
 #[cfg(target_arch = "s390x")]
-fn exit(code: i32) -> ! {
-    unsafe {
-        core::arch::asm!(
-            "svc 0",
-            in("r1") SYS_EXIT,
-            in("r2") code,
-            options(noreturn)
-        );
+mod sc {
+    macro_rules! syscall_noreturn {
+        ($nr:expr, $a1:expr) => {
+            core::arch::asm!("svc 0", in("r1") $nr, in("r2") $a1, options(noreturn))
+        };
     }
+    macro_rules! syscall_void {
+        ($nr:expr, $a1:expr) => {
+            core::arch::asm!("svc 0", in("r1") $nr, in("r2") $a1, lateout("r2") _)
+        };
+    }
+    macro_rules! syscall1 {
+        ($ty:ty; $nr:expr, $a1:expr) => {{
+            let ret: $ty;
+            core::arch::asm!("svc 0", in("r1") $nr, in("r2") $a1, lateout("r2") ret);
+            ret
+        }};
+    }
+    macro_rules! syscall2 {
+        ($ty:ty; $nr:expr, $a1:expr, $a2:expr) => {{
+            let ret: $ty;
+            core::arch::asm!("svc 0", in("r1") $nr, in("r2") $a1, in("r3") $a2, lateout("r2") ret);
+            ret
+        }};
+    }
+    macro_rules! syscall3 {
+        ($ty:ty; $nr:expr, $a1:expr, $a2:expr, $a3:expr) => {{
+            let ret: $ty;
+            core::arch::asm!("svc 0", in("r1") $nr, in("r2") $a1, in("r3") $a2, in("r4") $a3,
+                lateout("r2") ret);
+            ret
+        }};
+    }
+    pub(super) use {syscall1, syscall2, syscall3, syscall_noreturn, syscall_void};
 }
 
-#[cfg(target_arch = "x86_64")]
+#[allow(unused_imports)]
+use sc::*;
+
+// --- syscall wrappers (architecture-independent above the macro layer) ---
+pub fn exit(code: i32) -> ! {
+    unsafe { syscall_noreturn!(SYS_EXIT, code) }
+}
+
 fn write(fd: i32, buf: &[u8]) -> isize {
-    let ret: isize;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            in("rax") SYS_WRITE,
-            in("rdi") fd,
-            in("rsi") buf.as_ptr(),
-            in("rdx") buf.len(),
-            lateout("rax") ret,
-            lateout("rcx") _,
-            lateout("r11") _,
-        );
-    }
-    ret
+    unsafe { syscall3!(isize; SYS_WRITE, fd, buf.as_ptr(), buf.len()) }
 }
 
-#[cfg(target_arch = "aarch64")]
-fn write(fd: i32, buf: &[u8]) -> isize {
-    let ret: isize;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_WRITE,
-            in("x0") fd,
-            in("x1") buf.as_ptr(),
-            in("x2") buf.len(),
-            lateout("x0") ret,
-        );
-    }
-    ret
-}
-
-#[cfg(target_arch = "s390x")]
-fn write(fd: i32, buf: &[u8]) -> isize {
-    let ret: isize;
-    unsafe {
-        core::arch::asm!(
-            "svc 0",
-            in("r1") SYS_WRITE,
-            in("r2") fd,
-            in("r3") buf.as_ptr(),
-            in("r4") buf.len(),
-            lateout("r2") ret,
-        );
-    }
-    ret
-}
-
-#[cfg(target_arch = "x86_64")]
-fn open(path: &[u8]) -> i32 {
-    let ret: i32;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            in("rax") SYS_OPEN,
-            in("rdi") path.as_ptr(),
-            in("rsi") O_RDONLY,
-            in("rdx") 0,
-            lateout("rax") ret,
-            lateout("rcx") _,
-            lateout("r11") _,
-        );
-    }
-    ret
-}
-
-#[cfg(target_arch = "aarch64")]
-fn open(path: &[u8]) -> i32 {
-    let ret: i32;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_OPENAT,
-            in("x0") AT_FDCWD,
-            in("x1") path.as_ptr(),
-            in("x2") O_RDONLY,
-            in("x3") 0,
-            lateout("x0") ret,
-        );
-    }
-    ret
-}
-
-#[cfg(target_arch = "s390x")]
-fn open(path: &[u8]) -> i32 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc 0",
-            in("r1") SYS_OPEN,
-            in("r2") path.as_ptr(),
-            in("r3") O_RDONLY,
-            in("r4") 0i64,
-            lateout("r2") ret,
-        );
-    }
-    ret as i32
-}
-
-#[cfg(target_arch = "x86_64")]
 fn read(fd: i32, buf: &mut [u8]) -> isize {
-    let ret: isize;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            in("rax") SYS_READ,
-            in("rdi") fd,
-            in("rsi") buf.as_ptr(),
-            in("rdx") buf.len(),
-            lateout("rax") ret,
-            lateout("rcx") _,
-            lateout("r11") _,
-        );
-    }
-    ret
+    unsafe { syscall3!(isize; SYS_READ, fd, buf.as_ptr(), buf.len()) }
 }
 
-#[cfg(target_arch = "aarch64")]
-fn read(fd: i32, buf: &mut [u8]) -> isize {
-    let ret: isize;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_READ,
-            in("x0") fd,
-            in("x1") buf.as_ptr(),
-            in("x2") buf.len(),
-            lateout("x0") ret,
-        );
-    }
-    ret
-}
-
-#[cfg(target_arch = "s390x")]
-fn read(fd: i32, buf: &mut [u8]) -> isize {
-    let ret: isize;
-    unsafe {
-        core::arch::asm!(
-            "svc 0",
-            in("r1") SYS_READ,
-            in("r2") fd,
-            in("r3") buf.as_ptr(),
-            in("r4") buf.len(),
-            lateout("r2") ret,
-        );
-    }
-    ret
-}
-
-#[cfg(target_arch = "x86_64")]
 fn close(fd: i32) {
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            in("rax") SYS_CLOSE,
-            in("rdi") fd,
-            lateout("rax") _,
-            lateout("rcx") _,
-            lateout("r11") _,
-        );
-    }
+    unsafe { syscall_void!(SYS_CLOSE, fd) }
 }
 
-#[cfg(target_arch = "aarch64")]
-fn close(fd: i32) {
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_CLOSE,
-            in("x0") fd,
-            lateout("x0") _,
-        );
+fn open(path: &[u8]) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { syscall3!(i32; SYS_OPEN, path.as_ptr(), O_RDONLY, 0) }
     }
-}
-
-#[cfg(target_arch = "s390x")]
-fn close(fd: i32) {
-    unsafe {
-        core::arch::asm!(
-            "svc 0",
-            in("r1") SYS_CLOSE,
-            in("r2") fd,
-            lateout("r2") _,
-        );
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { syscall4!(i32; SYS_OPENAT, AT_FDCWD, path.as_ptr(), O_RDONLY, 0) }
+    }
+    #[cfg(target_arch = "s390x")]
+    {
+        unsafe { syscall3!(i64; SYS_OPEN, path.as_ptr(), O_RDONLY, 0i64) as i32 }
     }
 }
 
 // Seek to the end of the file and return its size in bytes (lseek with SEEK_END).
 // Returns a negative value on error.
-#[cfg(target_arch = "x86_64")]
 fn lseek_end(fd: i32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            in("rax") SYS_LSEEK,
-            in("rdi") fd,
-            in("rsi") 0i64,      // offset
-            in("rdx") SEEK_END,  // whence
-            lateout("rax") ret,
-            lateout("rcx") _,
-            lateout("r11") _,
-        );
-    }
-    ret
-}
-
-#[cfg(target_arch = "aarch64")]
-fn lseek_end(fd: i32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_LSEEK,
-            in("x0") fd,
-            in("x1") 0i64,      // offset
-            in("x2") SEEK_END,  // whence
-            lateout("x0") ret,
-        );
-    }
-    ret
-}
-
-#[cfg(target_arch = "s390x")]
-fn lseek_end(fd: i32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc 0",
-            in("r1") SYS_LSEEK,
-            in("r2") fd,
-            in("r3") 0i64,      // offset
-            in("r4") SEEK_END,  // whence
-            lateout("r2") ret,
-        );
-    }
-    ret
+    unsafe { syscall3!(i64; SYS_LSEEK, fd, 0i64, SEEK_END) }
 }
 
 // Memory-map `len` bytes of `fd` read-only (PROT_READ, MAP_PRIVATE, offset 0).
 // Returns a null pointer on error. The kernel returns a negative errno in
 // [-4095, -1] on failure; user-space addresses are positive on these arches.
-#[cfg(target_arch = "x86_64")]
 fn mmap_read(fd: i32, len: usize) -> *const u8 {
-    let ret: isize;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            in("rax") SYS_MMAP,
-            in("rdi") 0usize,       // addr = NULL
-            in("rsi") len,          // length
-            in("rdx") PROT_READ,    // prot
-            in("r10") MAP_PRIVATE,  // flags (NOTE: r10, not rcx, for syscalls)
-            in("r8") fd,            // fd
-            in("r9") 0usize,        // offset
-            lateout("rax") ret,
-            lateout("rcx") _,
-            lateout("r11") _,
-        );
+    #[cfg(not(target_arch = "s390x"))]
+    {
+        let ret: isize =
+            unsafe { syscall6!(isize; SYS_MMAP, 0usize, len, PROT_READ, MAP_PRIVATE, fd, 0usize) };
+        if ret < 0 {
+            core::ptr::null()
+        } else {
+            ret as *const u8
+        }
     }
-    if ret < 0 { core::ptr::null() } else { ret as *const u8 }
+    #[cfg(target_arch = "s390x")]
+    {
+        // s390x uses the old mmap convention: r2 holds a pointer to an array of
+        // 6 unsigned longs { addr, len, prot, flags, fd, offset }.
+        let args: [usize; 6] = [0, len, PROT_READ, MAP_PRIVATE, fd as usize, 0];
+        let ret: i64 = unsafe { syscall1!(i64; SYS_MMAP, args.as_ptr()) };
+        if ret < 0 {
+            core::ptr::null()
+        } else {
+            ret as usize as *const u8
+        }
+    }
 }
 
-#[cfg(target_arch = "aarch64")]
-fn mmap_read(fd: i32, len: usize) -> *const u8 {
-    let ret: isize;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_MMAP,
-            in("x0") 0usize,       // addr = NULL
-            in("x1") len,          // length
-            in("x2") PROT_READ,    // prot
-            in("x3") MAP_PRIVATE,  // flags
-            in("x4") fd,           // fd
-            in("x5") 0usize,       // offset
-            lateout("x0") ret,
-        );
+// Check if a path exists using access()/faccessat() with F_OK (0).
+pub fn path_exists(path: &[u8]) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { syscall2!(i32; SYS_ACCESS, path.as_ptr(), 0i32) == 0 }
     }
-    if ret < 0 { core::ptr::null() } else { ret as *const u8 }
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { syscall4!(i32; SYS_FACCESSAT, AT_FDCWD, path.as_ptr(), 0i32, 0i32) == 0 }
+    }
+    #[cfg(target_arch = "s390x")]
+    {
+        unsafe { syscall2!(i64; SYS_ACCESS, path.as_ptr(), 0i64) == 0 }
+    }
 }
 
-#[cfg(target_arch = "s390x")]
-fn mmap_read(fd: i32, len: usize) -> *const u8 {
-    // s390x uses the old mmap convention: r2 holds a pointer to an array of
-    // 6 unsigned longs { addr, len, prot, flags, fd, offset }.
-    let args: [usize; 6] = [0, len, PROT_READ, MAP_PRIVATE, fd as usize, 0];
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc 0",
-            in("r1") SYS_MMAP,
-            in("r2") args.as_ptr(),
-            lateout("r2") ret,
-            // No options(nomem): the kernel reads the args array through r2.
-        );
-    }
-    if ret < 0 { core::ptr::null() } else { ret as usize as *const u8 }
-}
-
-// Check if a path exists using access() syscall with F_OK (0)
-#[cfg(target_arch = "x86_64")]
-fn path_exists(path: &[u8]) -> bool {
-    let ret: i32;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            in("rax") SYS_ACCESS,
-            in("rdi") path.as_ptr(),
-            in("rsi") 0i32,  // F_OK = 0 (check existence)
-            lateout("rax") ret,
-            lateout("rcx") _,
-            lateout("r11") _,
-        );
-    }
-    ret == 0
-}
-
-#[cfg(target_arch = "aarch64")]
-fn path_exists(path: &[u8]) -> bool {
-    let ret: i32;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_FACCESSAT,
-            in("x0") AT_FDCWD,
-            in("x1") path.as_ptr(),
-            in("x2") 0i32,  // F_OK = 0 (check existence)
-            in("x3") 0i32,  // flags = 0
-            lateout("x0") ret,
-        );
-    }
-    ret == 0
-}
-
-#[cfg(target_arch = "s390x")]
-fn path_exists(path: &[u8]) -> bool {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc 0",
-            in("r1") SYS_ACCESS,
-            in("r2") path.as_ptr(),
-            in("r3") 0i64,  // F_OK = 0 (check existence)
-            lateout("r2") ret,
-        );
-    }
-    ret == 0
-}
-
-#[cfg(target_arch = "x86_64")]
 fn execve(filename: *const u8, argv: *const *const u8, envp: *const *const u8) -> i32 {
-    let ret: i32;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            in("rax") SYS_EXECVE,
-            in("rdi") filename,
-            in("rsi") argv,
-            in("rdx") envp,
-            lateout("rax") ret,
-            lateout("rcx") _,
-            lateout("r11") _,
-        );
+    #[cfg(not(target_arch = "s390x"))]
+    {
+        unsafe { syscall3!(i32; SYS_EXECVE, filename, argv, envp) }
     }
-    ret
+    #[cfg(target_arch = "s390x")]
+    {
+        unsafe { syscall3!(i64; SYS_EXECVE, filename, argv, envp) as i32 }
+    }
 }
 
-#[cfg(target_arch = "aarch64")]
-fn execve(filename: *const u8, argv: *const *const u8, envp: *const *const u8) -> i32 {
-    let ret: i32;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_EXECVE,
-            in("x0") filename,
-            in("x1") argv,
-            in("x2") envp,
-            lateout("x0") ret,
-        );
-    }
-    ret
-}
-
-#[cfg(target_arch = "s390x")]
-fn execve(filename: *const u8, argv: *const *const u8, envp: *const *const u8) -> i32 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc 0",
-            in("r1") SYS_EXECVE,
-            in("r2") filename,
-            in("r3") argv,
-            in("r4") envp,
-            lateout("r2") ret,
-        );
-    }
-    ret as i32
-}
-
-// String utilities
-fn print(s: &[u8]) {
+// --- primitives ---
+pub fn print(s: &[u8]) {
     write(STDOUT, s);
 }
 
-fn str_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    for i in 0..a.len() {
-        if a[i] != b[i] {
-            return false;
-        }
-    }
-    true
-}
-
-fn str_starts_with(haystack: &[u8], needle: &[u8]) -> bool {
-    if haystack.len() < needle.len() {
-        return false;
-    }
-    str_eq(&haystack[..needle.len()], needle)
-}
-
-fn find_byte(haystack: &[u8], needle: u8) -> Option<usize> {
-    for i in 0..haystack.len() {
-        if haystack[i] == needle {
-            return Some(i);
-        }
-    }
-    None
-}
-
-// Environment variable reading - returns the value as a String
-// Returns None if the variable doesn't exist or isn't valid UTF-8
-fn get_env_var(name: &[u8]) -> Option<String> {
+// Environment variable lookup by reading /proc/self/environ.
+pub fn get_env_var(name: &[u8]) -> Option<String> {
     let fd = open(b"/proc/self/environ\0");
     if fd < 0 {
         return None;
     }
-
-    // Read environment into Vec
     let mut environ_data = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
@@ -620,361 +361,47 @@ fn get_env_var(name: &[u8]) -> Option<String> {
     }
     close(fd);
 
-    if environ_data.is_empty() {
-        return None;
-    }
-
-    let mut pos = 0;
-
-    while pos < environ_data.len() {
-        let start = pos;
-        while pos < environ_data.len() && environ_data[pos] != 0 {
-            pos += 1;
+    for entry in environ_data.split(|&b| b == 0) {
+        if entry.is_empty() {
+            continue;
         }
-
-        let entry = &environ_data[start..pos];
-        if let Some(eq_pos) = find_byte(entry, b'=') {
-            let key = &entry[..eq_pos];
-            let value = &entry[eq_pos + 1..];
-
-            if str_eq(key, name) {
-                // Convert to String, returning None if not valid UTF-8
-                return String::from_utf8(value.to_vec()).ok();
+        if let Some(eq_pos) = entry.iter().position(|&b| b == b'=') {
+            if &entry[..eq_pos] == name {
+                return String::from_utf8(entry[eq_pos + 1..].to_vec()).ok();
             }
         }
-
-        pos += 1;
     }
-
     None
 }
 
-// Memory-mapped manifest: a pointer/length pair into the mapped file. The
-// manifest is scanned lazily on each lookup (O(n)), so no per-entry allocation
-// is needed and arbitrarily large manifests are supported. The kernel caches
-// the file's pages for us.
-struct Manifest {
-    ptr: *const u8,
-    len: usize,
-}
-
-impl Manifest {
-    #[inline]
-    fn data(&self) -> &[u8] {
-        // Safety: ptr/len come from a successful mmap that we leak for the
-        // lifetime of the process (until execve replaces the address space).
-        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
-    }
-
-    fn lookup(&self, key: &str) -> Option<&str> {
-        let key_bytes = key.as_bytes();
-        for (k, v) in ManifestLines::new(self.data()) {
-            if k == key_bytes {
-                return core::str::from_utf8(v).ok();
-            }
-        }
-        None
-    }
-
-    /// Find the longest manifest entry whose key is a prefix of `path` at a '/' boundary.
-    /// Returns (resolved_value, suffix) where suffix includes the leading '/'.
-    fn prefix_lookup<'a, 'b>(&'a self, path: &'b str) -> Option<(&'a str, &'b str)> {
-        let path_bytes = path.as_bytes();
-        let mut best: Option<(&'a str, &'b str)> = None;
-        let mut best_len: usize = 0;
-        for (k, v) in ManifestLines::new(self.data()) {
-            if path_bytes.len() > k.len()
-                && k.len() > best_len
-                && &path_bytes[..k.len()] == k
-                && path_bytes[k.len()] == b'/'
-            {
-                // Values were owned UTF-8 Strings before; keep that guarantee by
-                // only considering candidates whose value is valid UTF-8.
-                if let Ok(value) = core::str::from_utf8(v) {
-                    best_len = k.len();
-                    best = Some((value, &path[k.len()..]));
-                }
-            }
-        }
-        best
-    }
-}
-
-/// Iterator over `(key, value)` byte slices of a Bazel runfiles MANIFEST.
-/// Replicates `str::lines()` + `split_once(' ')`: split on '\n', strip one
-/// trailing '\r' (CRLF), and skip lines without a space (e.g. the
-/// "<workspace>/.runfile" marker).
-struct ManifestLines<'a> {
-    rest: &'a [u8],
-}
-
-impl<'a> ManifestLines<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self { rest: data }
-    }
-}
-
-impl<'a> Iterator for ManifestLines<'a> {
-    type Item = (&'a [u8], &'a [u8]);
-
-    fn next(&mut self) -> Option<(&'a [u8], &'a [u8])> {
-        while !self.rest.is_empty() {
-            let (mut line, remainder) = match find_byte(self.rest, b'\n') {
-                Some(nl) => (&self.rest[..nl], &self.rest[nl + 1..]),
-                None => (self.rest, &self.rest[self.rest.len()..]),
-            };
-            self.rest = remainder;
-            // Strip one trailing '\r' (handles CRLF line endings).
-            if let Some((&b'\r', head)) = line.split_last() {
-                line = head;
-            }
-            if let Some(sp) = find_byte(line, b' ') {
-                return Some((&line[..sp], &line[sp + 1..]));
-            }
-            // No space -> skip this line and continue.
-        }
-        None
-    }
-}
-
-// Load manifest file by memory-mapping it read-only. Returns None on open
-// failure, empty file (mmap of zero bytes is invalid), or mmap failure.
-fn load_manifest(path: &[u8]) -> Option<Manifest> {
+// Load the manifest by memory-mapping it read-only. None on open/empty/mmap failure.
+pub fn load_manifest(path: &[u8]) -> Option<Manifest> {
     let fd = open(path);
     if fd < 0 {
         return None;
     }
-
     let size = lseek_end(fd);
     if size <= 0 {
         close(fd);
         return None;
     }
     let len = size as usize;
-
     let ptr = mmap_read(fd, len);
     // The mapping keeps its own reference to the file; the fd can be closed.
     close(fd);
     if ptr.is_null() {
         return None;
     }
-
     // Leak the mapping: execve replaces the address space.
-    Some(Manifest { ptr, len })
+    Some(unsafe { Manifest::from_mapping(ptr, len) })
 }
 
-// Runfiles implementation using String for UTF-8 paths
-enum RunfilesMode {
-    ManifestBased(Manifest),
-    DirectoryBased(String),
-}
-
-struct Runfiles {
-    mode: RunfilesMode,
-    // Paths for environment variables (when export_runfiles_env is true)
-    manifest_path: Option<String>, // RUNFILES_MANIFEST_FILE
-    dir_path: Option<String>,      // RUNFILES_DIR and JAVA_RUNFILES
-}
-
-impl Runfiles {
-    fn create(executable_path: Option<&[u8]>) -> Option<Self> {
-        // Try RUNFILES_MANIFEST_FILE first
-        if let Some(manifest_path) = get_env_var(b"RUNFILES_MANIFEST_FILE") {
-            if !manifest_path.is_empty() {
-                // Create null-terminated path for load_manifest
-                let mut path_with_null = Vec::from(manifest_path.as_bytes());
-                path_with_null.push(0);
-
-                if let Some(manifest) = load_manifest(&path_with_null) {
-                    return Some(Self {
-                        mode: RunfilesMode::ManifestBased(manifest),
-                        manifest_path: Some(manifest_path),
-                        dir_path: None,
-                    });
-                }
-            }
-        }
-
-        // Try RUNFILES_DIR
-        if let Some(runfiles_dir) = get_env_var(b"RUNFILES_DIR") {
-            if !runfiles_dir.is_empty() {
-                return Some(Self {
-                    mode: RunfilesMode::DirectoryBased(runfiles_dir.clone()),
-                    manifest_path: None,
-                    dir_path: Some(runfiles_dir),
-                });
-            }
-        }
-
-        // Try to find runfiles next to the executable
-        // Check for <executable>.runfiles_manifest file (preferred)
-        // Then check for <executable>.runfiles directory
-        if let Some(exe_path) = executable_path {
-            let exe_len = str_len(exe_path);
-            if exe_len > 0 {
-                // Convert executable path to string (if valid UTF-8)
-                let exe_str = core::str::from_utf8(&exe_path[..exe_len]).ok()?;
-
-                // Try <executable>.runfiles_manifest file first
-                let manifest_file_path = String::from(exe_str) + ".runfiles_manifest";
-
-                // Add null terminator for syscall
-                let mut manifest_path_with_null = Vec::from(manifest_file_path.as_bytes());
-                manifest_path_with_null.push(0);
-
-                // Try to load the manifest file
-                if let Some(manifest) = load_manifest(&manifest_path_with_null) {
-                    // Also determine the runfiles directory for RUNFILES_DIR envvar
-                    let dir_path = String::from(exe_str) + ".runfiles";
-
-                    return Some(Self {
-                        mode: RunfilesMode::ManifestBased(manifest),
-                        manifest_path: Some(manifest_file_path),
-                        dir_path: Some(dir_path),
-                    });
-                }
-
-                // Try <executable>.runfiles directory
-                let runfiles_dir = String::from(exe_str) + ".runfiles";
-
-                // Add null terminator for path_exists syscall
-                let mut dir_with_null = Vec::from(runfiles_dir.as_bytes());
-                dir_with_null.push(0);
-
-                // Check if directory exists using access() syscall
-                if path_exists(&dir_with_null) {
-                    return Some(Self {
-                        mode: RunfilesMode::DirectoryBased(runfiles_dir.clone()),
-                        manifest_path: None,
-                        dir_path: Some(runfiles_dir),
-                    });
-                }
-            }
-        }
-
-        None
-    }
-
-    fn rlocation(&self, path: &str) -> Option<String> {
-        // If path is absolute, don't resolve through runfiles
-        if path.starts_with('/') {
-            return None;
-        }
-
-        match &self.mode {
-            RunfilesMode::ManifestBased(manifest) => {
-                if let Some(resolved) = manifest.lookup(path) {
-                    return Some(String::from(resolved));
-                }
-                // Prefix match for paths within TreeArtifacts
-                if let Some((resolved_prefix, suffix)) = manifest.prefix_lookup(path) {
-                    let mut result = String::from(resolved_prefix);
-                    result.push_str(suffix);
-                    return Some(result);
-                }
-                None
-            }
-            RunfilesMode::DirectoryBased(dir) => {
-                let mut result = dir.clone();
-
-                // Add separator if needed
-                if !result.ends_with('/') {
-                    result.push('/');
-                }
-
-                // Append the path
-                result.push_str(path);
-
-                Some(result)
-            }
-        }
-    }
-}
-
-// Placeholders for stub runner (will be replaced in final binary)
-// Each placeholder uses a distinctive pattern starting with @@RUNFILES_
-const ARG_SIZE: usize = 256;
-
-#[used]
-#[link_section = ".runfiles_stubs"]
-static mut ARGC_PLACEHOLDER: [u8; 32] = *b"@@RUNFILES_ARGC@@\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
-
-#[used]
-#[link_section = ".runfiles_stubs"]
-static mut TRANSFORM_FLAGS: [u8; 32] = *b"@@RUNFILES_TRANSFORM_FLAGS@@\0\0\0\0";
-
-#[used]
-#[link_section = ".runfiles_stubs"]
-static mut EXPORT_RUNFILES_ENV: [u8; 32] = *b"@@RUNFILES_EXPORT_ENV@@\0\0\0\0\0\0\0\0\0";
-
-#[used]
-#[link_section = ".runfiles_stubs"]
-static mut ARG0_PLACEHOLDER: [u8; ARG_SIZE] = [b'@'; ARG_SIZE];
-
-#[used]
-#[link_section = ".runfiles_stubs"]
-static mut ARG1_PLACEHOLDER: [u8; ARG_SIZE] = [b'@'; ARG_SIZE];
-
-#[used]
-#[link_section = ".runfiles_stubs"]
-static mut ARG2_PLACEHOLDER: [u8; ARG_SIZE] = [b'@'; ARG_SIZE];
-
-#[used]
-#[link_section = ".runfiles_stubs"]
-static mut ARG3_PLACEHOLDER: [u8; ARG_SIZE] = [b'@'; ARG_SIZE];
-
-#[used]
-#[link_section = ".runfiles_stubs"]
-static mut ARG4_PLACEHOLDER: [u8; ARG_SIZE] = [b'@'; ARG_SIZE];
-
-#[used]
-#[link_section = ".runfiles_stubs"]
-static mut ARG5_PLACEHOLDER: [u8; ARG_SIZE] = [b'@'; ARG_SIZE];
-
-#[used]
-#[link_section = ".runfiles_stubs"]
-static mut ARG6_PLACEHOLDER: [u8; ARG_SIZE] = [b'@'; ARG_SIZE];
-
-#[used]
-#[link_section = ".runfiles_stubs"]
-static mut ARG7_PLACEHOLDER: [u8; ARG_SIZE] = [b'@'; ARG_SIZE];
-
-#[used]
-#[link_section = ".runfiles_stubs"]
-static mut ARG8_PLACEHOLDER: [u8; ARG_SIZE] = [b'@'; ARG_SIZE];
-
-#[used]
-#[link_section = ".runfiles_stubs"]
-static mut ARG9_PLACEHOLDER: [u8; ARG_SIZE] = [b'@'; ARG_SIZE];
-
-// Get the length of a null-terminated string (Rust-style, takes slice)
-fn str_len(s: &[u8]) -> usize {
-    let mut len = 0;
-    while len < s.len() && s[len] != 0 {
-        len += 1;
-    }
-    len
-}
-
-// Check if placeholder is still in template state
-fn is_template_placeholder(placeholder: &[u8]) -> bool {
-    if placeholder.len() < 17 {
-        return false;
-    }
-    str_starts_with(placeholder, b"@@RUNFILES_")
-}
-
-// Read and parse environment variables from /proc/self/environ
-// Returns a tuple of (data_vec, pointers_vec) where pointers point into data_vec
+// Read /proc/self/environ into (data, pointers); pointers point into data.
 fn read_environ() -> (Vec<u8>, Vec<*const u8>) {
-    // Read environment from /proc/self/environ
     let fd = open(b"/proc/self/environ\0");
     if fd < 0 {
-        // If we can't read environ, return empty environment
         return (Vec::new(), vec![core::ptr::null()]);
     }
-
-    // Read into Vec
     let mut environ_data = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
@@ -990,42 +417,28 @@ fn read_environ() -> (Vec<u8>, Vec<*const u8>) {
         return (Vec::new(), vec![core::ptr::null()]);
     }
 
-    // Parse environment variables (null-separated entries)
     let mut env_ptrs = Vec::new();
     let mut pos = 0;
     let data_len = environ_data.len();
-
     while pos < data_len {
-        // Skip empty entries
         if environ_data[pos] == 0 {
             pos += 1;
             continue;
         }
-
-        // Mark start of this environment variable
         env_ptrs.push(unsafe { environ_data.as_ptr().add(pos) });
-
-        // Find the end (null byte)
         while pos < data_len && environ_data[pos] != 0 {
             pos += 1;
         }
-
-        // Move past the null byte
         pos += 1;
     }
-
-    // Null-terminate the pointer array
     env_ptrs.push(core::ptr::null());
-
     (environ_data, env_ptrs)
 }
 
-// Build modified environment with runfiles variables
-// Returns (data_vec, pointers_vec) - caller must keep data_vec alive while pointers are used
+// Build modified environment with runfiles variables; pointers point into data.
 fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> (Vec<u8>, Vec<*const u8>) {
     let (base_data, base_ptrs) = read_environ();
 
-    // If no runfiles info, just return base environment
     let rf = match runfiles {
         Some(r) => r,
         None => return (base_data, base_ptrs),
@@ -1034,73 +447,133 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> (Vec<u8>, Vec<*const u
     let mut env_data = Vec::new();
     let mut env_ptrs = Vec::new();
 
-    // Helper to add an environment variable to env_data and record pointer
     let add_env_var = |data: &mut Vec<u8>, ptrs: &mut Vec<*const u8>, name: &[u8], value: &str| {
         let start_pos = data.len();
         data.extend_from_slice(name);
         data.push(b'=');
         data.extend_from_slice(value.as_bytes());
-        data.push(0); // null terminator
-
-        // We'll fix up pointers after building the data
-        ptrs.push(start_pos as *const u8); // Temporarily store offset, fix up later
+        data.push(0);
+        ptrs.push(start_pos as *const u8);
     };
 
-    // Add runfiles environment variables first
     if let Some(ref path) = rf.manifest_path {
         add_env_var(&mut env_data, &mut env_ptrs, b"RUNFILES_MANIFEST_FILE", path);
     }
-
     if let Some(ref path) = rf.dir_path {
         add_env_var(&mut env_data, &mut env_ptrs, b"RUNFILES_DIR", path);
         add_env_var(&mut env_data, &mut env_ptrs, b"JAVA_RUNFILES", path);
     }
 
-    // Copy existing environment (skip runfiles vars that we're setting)
-    // We need to iterate through the base data directly
-    let mut pos = 0;
-    while pos < base_data.len() {
-        // Skip empty entries
-        if base_data[pos] == 0 {
-            pos += 1;
+    // Copy existing environment (skip runfiles vars we're setting).
+    for env_entry in base_data.split(|&b| b == 0) {
+        if env_entry.is_empty() {
             continue;
         }
-
-        // Find the end of this entry
-        let start = pos;
-        while pos < base_data.len() && base_data[pos] != 0 {
-            pos += 1;
-        }
-
-        let env_entry = &base_data[start..pos];
-
-        // Skip if this is a runfiles var we're replacing
         let is_runfiles_var = env_entry.starts_with(b"RUNFILES_MANIFEST_FILE=")
             || env_entry.starts_with(b"RUNFILES_DIR=")
             || env_entry.starts_with(b"JAVA_RUNFILES=");
-
         if !is_runfiles_var {
             let start_pos = env_data.len();
             env_data.extend_from_slice(env_entry);
-            env_data.push(0); // null terminator
-            env_ptrs.push(start_pos as *const u8); // Temporarily store offset
+            env_data.push(0);
+            env_ptrs.push(start_pos as *const u8);
         }
-
-        // Move past the null byte
-        pos += 1;
     }
 
-    // Now fix up all the pointers to point to actual addresses in env_data
+    // Fix up offsets to real addresses now that env_data won't move.
     let base_ptr = env_data.as_ptr();
     for ptr in env_ptrs.iter_mut() {
         let offset = *ptr as usize;
         *ptr = unsafe { base_ptr.add(offset) };
     }
-
-    // Null-terminate the pointer array
     env_ptrs.push(core::ptr::null());
 
     (env_data, env_ptrs)
+}
+
+// --- runtime args & launch ---
+pub struct RuntimeArgs {
+    argc: usize,
+    argv: *const *const u8,
+}
+
+impl RuntimeArgs {
+    /// argv[0] (the stub's own path) as bytes, for runfiles fallback discovery.
+    pub fn program_path(&self) -> Option<&[u8]> {
+        if self.argc == 0 {
+            return None;
+        }
+        unsafe {
+            let p = *self.argv;
+            let mut len = 0;
+            while *p.add(len) != 0 && len < 1048576 {
+                len += 1;
+            }
+            if len > 0 {
+                Some(core::slice::from_raw_parts(p, len))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
+    // Collect runtime args [1..] as NUL-terminated copies.
+    let mut runtime: Vec<Vec<u8>> = Vec::new();
+    if rt.argc > 1 {
+        for i in 1..rt.argc {
+            unsafe {
+                let p = *rt.argv.add(i);
+                let mut len = 0;
+                while *p.add(len) != 0 {
+                    len += 1;
+                    if len > 1048576 {
+                        print(b"ERROR: Runtime argument exceeds 1MB limit\n");
+                        exit(1);
+                    }
+                }
+                runtime.push(core::slice::from_raw_parts(p, len + 1).to_vec());
+            }
+        }
+    }
+
+    // Build the argv pointer array: embedded resolved + runtime + NULL.
+    let mut ptrs: Vec<*const u8> = Vec::with_capacity(launch.resolved.len() + runtime.len() + 1);
+    for a in launch.resolved {
+        ptrs.push(a.as_ptr());
+    }
+    for a in &runtime {
+        ptrs.push(a.as_ptr());
+    }
+    ptrs.push(core::ptr::null());
+
+    // The program to execute is the fully-resolved arg0; argv[0] may be overridden
+    // with the runfiles-relative path (read program before overwriting ptrs[0]).
+    let program = launch.resolved[0].as_ptr();
+    if let Some(override0) = launch.argv0_override {
+        ptrs[0] = override0.as_ptr();
+    }
+
+    let (_env_data, env_ptrs) = if launch.export_env {
+        build_runfiles_environ(launch.runfiles)
+    } else {
+        read_environ()
+    };
+
+    let ret = execve(program, ptrs.as_ptr(), env_ptrs.as_ptr());
+
+    // execve only returns on failure.
+    print(b"ERROR: execve failed with code ");
+    let digit = if ret < 0 {
+        print(b"-");
+        (-ret) as u8 + b'0'
+    } else {
+        ret as u8 + b'0'
+    };
+    print(&[digit]);
+    print(b"\n");
+    exit(1);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1130,288 +603,11 @@ core::arch::global_asm!(
 
 #[no_mangle]
 pub extern "C" fn _start_rust(initial_sp: *const usize) -> ! {
-    unsafe {
-        // Stack layout: [sp] = argc, [sp + 8] = argv[0], [sp + 16] = argv[1], ...
-        let runtime_argc = *initial_sp;
-        let runtime_argv = (initial_sp as usize + 8) as *const *const u8;
-
-        // Check if ARGC is still a placeholder
-        if is_template_placeholder(&ARGC_PLACEHOLDER) {
-            print(b"ERROR: This is a template stub runner.\n");
-            print(b"You must finalize it by replacing the placeholders before use.\n");
-            print(b"The ARGC_PLACEHOLDER has not been replaced.\n");
-            exit(1);
-        }
-
-        // Parse argc from placeholder
-        let argc_str = &ARGC_PLACEHOLDER;
-        let argc_len = str_len(argc_str);
-        if argc_len == 0 {
-            print(b"ERROR: ARGC is empty\n");
-            exit(1);
-        }
-
-        // Parse argc as decimal number
-        let mut argc: usize = 0;
-        for i in 0..argc_len {
-            let c = argc_str[i];
-            if c >= b'0' && c <= b'9' {
-                argc = argc * 10 + (c - b'0') as usize;
-            } else {
-                print(b"ERROR: ARGC contains non-digit characters\n");
-                exit(1);
-            }
-        }
-
-        if argc == 0 || argc > 10 {
-            print(b"ERROR: Invalid argc (must be 1-10)\n");
-            exit(1);
-        }
-
-        // Parse transform flags (bitmask of which args to transform)
-        let flags_str = &TRANSFORM_FLAGS;
-        let flags_len = str_len(flags_str);
-        let mut transform_flags: u32 = 0;
-
-        if !is_template_placeholder(flags_str) && flags_len > 0 {
-            // Parse as decimal number (bitmask)
-            for i in 0..flags_len {
-                let c = flags_str[i];
-                if c >= b'0' && c <= b'9' {
-                    transform_flags = transform_flags * 10 + (c - b'0') as u32;
-                } else {
-                    print(b"ERROR: TRANSFORM_FLAGS contains non-digit characters\n");
-                    exit(1);
-                }
-            }
-        }
-        // If flags not set, default to transforming all args
-        if flags_len == 0 || is_template_placeholder(flags_str) {
-            transform_flags = 0xFFFFFFFF; // Transform all by default
-        }
-
-        // Parse export_runfiles_env flag
-        let export_env_str = &EXPORT_RUNFILES_ENV;
-        let export_env_len = str_len(export_env_str);
-        let export_runfiles_env = if !is_template_placeholder(export_env_str) && export_env_len > 0 {
-            export_env_str[0] == b'1'
-        } else {
-            true // Default to true if not set
-        };
-
-        // Check if any arguments need transformation
-        // Create a mask for only the arguments we have (argc args)
-        let argc_mask = if argc >= 32 {
-            0xFFFFFFFF
-        } else {
-            (1u32 << argc) - 1
-        };
-        let needs_transform = (transform_flags & argc_mask) != 0;
-        let needs_runfiles = needs_transform || export_runfiles_env;
-
-        // Get executable path from runtime argv[0] (the stub's actual path) for runfiles fallback
-        let executable_path = if runtime_argc > 0 {
-            let argv0_ptr = *runtime_argv;
-            let mut exe_len = 0;
-            // Safety limit of 1MB to prevent infinite loop
-            while *argv0_ptr.add(exe_len) != 0 && exe_len < 1048576 {
-                exe_len += 1;
-            }
-            if exe_len > 0 {
-                Some(core::slice::from_raw_parts(argv0_ptr, exe_len))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // Initialize runfiles only if needed
-        let runfiles = if needs_runfiles {
-            if let Some(rf) = Runfiles::create(executable_path) {
-                Some(rf)
-            } else {
-                print(b"ERROR: Failed to initialize runfiles\n");
-                print(b"Set RUNFILES_DIR or RUNFILES_MANIFEST_FILE, or ensure <executable>.runfiles/ directory exists\n");
-                exit(1);
-            }
-        } else {
-            None
-        };
-
-        // Get arg placeholders
-        let arg_placeholders: [&[u8; ARG_SIZE]; 10] = [
-            &ARG0_PLACEHOLDER,
-            &ARG1_PLACEHOLDER,
-            &ARG2_PLACEHOLDER,
-            &ARG3_PLACEHOLDER,
-            &ARG4_PLACEHOLDER,
-            &ARG5_PLACEHOLDER,
-            &ARG6_PLACEHOLDER,
-            &ARG7_PLACEHOLDER,
-            &ARG8_PLACEHOLDER,
-            &ARG9_PLACEHOLDER,
-        ];
-
-        // Use Vec for dynamic path storage - no fixed size limits
-        // We store as Vec<u8> since we need null-terminated bytes for execve
-        let mut resolved_paths: Vec<Vec<u8>> = Vec::with_capacity(128);
-
-        // Resolve embedded arguments
-        for i in 0..argc {
-            let arg_data = arg_placeholders[i];
-            let arg_len = str_len(arg_data);
-
-            if arg_len == 0 {
-                print(b"ERROR: Argument ");
-                let digit = [b'0' + i as u8];
-                print(&digit);
-                print(b" is empty\n");
-                exit(1);
-            }
-
-            let arg_slice = &arg_data[..arg_len];
-
-            // Check if this argument should be transformed
-            let should_transform = (transform_flags & (1 << i)) != 0;
-
-            let resolved = if should_transform {
-                // Try to resolve through runfiles (which we know exists if we need transformation)
-                if let Some(ref rf) = runfiles {
-                    // Convert argument to &str for rlocation (Bazel args are UTF-8)
-                    if let Ok(arg_str) = core::str::from_utf8(arg_slice) {
-                        if let Some(resolved_str) = rf.rlocation(arg_str) {
-                            // Convert back to bytes with null terminator
-                            let mut path = Vec::from(resolved_str.as_bytes());
-                            path.push(0);
-                            path
-                        } else {
-                            // If not found in runfiles, use the path as-is
-                            let mut path = arg_slice.to_vec();
-                            path.push(0);
-                            path
-                        }
-                    } else {
-                        // Not valid UTF-8, use as-is
-                        let mut path = arg_slice.to_vec();
-                        path.push(0);
-                        path
-                    }
-                } else {
-                    // This should never happen - we checked needs_runfiles before
-                    // But use path as-is for safety
-                    let mut path = arg_slice.to_vec();
-                    path.push(0);
-                    path
-                }
-            } else {
-                // Use path as-is without transformation
-                let mut path = arg_slice.to_vec();
-                path.push(0);
-                path
-            };
-
-            resolved_paths.push(resolved);
-        }
-
-        // Append runtime arguments (skip argv[0] which is the stub itself)
-        if runtime_argc > 1 {
-            for i in 1..runtime_argc {
-                // Get runtime argument
-                let runtime_arg_ptr = *runtime_argv.add(i);
-
-                // Find length of runtime argument (scan until null, with safety limit)
-                let mut arg_len = 0;
-                while *runtime_arg_ptr.add(arg_len) != 0 {
-                    arg_len += 1;
-                    // Safety limit to prevent infinite loop on malformed input
-                    if arg_len > 1048576 {
-                        print(b"ERROR: Runtime argument exceeds 1MB limit\n");
-                        exit(1);
-                    }
-                }
-
-                // Copy runtime argument (include null terminator)
-                let runtime_arg_slice = core::slice::from_raw_parts(runtime_arg_ptr, arg_len + 1);
-                resolved_paths.push(runtime_arg_slice.to_vec());
-            }
-        }
-
-        // Preserve argv[0] as a runfiles-relative path.
-        //
-        // The rlocation-resolved path (resolved_paths[0]) is a fully resolved
-        // absolute path, suitable for the kernel to open and execute. However,
-        // many programs (notably aspect_rules_py's venv_shim) read argv[0] and
-        // walk its parent symlinks to locate the .runfiles tree. If argv[0] is
-        // already a fully resolved path, this walk fails because the symlink
-        // chain through .runfiles has been bypassed.
-        //
-        // To fix this, we construct argv[0] as <runfiles_dir>/<original_arg>,
-        // which preserves the path through the .runfiles symlink tree. The
-        // resolved path is still used as the filename argument to execve, so
-        // the kernel can find the actual binary.
-        let argv0_runfiles_path: Option<Vec<u8>> = if let Some(ref rf) = runfiles {
-            if let Some(ref dir_path) = rf.dir_path {
-                // Get the original (pre-resolution) arg0
-                let arg0_data = arg_placeholders[0];
-                let arg0_len = str_len(arg0_data);
-                if arg0_len > 0 {
-                    let mut path = Vec::from(dir_path.as_bytes());
-                    if !dir_path.ends_with('/') {
-                        path.push(b'/');
-                    }
-                    path.extend_from_slice(&arg0_data[..arg0_len]);
-                    path.push(0);
-                    Some(path)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // Build pointer array from the resolved paths
-        let mut resolved_ptrs: Vec<*const u8> = Vec::with_capacity(resolved_paths.len() + 1);
-        for path in &resolved_paths {
-            resolved_ptrs.push(path.as_ptr());
-        }
-        // NULL-terminate the argv array
-        resolved_ptrs.push(core::ptr::null());
-
-        // Get the executable path (first argument) — fully resolved for the kernel
-        let executable = resolved_ptrs[0];
-
-        // Replace argv[0] with the runfiles-relative path if available.
-        // This must happen after building resolved_ptrs so the executable
-        // pointer captures the resolved path before we overwrite argv[0].
-        if let Some(ref argv0_path) = argv0_runfiles_path {
-            resolved_ptrs[0] = argv0_path.as_ptr();
-        }
-
-        // Build environment (with runfiles vars if export_runfiles_env is true)
-        // We need to keep the env_data alive until execve
-        let (_env_data, env_ptrs) = if export_runfiles_env {
-            build_runfiles_environ(runfiles.as_ref())
-        } else {
-            read_environ()
-        };
-
-        // Execute the target program
-        let ret = execve(executable, resolved_ptrs.as_ptr(), env_ptrs.as_ptr());
-
-        // If execve returns, it failed
-        print(b"ERROR: execve failed with code ");
-        let digit = if ret < 0 {
-            print(b"-");
-            (-ret) as u8 + b'0'
-        } else {
-            ret as u8 + b'0'
-        };
-        print(&[digit]);
-        print(b"\n");
-        exit(1);
-    }
+    // Stack layout: [sp] = argc, [sp + 8] = argv[0], [sp + 16] = argv[1], ...
+    let (argc, argv) = unsafe {
+        let argc = *initial_sp;
+        let argv = (initial_sp as usize + 8) as *const *const u8;
+        (argc, argv)
+    };
+    crate::run::main(RuntimeArgs { argc, argv })
 }

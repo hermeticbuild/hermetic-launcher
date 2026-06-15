@@ -1,42 +1,14 @@
-// Windows-specific implementation using Windows API
-// Uses kernel32.dll functions
-
-extern crate alloc;
+// Windows backend: kernel32 (Win32) primitives, a `main` entry that parses the
+// command line, and a CreateProcessW-based launch (spawn + wait + propagate exit code).
+// Runtime args stay UTF-16; embedded args are widened from UTF-8.
 
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::alloc::{GlobalAlloc, Layout};
-use core::cell::UnsafeCell;
-use core::panic::PanicInfo;
-use talc::{ClaimOnOom, Span, Talc};
 
-// Global allocator using talc with a static memory arena
-// 8 MiB should be plenty for manifest parsing, path resolution, and environment handling
-static mut ARENA: [u8; 8 * 1024 * 1024] = [0; 8 * 1024 * 1024];
-
-// Simple wrapper for single-threaded use (no locking needed)
-struct TalcAllocator(UnsafeCell<Talc<ClaimOnOom>>);
-unsafe impl Sync for TalcAllocator {}
-
-unsafe impl GlobalAlloc for TalcAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        (*self.0.get()).malloc(layout).map_or(core::ptr::null_mut(), |p| p.as_ptr())
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        (*self.0.get()).free(core::ptr::NonNull::new_unchecked(ptr), layout);
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: TalcAllocator = TalcAllocator(UnsafeCell::new(Talc::new(unsafe {
-    ClaimOnOom::new(Span::from_array(core::ptr::addr_of!(ARENA).cast_mut()))
-})));
-
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    unsafe { ExitProcess(1) }
-}
+use crate::common::Manifest;
+use crate::run::Launch;
+use crate::runfiles::Runfiles;
 
 // Windows API types
 type DWORD = u32;
@@ -60,6 +32,7 @@ const PAGE_READONLY: DWORD = 0x02;
 const FILE_MAP_READ: DWORD = 0x04;
 
 // STARTUPINFOW structure (wide char version for CreateProcessW)
+#[allow(non_snake_case)] // Win32 field names
 #[repr(C)]
 struct STARTUPINFOW {
     cb: DWORD,
@@ -83,6 +56,7 @@ struct STARTUPINFOW {
 }
 
 // PROCESS_INFORMATION structure
+#[allow(non_snake_case)] // Win32 field names
 #[repr(C)]
 struct PROCESS_INFORMATION {
     hProcess: HANDLE,
@@ -144,182 +118,74 @@ extern "system" {
     fn GetCommandLineW() -> *const u16;
     fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: DWORD) -> DWORD;
     fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *mut DWORD) -> BOOL;
+    fn GetEnvironmentStringsW() -> *mut u16;
+    fn FreeEnvironmentStringsW(lpszEnvironmentBlock: *mut u16) -> BOOL;
 }
 
-// We don't use CommandLineToArgvW to avoid shell32.dll dependency
-// Instead we implement custom command-line parsing following Windows rules
+// --- path semantics ---
+pub const SEP: char = '\\';
+pub const NEWLINE: &[u8] = b"\r\n";
 
-// Parse Windows command line into arguments
-// Returns number of arguments parsed (excluding argv[0])
-// Stores argument pointers in output array
-fn parse_command_line(
-    cmdline: *const u16,
-    argv_out: &mut [*const u16; 128],
-    argv_len_out: &mut [usize; 128],
-) -> usize {
-    unsafe {
-        let mut pos = 0usize;
-        let mut argc = 0usize;
-
-        // Skip leading whitespace
-        while *cmdline.add(pos) != 0 && (*cmdline.add(pos) == b' ' as u16 || *cmdline.add(pos) == b'\t' as u16) {
-            pos += 1;
-        }
-
-        // Skip argv[0] (executable path)
-        let quoted = *cmdline.add(pos) == b'"' as u16;
-        if quoted {
-            pos += 1; // Skip opening quote
-            while *cmdline.add(pos) != 0 && *cmdline.add(pos) != b'"' as u16 {
-                pos += 1;
-            }
-            if *cmdline.add(pos) == b'"' as u16 {
-                pos += 1; // Skip closing quote
-            }
-        } else {
-            while *cmdline.add(pos) != 0 && *cmdline.add(pos) != b' ' as u16 && *cmdline.add(pos) != b'\t' as u16 {
-                pos += 1;
-            }
-        }
-
-        // Parse remaining arguments
-        while *cmdline.add(pos) != 0 && argc < 128 {
-            // Skip whitespace
-            while *cmdline.add(pos) != 0 && (*cmdline.add(pos) == b' ' as u16 || *cmdline.add(pos) == b'\t' as u16) {
-                pos += 1;
-            }
-
-            if *cmdline.add(pos) == 0 {
-                break;
-            }
-
-            // Start of argument
-            let arg_start = pos;
-            let in_quotes = *cmdline.add(pos) == b'"' as u16;
-
-            if in_quotes {
-                pos += 1; // Skip opening quote
-                // Find closing quote
-                while *cmdline.add(pos) != 0 && *cmdline.add(pos) != b'"' as u16 {
-                    pos += 1;
-                }
-                // Store argument (skip quotes in length calculation)
-                argv_out[argc] = cmdline.add(arg_start + 1);
-                argv_len_out[argc] = pos - arg_start - 1;
-
-                if *cmdline.add(pos) == b'"' as u16 {
-                    pos += 1; // Skip closing quote
-                }
-            } else {
-                // Unquoted argument - find whitespace
-                while *cmdline.add(pos) != 0 && *cmdline.add(pos) != b' ' as u16 && *cmdline.add(pos) != b'\t' as u16 {
-                    pos += 1;
-                }
-                argv_out[argc] = cmdline.add(arg_start);
-                argv_len_out[argc] = pos - arg_start;
-            }
-
-            argc += 1;
-        }
-
-        argc
-    }
+pub fn is_absolute(path: &str) -> bool {
+    let b = path.as_bytes();
+    b.len() >= 2
+        && ((b[0].is_ascii_alphabetic() && b[1] == b':') || (b[0] == b'\\' && b[1] == b'\\'))
 }
 
-// String utilities
-fn print(s: &[u8]) {
+pub fn to_native_path(s: &str) -> String {
+    s.replace('/', "\\")
+}
+
+// --- primitives ---
+pub fn print(s: &[u8]) {
     unsafe {
         let stdout = GetStdHandle(STD_OUTPUT_HANDLE);
         let mut written: DWORD = 0;
-        WriteFile(
-            stdout,
-            s.as_ptr(),
-            s.len() as DWORD,
-            &mut written,
+        WriteFile(stdout, s.as_ptr(), s.len() as DWORD, &mut written, core::ptr::null_mut());
+    }
+}
+
+pub fn exit(code: i32) -> ! {
+    unsafe { ExitProcess(code as u32) }
+}
+
+// Directory/file existence check by trying to open it (needs backup semantics for dirs).
+pub fn path_exists(path: &[u8]) -> bool {
+    const FILE_FLAG_BACKUP_SEMANTICS: DWORD = 0x02000000;
+    unsafe {
+        let handle = CreateFileA(
+            path.as_ptr(),
+            GENERIC_READ,
+            0,
+            core::ptr::null_mut(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
             core::ptr::null_mut(),
         );
-    }
-}
-
-fn print_number(mut n: usize) {
-    let mut buf = [0u8; 20]; // Enough for 64-bit numbers
-    let mut i = 0;
-
-    if n == 0 {
-        print(b"0");
-        return;
-    }
-
-    while n > 0 {
-        buf[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-        i += 1;
-    }
-
-    // Print in reverse order
-    while i > 0 {
-        i -= 1;
-        print(&buf[i..i+1]);
-    }
-}
-
-fn str_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    for i in 0..a.len() {
-        if a[i] != b[i] {
-            return false;
+        if handle != INVALID_HANDLE_VALUE {
+            CloseHandle(handle);
+            true
+        } else {
+            false
         }
     }
-    true
 }
 
-fn str_starts_with(haystack: &[u8], needle: &[u8]) -> bool {
-    if haystack.len() < needle.len() {
-        return false;
-    }
-    str_eq(&haystack[..needle.len()], needle)
-}
-
-fn find_byte(haystack: &[u8], needle: u8) -> Option<usize> {
-    for i in 0..haystack.len() {
-        if haystack[i] == needle {
-            return Some(i);
-        }
-    }
-    None
-}
-
-// Environment variable reading - returns String
-fn get_env_var(name: &[u8]) -> Option<String> {
+// Environment variable lookup (two-call GetEnvironmentVariableA pattern).
+pub fn get_env_var(name: &[u8]) -> Option<String> {
     unsafe {
-        // Ensure name is null-terminated
         let mut name_with_null = name.to_vec();
         name_with_null.push(0);
 
-        // First call to get required size
-        let size = GetEnvironmentVariableA(
-            name_with_null.as_ptr(),
-            core::ptr::null_mut(),
-            0,
-        );
-
+        let size = GetEnvironmentVariableA(name_with_null.as_ptr(), core::ptr::null_mut(), 0);
         if size == 0 {
             return None;
         }
-
-        // Allocate buffer and get value
         let mut buf = vec![0u8; size as usize];
-        let actual_size = GetEnvironmentVariableA(
-            name_with_null.as_ptr(),
-            buf.as_mut_ptr(),
-            buf.len() as DWORD,
-        );
-
+        let actual_size =
+            GetEnvironmentVariableA(name_with_null.as_ptr(), buf.as_mut_ptr(), buf.len() as DWORD);
         if actual_size > 0 && actual_size < buf.len() as DWORD {
             buf.truncate(actual_size as usize);
-            // Convert to String, returning None if not valid UTF-8
             String::from_utf8(buf).ok()
         } else {
             None
@@ -327,106 +193,13 @@ fn get_env_var(name: &[u8]) -> Option<String> {
     }
 }
 
-// Memory-mapped manifest: a pointer/length pair into the mapped file view. The
-// manifest is scanned lazily on each lookup (O(n)), so no per-entry allocation
-// is needed and arbitrarily large manifests are supported.
-struct Manifest {
-    ptr: *const u8,
-    len: usize,
-}
-
-impl Manifest {
-    #[inline]
-    fn data(&self) -> &[u8] {
-        // Safety: ptr/len come from a successful MapViewOfFile that we leak for
-        // the lifetime of the process (until ExitProcess reclaims it).
-        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
-    }
-
-    fn lookup(&self, key: &str) -> Option<&str> {
-        let key_bytes = key.as_bytes();
-        for (k, v) in ManifestLines::new(self.data()) {
-            if k == key_bytes {
-                return core::str::from_utf8(v).ok();
-            }
-        }
-        None
-    }
-
-    /// Find the longest manifest entry whose key is a prefix of `path` at a '/' boundary.
-    /// Returns (resolved_value, suffix) where suffix includes the leading '/'.
-    fn prefix_lookup<'a, 'b>(&'a self, path: &'b str) -> Option<(&'a str, &'b str)> {
-        let path_bytes = path.as_bytes();
-        let mut best: Option<(&'a str, &'b str)> = None;
-        let mut best_len: usize = 0;
-        for (k, v) in ManifestLines::new(self.data()) {
-            if path_bytes.len() > k.len()
-                && k.len() > best_len
-                && &path_bytes[..k.len()] == k
-                && path_bytes[k.len()] == b'/'
-            {
-                // Values were owned UTF-8 Strings before; keep that guarantee by
-                // only considering candidates whose value is valid UTF-8.
-                if let Ok(value) = core::str::from_utf8(v) {
-                    best_len = k.len();
-                    best = Some((value, &path[k.len()..]));
-                }
-            }
-        }
-        best
-    }
-}
-
-/// Iterator over `(key, value)` byte slices of a Bazel runfiles MANIFEST.
-/// Replicates `str::lines()` + `split_once(' ')`: split on '\n', strip one
-/// trailing '\r' (CRLF), and skip lines without a space (e.g. the
-/// "<workspace>/.runfile" marker).
-struct ManifestLines<'a> {
-    rest: &'a [u8],
-}
-
-impl<'a> ManifestLines<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self { rest: data }
-    }
-}
-
-impl<'a> Iterator for ManifestLines<'a> {
-    type Item = (&'a [u8], &'a [u8]);
-
-    fn next(&mut self) -> Option<(&'a [u8], &'a [u8])> {
-        while !self.rest.is_empty() {
-            let (mut line, remainder) = match find_byte(self.rest, b'\n') {
-                Some(nl) => (&self.rest[..nl], &self.rest[nl + 1..]),
-                None => (self.rest, &self.rest[self.rest.len()..]),
-            };
-            self.rest = remainder;
-            // Strip one trailing '\r' (handles CRLF line endings).
-            if let Some((&b'\r', head)) = line.split_last() {
-                line = head;
-            }
-            if let Some(sp) = find_byte(line, b' ') {
-                return Some((&line[..sp], &line[sp + 1..]));
-            }
-            // No space -> skip this line and continue.
-        }
-        None
-    }
-}
-
-// Load manifest file by memory-mapping it read-only. Returns None on open
-// failure, empty file (CreateFileMapping of zero bytes fails), or mapping
-// failure.
-fn load_manifest(path: &[u8]) -> Option<Manifest> {
+// Memory-map the manifest read-only. `path` is NUL-terminated by the caller.
+pub fn load_manifest(path: &[u8]) -> Option<Manifest> {
     unsafe {
-        // Ensure path is null-terminated
-        let mut path_with_null = path.to_vec();
-        path_with_null.push(0);
-
         // FILE_SHARE_READ lets the child process (which inherits
         // RUNFILES_MANIFEST_FILE) open the same manifest for reading.
         let file = CreateFileA(
-            path_with_null.as_ptr(),
+            path.as_ptr(),
             GENERIC_READ,
             FILE_SHARE_READ,
             core::ptr::null_mut(),
@@ -434,7 +207,6 @@ fn load_manifest(path: &[u8]) -> Option<Manifest> {
             FILE_ATTRIBUTE_NORMAL,
             core::ptr::null_mut(),
         );
-
         if file == INVALID_HANDLE_VALUE {
             return None;
         }
@@ -461,8 +233,7 @@ fn load_manifest(path: &[u8]) -> Option<Manifest> {
         }
 
         let view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
-        // The view keeps its own reference to the section; both handles can be
-        // closed and the view stays valid.
+        // The view keeps its own reference to the section; both handles can be closed.
         CloseHandle(mapping);
         CloseHandle(file);
         if view.is_null() {
@@ -470,895 +241,378 @@ fn load_manifest(path: &[u8]) -> Option<Manifest> {
         }
 
         // Leak the view: ExitProcess reclaims it.
-        Some(Manifest { ptr: view as *const u8, len })
+        Some(Manifest::from_mapping(view as *const u8, len))
     }
 }
 
-// Runfiles implementation using String for dynamic path storage
-enum RunfilesMode {
-    ManifestBased(Manifest),
-    DirectoryBased(String),
-}
+// Build the UTF-16 environment block (sorted, double-NUL terminated) with the runfiles
+// variables merged in. Returns an owned Vec the caller keeps alive while CreateProcessW
+// reads it. Previously this used a 128 KB `static mut`; a heap Vec removes the mutable
+// static, the fixed size cap, and the abort-on-overflow path, while preserving the exact
+// sorted-insertion ordering. Windows requires the block sorted alphabetically by name;
+// GetEnvironmentStringsW() already returns it sorted, so we insert our vars in place.
+fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> Vec<u16> {
+    let mut buf: Vec<u16> = Vec::with_capacity(8192);
 
-struct Runfiles {
-    mode: RunfilesMode,
-    // Paths for environment variables (when export_runfiles_env is true)
-    manifest_path: Option<String>, // RUNFILES_MANIFEST_FILE
-    dir_path: Option<String>,      // RUNFILES_DIR and JAVA_RUNFILES
-}
-
-impl Runfiles {
-    fn create(executable_path: Option<&[u8]>) -> Option<Self> {
-        // Step 1: Try RUNFILES_MANIFEST_FILE envvar first
-        if let Some(manifest_path) = get_env_var(b"RUNFILES_MANIFEST_FILE") {
-            if !manifest_path.is_empty() {
-                // Create null-terminated path for load_manifest
-                let mut path_with_null = Vec::from(manifest_path.as_bytes());
-                path_with_null.push(0);
-
-                if let Some(manifest) = load_manifest(&path_with_null) {
-                    return Some(Self {
-                        mode: RunfilesMode::ManifestBased(manifest),
-                        manifest_path: Some(manifest_path),
-                        dir_path: None,
-                    });
-                }
-            }
+    // Append "KEY=VALUE\0", widening bytes to UTF-16.
+    let push_var = |buf: &mut Vec<u16>, key: &[u8], value: &str| {
+        for &b in key {
+            buf.push(b as u16);
         }
-
-        // Step 2: Try RUNFILES_DIR envvar
-        if let Some(runfiles_dir) = get_env_var(b"RUNFILES_DIR") {
-            if !runfiles_dir.is_empty() {
-                return Some(Self {
-                    mode: RunfilesMode::DirectoryBased(runfiles_dir.clone()),
-                    manifest_path: None,
-                    dir_path: Some(runfiles_dir),
-                });
-            }
+        buf.push(b'=' as u16);
+        for &b in value.as_bytes() {
+            buf.push(b as u16);
         }
+        buf.push(0);
+    };
 
-        // Step 3: Try to find runfiles next to the executable
-        // Check for <executable>.runfiles_manifest file (preferred)
-        // Then check for <executable>.runfiles directory
-        if let Some(exe_path) = executable_path {
-            let exe_len = strlen(exe_path);
-            if exe_len > 0 {
-                // Convert executable path to string (if valid UTF-8)
-                let exe_str = core::str::from_utf8(&exe_path[..exe_len]).ok()?;
-
-                // Try <executable>.runfiles_manifest file first
-                let manifest_file_path = String::from(exe_str) + ".runfiles_manifest";
-
-                // Add null terminator for syscall
-                let mut manifest_path_with_null = Vec::from(manifest_file_path.as_bytes());
-                manifest_path_with_null.push(0);
-
-                // Try to load the manifest file
-                if let Some(manifest) = load_manifest(&manifest_path_with_null) {
-                    // Also determine the runfiles directory for RUNFILES_DIR envvar
-                    // The directory is <executable>.runfiles
-                    let dir_path = String::from(exe_str) + ".runfiles";
-
-                    return Some(Self {
-                        mode: RunfilesMode::ManifestBased(manifest),
-                        manifest_path: Some(manifest_file_path),
-                        dir_path: Some(dir_path),
-                    });
-                }
-
-                // Try <executable>.runfiles directory
-                let runfiles_dir = String::from(exe_str) + ".runfiles";
-
-                // Add null terminator for CreateFileA
-                let mut dir_with_null = Vec::from(runfiles_dir.as_bytes());
-                dir_with_null.push(0);
-
-                // Check if directory exists by trying to open it
-                unsafe {
-                    const FILE_FLAG_BACKUP_SEMANTICS: DWORD = 0x02000000;  // Needed to open directories
-                    let handle = CreateFileA(
-                        dir_with_null.as_ptr(),
-                        GENERIC_READ,
-                        0,
-                        core::ptr::null_mut(),
-                        OPEN_EXISTING,
-                        FILE_FLAG_BACKUP_SEMANTICS,
-                        core::ptr::null_mut(),
-                    );
-                    if handle != INVALID_HANDLE_VALUE {
-                        CloseHandle(handle);
-                        return Some(Self {
-                            mode: RunfilesMode::DirectoryBased(runfiles_dir.clone()),
-                            manifest_path: None,
-                            dir_path: Some(runfiles_dir),
-                        });
-                    }
-                }
-            }
-        }
-
-        None
-    }
-
-    fn rlocation(&self, path: &str) -> Option<String> {
-        // If path is absolute (Windows: starts with drive letter or \\), don't resolve
-        let path_bytes = path.as_bytes();
-        if path_bytes.len() >= 2 && ((path_bytes[0].is_ascii_alphabetic() && path_bytes[1] == b':') || (path_bytes[0] == b'\\' && path_bytes[1] == b'\\')) {
-            return None;
-        }
-
-        match &self.mode {
-            RunfilesMode::ManifestBased(manifest) => {
-                if let Some(resolved) = manifest.lookup(path) {
-                    // Convert forward slashes to backslashes
-                    return Some(resolved.replace('/', "\\"));
-                }
-                // Prefix match for paths within TreeArtifacts
-                if let Some((resolved_prefix, suffix)) = manifest.prefix_lookup(path) {
-                    let mut result = String::from(resolved_prefix);
-                    result.push_str(suffix);
-                    return Some(result.replace('/', "\\"));
-                }
-                None
-            }
-            RunfilesMode::DirectoryBased(dir) => {
-                let mut result = dir.clone();
-
-                // Add separator if needed
-                if !result.ends_with('\\') && !result.ends_with('/') {
-                    result.push('\\');
-                }
-
-                // Append path, converting forward slashes to backslashes
-                result.push_str(&path.replace('/', "\\"));
-
-                Some(result)
-            }
-        }
-    }
-}
-
-// Environment building for export mode
-// Windows environments can be large (32KB+), use 128KB to be safe
-const MAX_ENV_SIZE: usize = 131072;
-
-// External Windows API function for environment access
-extern "system" {
-    fn GetEnvironmentStringsW() -> *mut u16;
-    fn FreeEnvironmentStringsW(lpszEnvironmentBlock: *mut u16) -> BOOL;
-}
-
-static mut MODIFIED_ENV_DATA: [u16; MAX_ENV_SIZE / 2] = [0; MAX_ENV_SIZE / 2];
-
-fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> *mut core::ffi::c_void {
     unsafe {
-        // Windows requires environment variables to be sorted alphabetically
-        // GetEnvironmentStringsW() already returns sorted environment
-        // We need to maintain sorted order when adding our variables
-
-        let mut data_pos = 0usize;
-        let max_pos = MODIFIED_ENV_DATA.len();
-
-        // Helper to check bounds before writing
-        let check_bounds = |pos: usize, needed: usize| -> bool {
-            pos + needed <= max_pos
-        };
-
-        // Copy existing environment and insert runfiles vars in correct sorted position
         let env_block = GetEnvironmentStringsW();
         if env_block.is_null() {
-            // No parent environment, just add runfiles vars in sorted order
-            let mut add_env = |key: &[u8], value: &str| -> bool {
-                let value_bytes = value.as_bytes();
-                let total_len = key.len() + 1 + value_bytes.len() + 1; // key + '=' + value + '\0'
-                if !check_bounds(data_pos, total_len) {
-                    return false;
-                }
-
-                for &b in key {
-                    MODIFIED_ENV_DATA[data_pos] = b as u16;
-                    data_pos += 1;
-                }
-                MODIFIED_ENV_DATA[data_pos] = b'=' as u16;
-                data_pos += 1;
-                for &b in value_bytes {
-                    MODIFIED_ENV_DATA[data_pos] = b as u16;
-                    data_pos += 1;
-                }
-                MODIFIED_ENV_DATA[data_pos] = 0;
-                data_pos += 1;
-                true
-            };
-
+            // No parent environment: add runfiles vars in sorted order.
             if let Some(rf) = runfiles {
                 if let Some(ref path) = rf.dir_path {
-                    if !add_env(b"JAVA_RUNFILES", path) {
-                        print(b"ERROR: Failed to add JAVA_RUNFILES to environment\r\n");
-                        print(b"Environment buffer limit exceeded. Total size limit: ");
-                        print_number(MAX_ENV_SIZE);
-                        print(b" bytes\r\n");
-                        ExitProcess(1);
-                    }
-                    if !add_env(b"RUNFILES_DIR", path) {
-                        print(b"ERROR: Failed to add RUNFILES_DIR to environment\r\n");
-                        print(b"Environment buffer limit exceeded. Total size limit: ");
-                        print_number(MAX_ENV_SIZE);
-                        print(b" bytes\r\n");
-                        ExitProcess(1);
-                    }
+                    push_var(&mut buf, b"JAVA_RUNFILES", path);
+                    push_var(&mut buf, b"RUNFILES_DIR", path);
                 }
                 if let Some(ref path) = rf.manifest_path {
-                    if !add_env(b"RUNFILES_MANIFEST_FILE", path) {
-                        print(b"ERROR: Failed to add RUNFILES_MANIFEST_FILE to environment\r\n");
-                        print(b"Environment buffer limit exceeded. Total size limit: ");
-                        print_number(MAX_ENV_SIZE);
-                        print(b" bytes\r\n");
-                        ExitProcess(1);
-                    }
+                    push_var(&mut buf, b"RUNFILES_MANIFEST_FILE", path);
                 }
             }
         } else {
-            // Iterate through existing environment and insert runfiles vars at correct position
             let mut pos = 0;
-            let mut java_runfiles_inserted = false;
-            let mut runfiles_dir_inserted = false;
-            let mut runfiles_manifest_inserted = false;
-            let mut env_dropped = false;
+            let mut java_inserted = false;
+            let mut dir_inserted = false;
+            let mut manifest_inserted = false;
 
             loop {
                 let entry_start = pos;
                 while *env_block.add(pos) != 0 {
                     pos += 1;
-                    if pos > 65536 { break; } // safety: MAX_ENV_SIZE / 2
                 }
-
                 let entry_len = pos - entry_start;
-                if entry_len == 0 { break; }
-
+                if entry_len == 0 {
+                    break;
+                }
                 let entry_ptr = env_block.add(entry_start);
 
-                // Check if we should skip existing runfiles vars
-                let should_skip =
-                    (entry_len > 23 && {
-                        let mut matches = true;
-                        for i in 0..23 {
-                            if *entry_ptr.add(i) != b"RUNFILES_MANIFEST_FILE="[i] as u16 {
-                                matches = false;
-                                break;
-                            }
-                        }
-                        matches
-                    }) ||
-                    (entry_len > 13 && {
-                        let mut matches = true;
-                        for i in 0..13 {
-                            if *entry_ptr.add(i) != b"RUNFILES_DIR="[i] as u16 {
-                                matches = false;
-                                break;
-                            }
-                        }
-                        matches
-                    }) ||
-                    (entry_len > 14 && {
-                        let mut matches = true;
-                        for i in 0..14 {
-                            if *entry_ptr.add(i) != b"JAVA_RUNFILES="[i] as u16 {
-                                matches = false;
-                                break;
-                            }
-                        }
-                        matches
-                    });
+                // Skip existing runfiles vars (we re-insert our own).
+                let prefixed = |needle: &[u8]| -> bool {
+                    entry_len > needle.len()
+                        && (0..needle.len()).all(|i| *entry_ptr.add(i) == needle[i] as u16)
+                };
+                let should_skip = prefixed(b"RUNFILES_MANIFEST_FILE=")
+                    || prefixed(b"RUNFILES_DIR=")
+                    || prefixed(b"JAVA_RUNFILES=");
 
                 if !should_skip {
-                    // Helper to compare var name with a target name (case-insensitive, stops at '=')
+                    // Case-insensitive "does this entry sort after `target`?"
                     let var_comes_after = |target: &[u8]| -> bool {
+                        let upper = |c: u16| if (b'a' as u16..=b'z' as u16).contains(&c) { c - 32 } else { c };
                         for i in 0..target.len().min(entry_len) {
-                            let entry_char = *entry_ptr.add(i);
-                            let target_char = target[i] as u16;
-
-                            // Convert both to uppercase for case-insensitive comparison
-                            let entry_upper = if entry_char >= b'a' as u16 && entry_char <= b'z' as u16 {
-                                entry_char - 32
-                            } else {
-                                entry_char
-                            };
-                            let target_upper = if target_char >= b'a' as u16 && target_char <= b'z' as u16 {
-                                target_char - 32
-                            } else {
-                                target_char
-                            };
-
-                            if entry_upper != target_upper {
-                                return entry_upper > target_upper;
+                            let e = upper(*entry_ptr.add(i));
+                            let t = upper(target[i] as u16);
+                            if e != t {
+                                return e > t;
                             }
                         }
                         entry_len > target.len()
                     };
 
-                    // Insert JAVA_RUNFILES if needed
-                    if !java_runfiles_inserted && var_comes_after(b"JAVA_RUNFILES") {
+                    if !java_inserted && var_comes_after(b"JAVA_RUNFILES") {
                         if let Some(rf) = runfiles {
                             if let Some(ref path) = rf.dir_path {
-                                let path_bytes = path.as_bytes();
-                                let total_len = 14 + path_bytes.len() + 1; // "JAVA_RUNFILES=" + value + '\0'
-                                if !check_bounds(data_pos, total_len) {
-                                    env_dropped = true;
-                                } else {
-                                    for &b in b"JAVA_RUNFILES=" {
-                                        MODIFIED_ENV_DATA[data_pos] = b as u16;
-                                        data_pos += 1;
-                                    }
-                                    for &b in path_bytes {
-                                        MODIFIED_ENV_DATA[data_pos] = b as u16;
-                                        data_pos += 1;
-                                    }
-                                    MODIFIED_ENV_DATA[data_pos] = 0;
-                                    data_pos += 1;
-                                }
+                                push_var(&mut buf, b"JAVA_RUNFILES", path);
                             }
                         }
-                        java_runfiles_inserted = true;
+                        java_inserted = true;
                     }
-
-                    // Insert RUNFILES_DIR if needed
-                    if !runfiles_dir_inserted && var_comes_after(b"RUNFILES_DIR") {
+                    if !dir_inserted && var_comes_after(b"RUNFILES_DIR") {
                         if let Some(rf) = runfiles {
                             if let Some(ref path) = rf.dir_path {
-                                let path_bytes = path.as_bytes();
-                                let total_len = 13 + path_bytes.len() + 1; // "RUNFILES_DIR=" + value + '\0'
-                                if !check_bounds(data_pos, total_len) {
-                                    env_dropped = true;
-                                } else {
-                                    for &b in b"RUNFILES_DIR=" {
-                                        MODIFIED_ENV_DATA[data_pos] = b as u16;
-                                        data_pos += 1;
-                                    }
-                                    for &b in path_bytes {
-                                        MODIFIED_ENV_DATA[data_pos] = b as u16;
-                                        data_pos += 1;
-                                    }
-                                    MODIFIED_ENV_DATA[data_pos] = 0;
-                                    data_pos += 1;
-                                }
+                                push_var(&mut buf, b"RUNFILES_DIR", path);
                             }
                         }
-                        runfiles_dir_inserted = true;
+                        dir_inserted = true;
                     }
-
-                    // Insert RUNFILES_MANIFEST_FILE if needed
-                    if !runfiles_manifest_inserted && var_comes_after(b"RUNFILES_MANIFEST_FILE") {
+                    if !manifest_inserted && var_comes_after(b"RUNFILES_MANIFEST_FILE") {
                         if let Some(rf) = runfiles {
                             if let Some(ref path) = rf.manifest_path {
-                                let path_bytes = path.as_bytes();
-                                let total_len = 23 + path_bytes.len() + 1; // "RUNFILES_MANIFEST_FILE=" + value + '\0'
-                                if !check_bounds(data_pos, total_len) {
-                                    env_dropped = true;
-                                } else {
-                                    for &b in b"RUNFILES_MANIFEST_FILE=" {
-                                        MODIFIED_ENV_DATA[data_pos] = b as u16;
-                                        data_pos += 1;
-                                    }
-                                    for &b in path_bytes {
-                                        MODIFIED_ENV_DATA[data_pos] = b as u16;
-                                        data_pos += 1;
-                                    }
-                                    MODIFIED_ENV_DATA[data_pos] = 0;
-                                    data_pos += 1;
-                                }
+                                push_var(&mut buf, b"RUNFILES_MANIFEST_FILE", path);
                             }
                         }
-                        runfiles_manifest_inserted = true;
+                        manifest_inserted = true;
                     }
 
-                    // Copy this environment variable
-                    if data_pos + entry_len + 1 <= MODIFIED_ENV_DATA.len() {
-                        for i in 0..entry_len {
-                            MODIFIED_ENV_DATA[data_pos + i] = *entry_ptr.add(i);
-                        }
-                        MODIFIED_ENV_DATA[data_pos + entry_len] = 0;
-                        data_pos += entry_len + 1;
-                    } else {
-                        env_dropped = true;
+                    // Copy this environment variable.
+                    for i in 0..entry_len {
+                        buf.push(*entry_ptr.add(i));
                     }
+                    buf.push(0);
                 }
 
                 pos += 1;
             }
 
-            // Add any remaining runfiles vars that weren't inserted yet
-            if !java_runfiles_inserted {
-                if let Some(rf) = runfiles {
+            // Append any runfiles vars that sort after every existing entry.
+            if let Some(rf) = runfiles {
+                if !java_inserted {
                     if let Some(ref path) = rf.dir_path {
-                        let path_bytes = path.as_bytes();
-                        let total_len = 14 + path_bytes.len() + 1;
-                        if !check_bounds(data_pos, total_len) {
-                            env_dropped = true;
-                        } else {
-                            for &b in b"JAVA_RUNFILES=" {
-                                MODIFIED_ENV_DATA[data_pos] = b as u16;
-                                data_pos += 1;
-                            }
-                            for &b in path_bytes {
-                                MODIFIED_ENV_DATA[data_pos] = b as u16;
-                                data_pos += 1;
-                            }
-                            MODIFIED_ENV_DATA[data_pos] = 0;
-                            data_pos += 1;
-                        }
+                        push_var(&mut buf, b"JAVA_RUNFILES", path);
                     }
                 }
-            }
-            if !runfiles_dir_inserted {
-                if let Some(rf) = runfiles {
+                if !dir_inserted {
                     if let Some(ref path) = rf.dir_path {
-                        let path_bytes = path.as_bytes();
-                        let total_len = 13 + path_bytes.len() + 1;
-                        if !check_bounds(data_pos, total_len) {
-                            env_dropped = true;
-                        } else {
-                            for &b in b"RUNFILES_DIR=" {
-                                MODIFIED_ENV_DATA[data_pos] = b as u16;
-                                data_pos += 1;
-                            }
-                            for &b in path_bytes {
-                                MODIFIED_ENV_DATA[data_pos] = b as u16;
-                                data_pos += 1;
-                            }
-                            MODIFIED_ENV_DATA[data_pos] = 0;
-                            data_pos += 1;
-                        }
+                        push_var(&mut buf, b"RUNFILES_DIR", path);
                     }
                 }
-            }
-            if !runfiles_manifest_inserted {
-                if let Some(rf) = runfiles {
+                if !manifest_inserted {
                     if let Some(ref path) = rf.manifest_path {
-                        let path_bytes = path.as_bytes();
-                        let total_len = 23 + path_bytes.len() + 1;
-                        if !check_bounds(data_pos, total_len) {
-                            env_dropped = true;
-                        } else {
-                            for &b in b"RUNFILES_MANIFEST_FILE=" {
-                                MODIFIED_ENV_DATA[data_pos] = b as u16;
-                                data_pos += 1;
-                            }
-                            for &b in path_bytes {
-                                MODIFIED_ENV_DATA[data_pos] = b as u16;
-                                data_pos += 1;
-                            }
-                            MODIFIED_ENV_DATA[data_pos] = 0;
-                            data_pos += 1;
-                        }
+                        push_var(&mut buf, b"RUNFILES_MANIFEST_FILE", path);
                     }
                 }
-            }
-
-            // Check if any environment variables were dropped
-            if env_dropped {
-                FreeEnvironmentStringsW(env_block);
-                print(b"ERROR: Failed to copy all environment variables\r\n");
-                print(b"Environment buffer limit exceeded. Total size limit: ");
-                print_number(MAX_ENV_SIZE);
-                print(b" bytes\r\n");
-                print(b"Current usage: ");
-                print_number(data_pos * 2); // *2 because it's u16 array
-                print(b" bytes\r\n");
-                print(b"Consider reducing the number or size of environment variables.\r\n");
-                ExitProcess(1);
             }
 
             FreeEnvironmentStringsW(env_block);
         }
-
-        // Add double null terminator to mark end of environment block
-        if data_pos < MODIFIED_ENV_DATA.len() {
-            MODIFIED_ENV_DATA[data_pos] = 0;
-            data_pos += 1;
-        }
-        if data_pos < MODIFIED_ENV_DATA.len() {
-            MODIFIED_ENV_DATA[data_pos] = 0;
-        }
-
-        MODIFIED_ENV_DATA.as_mut_ptr() as *mut core::ffi::c_void
     }
+
+    // Final NUL: with the last entry's NUL this forms the double-NUL block terminator.
+    buf.push(0);
+    buf
 }
 
-// Placeholders for stub runner (will be replaced in final binary)
-const ARG_SIZE: usize = 256;
-
-#[used]
-#[link_section = ".runfiles"]
-static mut ARGC_PLACEHOLDER: [u8; 32] = *b"@@RUNFILES_ARGC@@\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
-
-#[used]
-#[link_section = ".runfiles"]
-static mut TRANSFORM_FLAGS: [u8; 32] = *b"@@RUNFILES_TRANSFORM_FLAGS@@\0\0\0\0";
-
-#[used]
-#[link_section = ".runfiles"]
-static mut EXPORT_RUNFILES_ENV: [u8; 32] = *b"@@RUNFILES_EXPORT_ENV@@\0\0\0\0\0\0\0\0\0";
-
-#[used]
-#[link_section = ".runfiles"]
-static mut ARG0_PLACEHOLDER: [u8; ARG_SIZE] = [b'@'; ARG_SIZE];
-
-#[used]
-#[link_section = ".runfiles"]
-static mut ARG1_PLACEHOLDER: [u8; ARG_SIZE] = [b'@'; ARG_SIZE];
-
-#[used]
-#[link_section = ".runfiles"]
-static mut ARG2_PLACEHOLDER: [u8; ARG_SIZE] = [b'@'; ARG_SIZE];
-
-#[used]
-#[link_section = ".runfiles"]
-static mut ARG3_PLACEHOLDER: [u8; ARG_SIZE] = [b'@'; ARG_SIZE];
-
-#[used]
-#[link_section = ".runfiles"]
-static mut ARG4_PLACEHOLDER: [u8; ARG_SIZE] = [b'@'; ARG_SIZE];
-
-#[used]
-#[link_section = ".runfiles"]
-static mut ARG5_PLACEHOLDER: [u8; ARG_SIZE] = [b'@'; ARG_SIZE];
-
-#[used]
-#[link_section = ".runfiles"]
-static mut ARG6_PLACEHOLDER: [u8; ARG_SIZE] = [b'@'; ARG_SIZE];
-
-#[used]
-#[link_section = ".runfiles"]
-static mut ARG7_PLACEHOLDER: [u8; ARG_SIZE] = [b'@'; ARG_SIZE];
-
-#[used]
-#[link_section = ".runfiles"]
-static mut ARG8_PLACEHOLDER: [u8; ARG_SIZE] = [b'@'; ARG_SIZE];
-
-#[used]
-#[link_section = ".runfiles"]
-static mut ARG9_PLACEHOLDER: [u8; ARG_SIZE] = [b'@'; ARG_SIZE];
-
-// Get the length of a null-terminated string
-fn strlen(s: &[u8]) -> usize {
-    let mut len = 0;
-    while len < s.len() && s[len] != 0 {
-        len += 1;
-    }
-    len
-}
-
-// Check if placeholder is still in template state
-fn is_template_placeholder(placeholder: &[u8]) -> bool {
-    if placeholder.len() < 17 {
-        return false;
-    }
-    str_starts_with(placeholder, b"@@RUNFILES_")
-}
-
-#[no_mangle]
-pub extern "C" fn main() -> ! {
+// Parse a Windows command line into runtime arguments (excluding argv[0]).
+// We avoid CommandLineToArgvW to skip the shell32.dll dependency.
+fn parse_command_line(
+    cmdline: *const u16,
+    argv_out: &mut [*const u16; 128],
+    argv_len_out: &mut [usize; 128],
+) -> usize {
     unsafe {
-        // Get command line
-        let cmdline = GetCommandLineW();
-
-        // Parse runtime arguments using custom parser (no shell32.dll needed)
-        let mut runtime_argv: [*const u16; 128] = [core::ptr::null(); 128];
-        let mut runtime_argv_len: [usize; 128] = [0; 128];
-        let runtime_args_count = parse_command_line(cmdline, &mut runtime_argv, &mut runtime_argv_len);
-
-        // Check if ARGC is still a placeholder
-        if is_template_placeholder(&ARGC_PLACEHOLDER) {
-            print(b"ERROR: This is a template stub runner.\r\n");
-            print(b"You must finalize it by replacing the placeholders before use.\r\n");
-            print(b"The ARGC_PLACEHOLDER has not been replaced.\r\n");
-            ExitProcess(1);
-        }
-
-        // Parse argc from placeholder
-        let argc_str = &ARGC_PLACEHOLDER;
-        let argc_len = strlen(argc_str);
-        if argc_len == 0 {
-            print(b"ERROR: ARGC is empty\r\n");
-            ExitProcess(1);
-        }
-
-        // Parse argc as decimal number
-        let mut argc: usize = 0;
-        for i in 0..argc_len {
-            let c = argc_str[i];
-            if c >= b'0' && c <= b'9' {
-                argc = argc * 10 + (c - b'0') as usize;
-            } else {
-                print(b"ERROR: ARGC contains non-digit characters\r\n");
-                ExitProcess(1);
-            }
-        }
-
-        if argc == 0 || argc > 10 {
-            print(b"ERROR: Invalid argc (must be 1-10)\r\n");
-            ExitProcess(1);
-        }
-
-        // Parse transform flags (bitmask of which args to transform)
-        let flags_str = &TRANSFORM_FLAGS;
-        let flags_len = strlen(flags_str);
-        let mut transform_flags: u32 = 0;
-
-        if !is_template_placeholder(flags_str) && flags_len > 0 {
-            // Parse as decimal number (bitmask)
-            for i in 0..flags_len {
-                let c = flags_str[i];
-                if c >= b'0' && c <= b'9' {
-                    transform_flags = transform_flags * 10 + (c - b'0') as u32;
-                } else {
-                    print(b"ERROR: TRANSFORM_FLAGS contains non-digit characters\r\n");
-                    ExitProcess(1);
-                }
-            }
-        }
-        // If flags not set, default to transforming all args
-        if flags_len == 0 || is_template_placeholder(flags_str) {
-            transform_flags = 0xFFFFFFFF; // Transform all by default
-        }
-
-        // Parse export_runfiles_env flag (defaults to true)
-        let export_str = &EXPORT_RUNFILES_ENV;
-        let export_len = strlen(export_str);
-        let export_runfiles_env = if !is_template_placeholder(export_str) && export_len > 0 {
-            // Parse as "1" (true) or "0" (false)
-            export_str[0] != b'0'
-        } else {
-            true // Default to true
-        };
-
-        // Check if any arguments need transformation
-        let argc_mask = if argc >= 32 {
-            0xFFFFFFFF
-        } else {
-            (1u32 << argc) - 1
-        };
-        let needs_transform = (transform_flags & argc_mask) != 0;
-        let needs_runfiles = needs_transform || export_runfiles_env;
-
-        // Parse argv[0] from command line manually
-        // Command line format: either "path\to\exe" args... or path\to\exe args...
-        // We extract the first token (argv[0]) for runfiles fallback
-        let mut exe_path_buf = Vec::new();
         let mut pos = 0usize;
+        let mut argc = 0usize;
 
         // Skip leading whitespace
-        while *cmdline.add(pos) != 0 && (*cmdline.add(pos) == b' ' as u16 || *cmdline.add(pos) == b'\t' as u16) {
+        while *cmdline.add(pos) != 0
+            && (*cmdline.add(pos) == b' ' as u16 || *cmdline.add(pos) == b'\t' as u16)
+        {
             pos += 1;
         }
 
-        // Check if first char is a quote
+        // Skip argv[0] (executable path)
         let quoted = *cmdline.add(pos) == b'"' as u16;
         if quoted {
-            pos += 1; // Skip opening quote
+            pos += 1;
+            while *cmdline.add(pos) != 0 && *cmdline.add(pos) != b'"' as u16 {
+                pos += 1;
+            }
+            if *cmdline.add(pos) == b'"' as u16 {
+                pos += 1;
+            }
+        } else {
+            while *cmdline.add(pos) != 0
+                && *cmdline.add(pos) != b' ' as u16
+                && *cmdline.add(pos) != b'\t' as u16
+            {
+                pos += 1;
+            }
         }
 
-        // Extract argv[0] (with 1MB safety limit)
-        while exe_path_buf.len() < 1048576 && *cmdline.add(pos) != 0 {
-            let wchar = *cmdline.add(pos);
-
-            // Check for end of argv[0]
-            if quoted {
-                if wchar == b'"' as u16 {
-                    break; // End of quoted string
-                }
-            } else {
-                if wchar == b' ' as u16 || wchar == b'\t' as u16 {
-                    break; // End of unquoted string
-                }
+        // Parse remaining arguments
+        while *cmdline.add(pos) != 0 && argc < 128 {
+            while *cmdline.add(pos) != 0
+                && (*cmdline.add(pos) == b' ' as u16 || *cmdline.add(pos) == b'\t' as u16)
+            {
+                pos += 1;
+            }
+            if *cmdline.add(pos) == 0 {
+                break;
             }
 
-            // Simple UTF-16 to ASCII conversion
+            let arg_start = pos;
+            let in_quotes = *cmdline.add(pos) == b'"' as u16;
+            if in_quotes {
+                pos += 1;
+                while *cmdline.add(pos) != 0 && *cmdline.add(pos) != b'"' as u16 {
+                    pos += 1;
+                }
+                argv_out[argc] = cmdline.add(arg_start + 1);
+                argv_len_out[argc] = pos - arg_start - 1;
+                if *cmdline.add(pos) == b'"' as u16 {
+                    pos += 1;
+                }
+            } else {
+                while *cmdline.add(pos) != 0
+                    && *cmdline.add(pos) != b' ' as u16
+                    && *cmdline.add(pos) != b'\t' as u16
+                {
+                    pos += 1;
+                }
+                argv_out[argc] = cmdline.add(arg_start);
+                argv_len_out[argc] = pos - arg_start;
+            }
+            argc += 1;
+        }
+        argc
+    }
+}
+
+// Extract argv[0] from the command line, narrowed to bytes (for runfiles fallback).
+fn parse_argv0(cmdline: *const u16) -> Vec<u8> {
+    let mut exe_path_buf = Vec::new();
+    unsafe {
+        let mut pos = 0usize;
+        while *cmdline.add(pos) != 0
+            && (*cmdline.add(pos) == b' ' as u16 || *cmdline.add(pos) == b'\t' as u16)
+        {
+            pos += 1;
+        }
+        let quoted = *cmdline.add(pos) == b'"' as u16;
+        if quoted {
+            pos += 1;
+        }
+        while exe_path_buf.len() < 1048576 && *cmdline.add(pos) != 0 {
+            let wchar = *cmdline.add(pos);
+            if quoted {
+                if wchar == b'"' as u16 {
+                    break;
+                }
+            } else if wchar == b' ' as u16 || wchar == b'\t' as u16 {
+                break;
+            }
             exe_path_buf.push((wchar & 0xFF) as u8);
             pos += 1;
         }
+    }
+    exe_path_buf
+}
 
-        let executable_path: Option<&[u8]> = if !exe_path_buf.is_empty() {
-            Some(&exe_path_buf)
-        } else {
+// --- runtime args & launch ---
+pub struct RuntimeArgs {
+    argv0_bytes: Vec<u8>,
+    runtime_argv: [*const u16; 128],
+    runtime_argv_len: [usize; 128],
+    runtime_count: usize,
+}
+
+impl RuntimeArgs {
+    /// argv[0] (the stub's own path) as bytes, for runfiles fallback discovery.
+    pub fn program_path(&self) -> Option<&[u8]> {
+        if self.argv0_bytes.is_empty() {
             None
-        };
-
-        // Initialize runfiles only if needed
-        let runfiles = if needs_runfiles {
-            if let Some(rf) = Runfiles::create(executable_path) {
-                Some(rf)
-            } else {
-                print(b"ERROR: Failed to initialize runfiles\r\n");
-                print(b"Set RUNFILES_DIR or RUNFILES_MANIFEST_FILE, or ensure <executable>.runfiles\\ directory exists\r\n");
-                ExitProcess(1);
-            }
         } else {
-            None
-        };
-
-        // Get arg placeholders
-        let arg_placeholders: [&[u8; ARG_SIZE]; 10] = [
-            &ARG0_PLACEHOLDER,
-            &ARG1_PLACEHOLDER,
-            &ARG2_PLACEHOLDER,
-            &ARG3_PLACEHOLDER,
-            &ARG4_PLACEHOLDER,
-            &ARG5_PLACEHOLDER,
-            &ARG6_PLACEHOLDER,
-            &ARG7_PLACEHOLDER,
-            &ARG8_PLACEHOLDER,
-            &ARG9_PLACEHOLDER,
-        ];
-
-        // Use Vec for dynamic path storage - no fixed size limits
-        let mut resolved_paths: Vec<Vec<u8>> = Vec::with_capacity(128);
-
-        // Resolve embedded arguments
-        for i in 0..argc {
-            let arg_data = arg_placeholders[i];
-            let arg_len = strlen(arg_data);
-
-            if arg_len == 0 {
-                print(b"ERROR: Argument ");
-                let digit = [b'0' + i as u8];
-                print(&digit);
-                print(b" is empty\r\n");
-                ExitProcess(1);
-            }
-
-            let arg_slice = &arg_data[..arg_len];
-
-            // Check if this argument should be transformed
-            let should_transform = (transform_flags & (1 << i)) != 0;
-
-            let resolved = if should_transform {
-                // Try to resolve through runfiles
-                if let Some(ref rf) = runfiles {
-                    // Convert argument to &str for rlocation (Bazel args are UTF-8)
-                    if let Ok(arg_str) = core::str::from_utf8(arg_slice) {
-                        if let Some(resolved_str) = rf.rlocation(arg_str) {
-                            // Convert back to bytes
-                            Vec::from(resolved_str.as_bytes())
-                        } else {
-                            // If not found in runfiles, use the path as-is
-                            arg_slice.to_vec()
-                        }
-                    } else {
-                        // Not valid UTF-8, use as-is
-                        arg_slice.to_vec()
-                    }
-                } else {
-                    // Use path as-is
-                    arg_slice.to_vec()
-                }
-            } else {
-                // Use path as-is without transformation
-                arg_slice.to_vec()
-            };
-
-            resolved_paths.push(resolved);
+            Some(&self.argv0_bytes)
         }
+    }
+}
 
-        // Build command line for CreateProcessW (UTF-16)
-        // Command line includes embedded args + runtime args
+pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
+    unsafe {
+        let argc = launch.resolved.len();
+
+        // Build the UTF-16 command line: embedded args (widened) + runtime args (native).
         let mut cmdline_wide: Vec<u16> = Vec::with_capacity(8192);
 
-        // Add embedded arguments (convert from UTF-8 to UTF-16)
-        for i in 0..argc {
-            let arg_slice = &resolved_paths[i];
+        for (i, arg) in launch.resolved.iter().enumerate() {
+            // Embedded args are NUL-terminated; widen without the trailing NUL.
+            let bytes = if arg.last() == Some(&0) { &arg[..arg.len() - 1] } else { &arg[..] };
 
-            // Always quote the first argument (executable path) following Bazel's approach
-            // For other arguments, only quote if they contain spaces
-            let needs_quotes = i == 0 || find_byte(arg_slice, b' ').is_some();
-
+            // Quote arg0 always (Bazel launcher.cc convention); others only if they contain spaces.
+            let needs_quotes = i == 0 || bytes.contains(&b' ');
             if needs_quotes {
                 cmdline_wide.push(b'"' as u16);
             }
-
-            // Convert UTF-8 to UTF-16 and copy
-            for &b in arg_slice {
+            for &b in bytes {
                 cmdline_wide.push(b as u16);
             }
-
             if needs_quotes {
                 cmdline_wide.push(b'"' as u16);
             }
-
-            // Add space between arguments
-            if i < argc - 1 || runtime_args_count > 0 {
+            if i < argc - 1 || rt.runtime_count > 0 {
                 cmdline_wide.push(b' ' as u16);
             }
         }
 
-        // Add runtime arguments (already UTF-16, just copy)
-        for i in 0..runtime_args_count {
-            let runtime_arg = runtime_argv[i];
-            let arg_len = runtime_argv_len[i];
-
-            // Check if we need quotes (scan for spaces)
+        for i in 0..rt.runtime_count {
+            let arg = rt.runtime_argv[i];
+            let arg_len = rt.runtime_argv_len[i];
             let mut needs_quotes = false;
             for j in 0..arg_len {
-                if *runtime_arg.add(j) == b' ' as u16 {
+                if *arg.add(j) == b' ' as u16 {
                     needs_quotes = true;
                     break;
                 }
             }
-
             if needs_quotes {
                 cmdline_wide.push(b'"' as u16);
             }
-
-            // Copy wide string
             for j in 0..arg_len {
-                cmdline_wide.push(*runtime_arg.add(j));
+                cmdline_wide.push(*arg.add(j));
             }
-
             if needs_quotes {
                 cmdline_wide.push(b'"' as u16);
             }
-
-            // Add space between arguments (except after last)
-            if i < runtime_args_count - 1 {
+            if i < rt.runtime_count - 1 {
                 cmdline_wide.push(b' ' as u16);
             }
         }
 
-        // Null-terminate command line
         cmdline_wide.push(0);
 
-        // Build environment with runfiles variables if export is enabled
-        let envp = if export_runfiles_env {
-            build_runfiles_environ(runfiles.as_ref())
+        // Build the environment with runfiles vars if export is enabled.
+        // `env_storage` keeps the block alive while CreateProcessW reads it.
+        let env_storage: Vec<u16>;
+        let envp = if launch.export_env {
+            env_storage = build_runfiles_environ(launch.runfiles);
+            env_storage.as_ptr() as *mut core::ffi::c_void
         } else {
             core::ptr::null_mut()
         };
+        let creation_flags = if launch.export_env { CREATE_UNICODE_ENVIRONMENT } else { 0 };
 
-        // Create the process
         let mut si: STARTUPINFOW = core::mem::zeroed();
         si.cb = core::mem::size_of::<STARTUPINFOW>() as DWORD;
         let mut pi: PROCESS_INFORMATION = core::mem::zeroed();
 
-        // Determine creation flags
-        // If we have a UTF-16 environment block, we need CREATE_UNICODE_ENVIRONMENT
-        let creation_flags = if export_runfiles_env {
-            CREATE_UNICODE_ENVIRONMENT
-        } else {
-            0
-        };
-
-        // Use NULL for lpApplicationName and quote the executable in the command line
-        // This follows Bazel's launcher.cc approach
+        // NULL lpApplicationName + quoted executable in the command line (Bazel approach).
         let success = CreateProcessW(
-            core::ptr::null(),          // Application name (NULL - parsed from command line)
-            cmdline_wide.as_mut_ptr(),  // Command line (UTF-16) - quoted executable + args
-            core::ptr::null_mut(),      // Process attributes
-            core::ptr::null_mut(),      // Thread attributes
-            1,                          // Inherit handles
-            creation_flags,             // Creation flags (with CREATE_UNICODE_ENVIRONMENT if needed)
-            envp,                       // Environment
-            core::ptr::null(),          // Current directory
+            core::ptr::null(),
+            cmdline_wide.as_mut_ptr(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            1,
+            creation_flags,
+            envp,
+            core::ptr::null(),
             &mut si,
             &mut pi,
         );
-
         if success == 0 {
             print(b"ERROR: CreateProcess failed\r\n");
             ExitProcess(1);
         }
 
-        // Wait for the child process to complete
         WaitForSingleObject(pi.hProcess, INFINITE);
-
-        // Get the child process's exit code
         let mut exit_code: DWORD = 0;
         GetExitCodeProcess(pi.hProcess, &mut exit_code);
-
-        // Close handles
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
-
-        // Exit with the child process's exit code
         ExitProcess(exit_code);
     }
+}
+
+#[no_mangle]
+pub extern "C" fn main() -> ! {
+    let cmdline = unsafe { GetCommandLineW() };
+    let mut runtime_argv: [*const u16; 128] = [core::ptr::null(); 128];
+    let mut runtime_argv_len: [usize; 128] = [0; 128];
+    let runtime_count = parse_command_line(cmdline, &mut runtime_argv, &mut runtime_argv_len);
+    let argv0_bytes = parse_argv0(cmdline);
+    crate::run::main(RuntimeArgs {
+        argv0_bytes,
+        runtime_argv,
+        runtime_argv_len,
+        runtime_count,
+    })
 }
