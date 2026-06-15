@@ -19,12 +19,14 @@ common:release --@rules_rust//rust/settings:extra_rustc_flag=-Ccodegen-units=1
 common:release --@rules_rust//rust/settings:extra_rustc_flag=-Copt-level=z
 common:release --@rules_rust//rust/settings:extra_rustc_flag=-Cstrip=symbols
 
+common:cache --remote_cache=grpcs://hermetic-launcher.buildbuddy.io
+common:cache --remote_cache_compression
+common:cache --remote_download_toplevel
+common:cache --experimental_remote_downloader=grpcs://hermetic-launcher.buildbuddy.io
+common:cache --bes_results_url=https://app.buildbuddy.io/invocation/
+common:cache --bes_backend=grpcs://hermetic-launcher.buildbuddy.io
+
+common:remote --config=cache
 common:remote --extra_execution_platforms=//:rbe_platform
 common:remote --remote_executor=grpcs://hermetic-launcher.buildbuddy.io
-common:remote --remote_cache=grpcs://hermetic-launcher.buildbuddy.io
 common:remote --noexperimental_throttle_remote_action_building
-common:remote --remote_cache_compression
-common:remote --remote_download_toplevel
-common:remote --experimental_remote_downloader=grpcs://hermetic-launcher.buildbuddy.io
-common:remote --bes_results_url=https://app.buildbuddy.io/invocation/
-common:remote --bes_backend=grpcs://hermetic-launcher.buildbuddy.io
