@@ -18,7 +18,19 @@ jobs:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         run: |
           if [ -n "${BUILDBUDDY_API_KEY}" ]; then
-            echo "common:remote --remote_header=x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}" >> ~/.bazelrc
+            cat >> ~/.bazelrc << EOF
+          common:cache --remote_cache=grpcs://hermetic-launcher.buildbuddy.io
+          common:cache --remote_cache_compression
+          common:cache --remote_download_toplevel
+          common:cache --experimental_remote_downloader=grpcs://hermetic-launcher.buildbuddy.io
+          common:cache --bes_results_url=https://app.buildbuddy.io/invocation/
+          common:cache --bes_backend=grpcs://hermetic-launcher.buildbuddy.io
+          common:cache --remote_header=x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}
+          common:remote --config=cache
+          common:remote --extra_execution_platforms=//:rbe_platform
+          common:remote --remote_executor=grpcs://hermetic-launcher.buildbuddy.io
+          common:remote --noexperimental_throttle_remote_action_building
+          EOF
             echo "common --config=remote" >> ~/.bazelrc
           fi
       - run: bash tools/build-release-binaries.sh artifacts
@@ -27,7 +39,7 @@ jobs:
           name: binaries
           path: artifacts/
           retention-days: 7
-  
+
   test-query:
     name: Query test
     runs-on: ubuntu-latest
@@ -46,11 +58,22 @@ jobs:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         run: |
           if [ -n "${BUILDBUDDY_API_KEY}" ]; then
-            echo "common:remote --remote_header=x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}" >> ~/.bazelrc
-            echo "common --config=remote" >> ~/.bazelrc
+            cat >> ~/.bazelrc << EOF
+          common:cache --remote_cache=grpcs://hermetic-launcher.buildbuddy.io
+          common:cache --remote_cache_compression
+          common:cache --remote_download_toplevel
+          common:cache --experimental_remote_downloader=grpcs://hermetic-launcher.buildbuddy.io
+          common:cache --bes_results_url=https://app.buildbuddy.io/invocation/
+          common:cache --bes_backend=grpcs://hermetic-launcher.buildbuddy.io
+          common:cache --remote_header=x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}
+          common:remote --config=cache
+          common:remote --extra_execution_platforms=//:rbe_platform
+          common:remote --remote_executor=grpcs://hermetic-launcher.buildbuddy.io
+          common:remote --noexperimental_throttle_remote_action_building
+          EOF
           fi
-      - run: bazel test //integration-tests:integration_test
-      - run: bazel test //...
+      - run: bazel test --config=remote //integration-tests:integration_test
+      - run: bazel test --config=cache //...
         working-directory: e2e/bzlmod
 
   test-macos:
@@ -58,8 +81,23 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - run: bazel test //integration-tests:integration_test
-      - run: bazel test //...
+      - name: Configure BuildBuddy remote cache
+        env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+        run: |
+          if [ -n "${BUILDBUDDY_API_KEY}" ]; then
+            cat >> ~/.bazelrc << EOF
+          common:cache --remote_cache=grpcs://hermetic-launcher.buildbuddy.io
+          common:cache --remote_cache_compression
+          common:cache --remote_download_toplevel
+          common:cache --experimental_remote_downloader=grpcs://hermetic-launcher.buildbuddy.io
+          common:cache --bes_results_url=https://app.buildbuddy.io/invocation/
+          common:cache --bes_backend=grpcs://hermetic-launcher.buildbuddy.io
+          common:cache --remote_header=x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}
+          EOF
+          fi
+      - run: bazel test --config=cache //integration-tests:integration_test
+      - run: bazel test --config=cache //...
         working-directory: e2e/bzlmod
 
   test-windows:
@@ -67,6 +105,22 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - run: bazel --output_user_root=C:/b test //integration-tests:integration_test
-      - run: bazel test //...
+      - name: Configure BuildBuddy remote cache
+        env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+        run: |
+          if ($env:BUILDBUDDY_API_KEY) {
+            $lines = @(
+              "common:cache --remote_cache=grpcs://hermetic-launcher.buildbuddy.io",
+              "common:cache --remote_cache_compression",
+              "common:cache --remote_download_toplevel",
+              "common:cache --experimental_remote_downloader=grpcs://hermetic-launcher.buildbuddy.io",
+              "common:cache --bes_results_url=https://app.buildbuddy.io/invocation/",
+              "common:cache --bes_backend=grpcs://hermetic-launcher.buildbuddy.io",
+              "common:cache --remote_header=x-buildbuddy-api-key=$env:BUILDBUDDY_API_KEY"
+            )
+            Add-Content "$env:USERPROFILE\.bazelrc" $lines
+          }
+      - run: bazel --output_user_root=C:/b test --config=cache //integration-tests:integration_test
+      - run: bazel test --config=cache //...
         working-directory: e2e/bzlmod
