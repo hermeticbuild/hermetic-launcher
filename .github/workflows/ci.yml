@@ -21,7 +21,6 @@ jobs:
             cat >> ~/.bazelrc << EOF
           common:cache --remote_cache=grpcs://hermetic-launcher.buildbuddy.io
           common:cache --remote_cache_compression
-          common:cache --remote_download_toplevel
           common:cache --experimental_remote_downloader=grpcs://hermetic-launcher.buildbuddy.io
           common:cache --bes_results_url=https://app.buildbuddy.io/invocation/
           common:cache --bes_backend=grpcs://hermetic-launcher.buildbuddy.io
@@ -61,7 +60,6 @@ jobs:
             cat >> ~/.bazelrc << EOF
           common:cache --remote_cache=grpcs://hermetic-launcher.buildbuddy.io
           common:cache --remote_cache_compression
-          common:cache --remote_download_toplevel
           common:cache --experimental_remote_downloader=grpcs://hermetic-launcher.buildbuddy.io
           common:cache --bes_results_url=https://app.buildbuddy.io/invocation/
           common:cache --bes_backend=grpcs://hermetic-launcher.buildbuddy.io
@@ -89,7 +87,6 @@ jobs:
             cat >> ~/.bazelrc << EOF
           common:cache --remote_cache=grpcs://hermetic-launcher.buildbuddy.io
           common:cache --remote_cache_compression
-          common:cache --remote_download_toplevel
           common:cache --experimental_remote_downloader=grpcs://hermetic-launcher.buildbuddy.io
           common:cache --bes_results_url=https://app.buildbuddy.io/invocation/
           common:cache --bes_backend=grpcs://hermetic-launcher.buildbuddy.io
@@ -113,7 +110,6 @@ jobs:
             $lines = @(
               "common:cache --remote_cache=grpcs://hermetic-launcher.buildbuddy.io",
               "common:cache --remote_cache_compression",
-              "common:cache --remote_download_toplevel",
               "common:cache --experimental_remote_downloader=grpcs://hermetic-launcher.buildbuddy.io",
               "common:cache --bes_results_url=https://app.buildbuddy.io/invocation/",
               "common:cache --bes_backend=grpcs://hermetic-launcher.buildbuddy.io",

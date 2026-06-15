@@ -6,6 +6,7 @@ common --jobs=50
 common --@llvm//config:experimental_stub_libgcc_s
 common --@rules_cc//cc/toolchains/args/archiver_flags:use_libtool_on_macos=false
 common --nobuild_runfile_links
+common --remote_download_minimal
 
 common:linux --host_platform=//platforms:local_gnu
 common:windows --host_platform=//platforms:local_windows_msvc
@@ -18,10 +19,10 @@ common:release --@rules_rust//rust/settings:lto=fat
 common:release --@rules_rust//rust/settings:extra_rustc_flag=-Ccodegen-units=1
 common:release --@rules_rust//rust/settings:extra_rustc_flag=-Copt-level=z
 common:release --@rules_rust//rust/settings:extra_rustc_flag=-Cstrip=symbols
+common:release --remote_download_toplevel
 
 common:cache --remote_cache=grpcs://hermetic-launcher.buildbuddy.io
 common:cache --remote_cache_compression
-common:cache --remote_download_toplevel
 common:cache --experimental_remote_downloader=grpcs://hermetic-launcher.buildbuddy.io
 common:cache --bes_results_url=https://app.buildbuddy.io/invocation/
 common:cache --bes_backend=grpcs://hermetic-launcher.buildbuddy.io
