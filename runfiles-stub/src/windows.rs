@@ -507,6 +507,44 @@ impl RuntimeArgs {
     }
 }
 
+// Append one argument to a Windows command line using MSVCRT/CommandLineToArgvW
+// quoting rules, so the child re-parses each argument exactly as intended:
+//   * wrap the argument in double quotes when it needs them (or `force_quotes`,
+//     used for argv[0] per the Bazel launcher.cc convention);
+//   * double every run of backslashes that immediately precedes a double quote
+//     (including the closing quote we add), and escape embedded double quotes.
+// Without this, embedded `"` characters and trailing `\` (common in Windows paths
+// like `C:\dir\`) corrupt or merge arguments.
+fn append_arg(cmdline: &mut Vec<u16>, arg: &[u16], force_quotes: bool) {
+    let quote = force_quotes || arg.iter().any(|&c| c == b' ' as u16);
+    if quote {
+        cmdline.push(b'"' as u16);
+    }
+    let mut backslashes: usize = 0;
+    for &c in arg {
+        if c == b'\\' as u16 {
+            backslashes += 1;
+        } else {
+            if c == b'"' as u16 {
+                // Emit 2*backslashes+1 backslashes (the run was already pushed below
+                // on prior iterations; push backslashes+1 more) to escape the quote.
+                for _ in 0..=backslashes {
+                    cmdline.push(b'\\' as u16);
+                }
+            }
+            backslashes = 0;
+        }
+        cmdline.push(c);
+    }
+    if quote {
+        // Double any trailing backslashes so they don't escape the closing quote.
+        for _ in 0..backslashes {
+            cmdline.push(b'\\' as u16);
+        }
+        cmdline.push(b'"' as u16);
+    }
+}
+
 pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
     unsafe {
         let argc = launch.resolved.len();
@@ -517,42 +555,18 @@ pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
         for (i, arg) in launch.resolved.iter().enumerate() {
             // Embedded args are NUL-terminated; widen without the trailing NUL.
             let bytes = if arg.last() == Some(&0) { &arg[..arg.len() - 1] } else { &arg[..] };
+            let wide: Vec<u16> = bytes.iter().map(|&b| b as u16).collect();
 
-            // Quote arg0 always (Bazel launcher.cc convention); others only if they contain spaces.
-            let needs_quotes = i == 0 || bytes.contains(&b' ');
-            if needs_quotes {
-                cmdline_wide.push(b'"' as u16);
-            }
-            for &b in bytes {
-                cmdline_wide.push(b as u16);
-            }
-            if needs_quotes {
-                cmdline_wide.push(b'"' as u16);
-            }
+            // Quote arg0 always (Bazel launcher.cc convention); others as needed.
+            append_arg(&mut cmdline_wide, &wide, i == 0);
             if i < argc - 1 || rt.runtime_count > 0 {
                 cmdline_wide.push(b' ' as u16);
             }
         }
 
         for i in 0..rt.runtime_count {
-            let arg = rt.runtime_argv[i];
-            let arg_len = rt.runtime_argv_len[i];
-            let mut needs_quotes = false;
-            for j in 0..arg_len {
-                if *arg.add(j) == b' ' as u16 {
-                    needs_quotes = true;
-                    break;
-                }
-            }
-            if needs_quotes {
-                cmdline_wide.push(b'"' as u16);
-            }
-            for j in 0..arg_len {
-                cmdline_wide.push(*arg.add(j));
-            }
-            if needs_quotes {
-                cmdline_wide.push(b'"' as u16);
-            }
+            let arg = core::slice::from_raw_parts(rt.runtime_argv[i], rt.runtime_argv_len[i]);
+            append_arg(&mut cmdline_wide, arg, false);
             if i < rt.runtime_count - 1 {
                 cmdline_wide.push(b' ' as u16);
             }
