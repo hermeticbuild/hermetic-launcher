@@ -39,6 +39,81 @@ jobs:
           path: artifacts/
           retention-days: 7
 
+  size-report:
+    name: Binary size report
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+      - name: Configure BuildBuddy RBE
+        env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+        run: |
+          if [ -n "${BUILDBUDDY_API_KEY}" ]; then
+            cat >> ~/.bazelrc << EOF
+          common:cache --remote_cache=grpcs://hermetic-launcher.buildbuddy.io
+          common:cache --remote_cache_compression
+          common:cache --experimental_remote_downloader=grpcs://hermetic-launcher.buildbuddy.io
+          common:cache --bes_results_url=https://app.buildbuddy.io/invocation/
+          common:cache --bes_backend=grpcs://hermetic-launcher.buildbuddy.io
+          common:cache --remote_header=x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}
+          common:remote --config=cache
+          common:remote --extra_execution_platforms=//:rbe_platform
+          common:remote --remote_executor=grpcs://hermetic-launcher.buildbuddy.io
+          common:remote --noexperimental_throttle_remote_action_building
+          EOF
+            echo "common --config=remote" >> ~/.bazelrc
+          fi
+      - name: Build base binaries
+        run: bash tools/build-release-binaries.sh /tmp/artifacts-base
+      - name: Record base sizes
+        run: |
+          shopt -s nullglob
+          for f in /tmp/artifacts-base/runfiles-stub-* /tmp/artifacts-base/finalize-stub-*; do
+            [ -f "$f" ] || continue
+            printf '%s %d\n' "$(basename "$f")" "$(stat -c%s "$f")"
+          done > /tmp/sizes-base.txt
+          rm -rf /tmp/artifacts-base
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Build PR binaries
+        run: bash tools/build-release-binaries.sh /tmp/artifacts-pr
+      - name: Record PR sizes
+        run: |
+          shopt -s nullglob
+          for f in /tmp/artifacts-pr/runfiles-stub-* /tmp/artifacts-pr/finalize-stub-*; do
+            [ -f "$f" ] || continue
+            printf '%s %d\n' "$(basename "$f")" "$(stat -c%s "$f")"
+          done > /tmp/sizes-pr.txt
+          rm -rf /tmp/artifacts-pr
+      - name: Generate size report
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 tools/binary-size-report.py \
+            /tmp/sizes-base.txt /tmp/sizes-pr.txt \
+            "$BASE_SHA" "$PR_SHA" | tee /tmp/size-report.md
+          cat /tmp/size-report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Post PR comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          EXISTING_ID=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+            --jq 'map(select(.body | startswith("<!-- binary-size-report -->"))) | first | .id // empty')
+          if [ -n "$EXISTING_ID" ]; then
+            gh api "repos/$GITHUB_REPOSITORY/issues/comments/$EXISTING_ID" \
+              -X PATCH -f body="$(cat /tmp/size-report.md)"
+          else
+            gh pr comment "$PR_NUMBER" --body "$(cat /tmp/size-report.md)"
+          fi
+
   test-query:
     name: Query test
     runs-on: ubuntu-latest
