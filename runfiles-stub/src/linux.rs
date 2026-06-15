@@ -344,13 +344,14 @@ pub fn print(s: &[u8]) {
     write(STDOUT, s);
 }
 
-// Environment variable lookup by reading /proc/self/environ.
-pub fn get_env_var(name: &[u8]) -> Option<String> {
+// Read the whole of /proc/self/environ into a byte buffer (empty on failure).
+// The buffer is a sequence of NUL-terminated "NAME=VALUE" entries.
+fn slurp_environ() -> Vec<u8> {
+    let mut environ_data = Vec::new();
     let fd = open(b"/proc/self/environ\0");
     if fd < 0 {
-        return None;
+        return environ_data;
     }
-    let mut environ_data = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
         let bytes_read = read(fd, &mut chunk);
@@ -360,7 +361,12 @@ pub fn get_env_var(name: &[u8]) -> Option<String> {
         environ_data.extend_from_slice(&chunk[..bytes_read as usize]);
     }
     close(fd);
+    environ_data
+}
 
+// Environment variable lookup by reading /proc/self/environ.
+pub fn get_env_var(name: &[u8]) -> Option<String> {
+    let environ_data = slurp_environ();
     for entry in environ_data.split(|&b| b == 0) {
         if entry.is_empty() {
             continue;
@@ -398,21 +404,7 @@ pub fn load_manifest(path: &[u8]) -> Option<Manifest> {
 
 // Read /proc/self/environ into (data, pointers); pointers point into data.
 fn read_environ() -> (Vec<u8>, Vec<*const u8>) {
-    let fd = open(b"/proc/self/environ\0");
-    if fd < 0 {
-        return (Vec::new(), vec![core::ptr::null()]);
-    }
-    let mut environ_data = Vec::new();
-    let mut chunk = [0u8; 8192];
-    loop {
-        let bytes_read = read(fd, &mut chunk);
-        if bytes_read <= 0 {
-            break;
-        }
-        environ_data.extend_from_slice(&chunk[..bytes_read as usize]);
-    }
-    close(fd);
-
+    let environ_data = slurp_environ();
     if environ_data.is_empty() {
         return (Vec::new(), vec![core::ptr::null()]);
     }
