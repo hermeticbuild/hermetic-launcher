@@ -740,10 +740,98 @@ fn test_relative_argv0_discovery(config: &TestConfig) -> Result<(), String> {
     let add_rlocation = format!("{}/bin/add-numbers{}", WORKSPACE_NAME, EXE_EXT);
     finalize_stub(config, &stub_path, &[&add_rlocation, "5", "10"], &[0])?;
 
-    // Invoke the stub via a RELATIVE argv[0] ("subdir/relstub") with cwd =
-    // test_dir, and no runfiles env vars. This forces the launcher to (a)
-    // discover <argv[0]>.runfiles and (b) produce an absolute program path for
-    // execve — not one relative to the (here different) cwd.
+    // Reproduce `bazel run`'s geometry exactly. bazel run execs the *real* binary
+    // but (a) passes a RELATIVE argv[0] (e.g. "bazel-bin/hello"), (b) sets cwd
+    // *inside* the runfiles tree (`<x>.runfiles/_main`), and (c) leaves
+    // RUNFILES_DIR unset. So `<argv[0]>.runfiles` resolved against cwd points
+    // somewhere that does not exist, and the launcher must instead resolve
+    // argv[0] to the real executable (/proc/self/exe, _NSGetExecutablePath).
+    //
+    // We exec the real stub path but override argv[0] to a relative string, and
+    // run from a cwd inside the runfiles where that relative argv[0] does not
+    // resolve to the stub or its .runfiles.
+    let inner_cwd = runfiles_dir.join(WORKSPACE_NAME);
+    let relative_argv0 = PathBuf::from("bin").join(&stub_name);
+    let mut cmd = Command::new(&stub_path);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.arg0(&relative_argv0);
+    }
+    cmd.current_dir(&inner_cwd);
+    cmd.env_remove("RUNFILES_DIR");
+    cmd.env_remove("RUNFILES_MANIFEST_FILE");
+
+    let output = cmd.output().map_err(|e| format!("Failed to run stub: {}", e))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let exit_code = output.status.code().unwrap_or(-1);
+
+    if exit_code != 0 {
+        return Err(format!(
+            "Stub failed with exit code {} (relative argv[0], no RUNFILES_DIR): {}",
+            exit_code, stderr
+        ));
+    }
+    if !stdout.contains("SUM:15") {
+        return Err(format!("Unexpected output: {}. Expected 'SUM:15'", stdout));
+    }
+
+    println!("    PASS");
+    Ok(())
+}
+
+/// Test: the embedded program is reached through a RELATIVE symlink inside
+/// runfiles (the aspect_rules_py venv shape: `<venv>/bin/python` is a relative
+/// symlink to the hermetic interpreter), invoked via a relative argv[0] with no
+/// RUNFILES_DIR. This mirrors aspect-build/rules_py#1113 more closely than
+/// `relative_argv0_discovery`, whose embedded program is a regular file.
+fn test_symlinked_program_relative_argv0(config: &TestConfig) -> Result<(), String> {
+    println!("  Running test: symlinked_program_relative_argv0");
+
+    let test_dir = config.work_dir.join("test_symlink_prog");
+    let sub_dir = test_dir.join("subdir");
+    fs::create_dir_all(&sub_dir).map_err(|e| format!("Failed to create test dir: {}", e))?;
+
+    let stub_name = format!("symstub{}", EXE_EXT);
+    let stub_path = sub_dir.join(&stub_name);
+    let runfiles_dir = sub_dir.join(format!("{}.runfiles", stub_name));
+
+    // Real binary lives at <runfiles>/<ws>/realbin/add-numbers; the stub's
+    // embedded program points at <runfiles>/<ws>/bin/python, a RELATIVE symlink
+    // to it (../realbin/add-numbers) — the venv shape.
+    let real_dir = runfiles_dir.join(WORKSPACE_NAME).join("realbin");
+    let venv_bin = runfiles_dir.join(WORKSPACE_NAME).join("bin");
+    fs::create_dir_all(&real_dir).map_err(|e| format!("mkdir realbin: {}", e))?;
+    fs::create_dir_all(&venv_bin).map_err(|e| format!("mkdir bin: {}", e))?;
+
+    let real_binary = real_dir.join(format!("add-numbers{}", EXE_EXT));
+    fs::copy(
+        config.test_binaries_dir.join(format!("add-numbers{}", EXE_EXT)),
+        &real_binary,
+    )
+    .map_err(|e| format!("copy binary: {}", e))?;
+
+    let symlink = venv_bin.join(format!("python{}", EXE_EXT));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&real_binary)
+            .map_err(|e| format!("perms: {}", e))?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&real_binary, perms).map_err(|e| format!("set perms: {}", e))?;
+        // Relative symlink, like a relocatable venv: bin/python -> ../realbin/add-numbers
+        std::os::unix::fs::symlink(
+            format!("../realbin/add-numbers{}", EXE_EXT),
+            &symlink,
+        )
+        .map_err(|e| format!("symlink: {}", e))?;
+    }
+
+    let prog_rlocation = format!("{}/bin/python{}", WORKSPACE_NAME, EXE_EXT);
+    finalize_stub(config, &stub_path, &[&prog_rlocation, "5", "10"], &[0])?;
+
     let relative_argv0 = PathBuf::from("subdir").join(&stub_name);
     let mut cmd = Command::new(&relative_argv0);
     cmd.current_dir(&test_dir);
@@ -757,7 +845,7 @@ fn test_relative_argv0_discovery(config: &TestConfig) -> Result<(), String> {
 
     if exit_code != 0 {
         return Err(format!(
-            "Stub failed with exit code {} (relative argv[0], no RUNFILES_DIR): {}",
+            "Stub failed with exit code {} (symlinked program, relative argv[0], no RUNFILES_DIR): {}",
             exit_code, stderr
         ));
     }
@@ -1050,6 +1138,7 @@ fn main() -> ExitCode {
         ("mixed_arguments", test_mixed_arguments),
         ("fallback_runfiles_dir", test_fallback_runfiles_dir),
         ("relative_argv0_discovery", test_relative_argv0_discovery),
+        ("symlinked_program_relative_argv0", test_symlinked_program_relative_argv0),
         ("fallback_runfiles_manifest", test_fallback_runfiles_manifest),
         ("print_env", test_print_env),
         ("large_manifest", test_large_manifest),

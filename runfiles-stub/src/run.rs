@@ -95,8 +95,19 @@ pub fn main(rt: platform::RuntimeArgs) -> ! {
     let needs_transform = (transform_flags & argc_mask) != 0;
     let needs_runfiles = needs_transform || export_runfiles_env;
 
-    // argv[0] (the stub's own path) is the fallback for runfiles discovery.
-    let executable_path = rt.program_path();
+    // Resolve the path used to locate `<exe>.runfiles`. argv[0] is the usual
+    // source, but `bazel run` (and any caller that execs us with a relative
+    // argv[0] from an unrelated cwd) makes a relative argv[0] useless for
+    // discovery — `<argv[0]>.runfiles` joined to cwd points nowhere. In that
+    // case fall back to the real executable path (/proc/self/exe,
+    // _NSGetExecutablePath). RUNFILES_DIR / RUNFILES_MANIFEST_FILE, when set,
+    // still take precedence inside Runfiles::create.
+    let argv0 = rt.program_path();
+    let resolved_exe: Option<Vec<u8>> = match argv0 {
+        Some(p) if !p.is_empty() && p[0] == b'/' => None, // absolute argv[0] is fine
+        _ => platform::executable_path(),
+    };
+    let executable_path = resolved_exe.as_deref().or(argv0);
 
     let runfiles = if needs_runfiles {
         match Runfiles::create(executable_path) {

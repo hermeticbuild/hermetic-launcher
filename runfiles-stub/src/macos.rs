@@ -17,6 +17,10 @@ mod sys {
         pub fn close(fd: i32) -> i32;
         pub fn access(path: *const u8, mode: i32) -> i32;
         pub fn execve(path: *const u8, argv: *const *const u8, envp: *const *const u8) -> i32;
+        // Fills buf with the absolute path of the running executable. On the
+        // first call `*size` is the buffer capacity; if too small it's set to
+        // the required size and -1 is returned. Returns 0 on success.
+        pub fn _NSGetExecutablePath(buf: *mut u8, size: *mut u32) -> i32;
         pub fn mmap(
             addr: *mut core::ffi::c_void,
             len: usize,
@@ -64,6 +68,39 @@ pub fn exit(code: i32) -> ! {
 
 pub fn path_exists(path: &[u8]) -> bool {
     unsafe { sys::access(path.as_ptr(), 0) == 0 } // F_OK = 0
+}
+
+/// Absolute path of the running executable, via `_NSGetExecutablePath`.
+///
+/// Used for runfiles discovery: a relative `argv[0]` (as passed by `bazel run`)
+/// can't be joined against the cwd to locate `<exe>.runfiles`, so we resolve the
+/// real executable path instead. The returned path is NOT canonicalized (it may
+/// contain `.`/`..`/symlinks), which is fine — appending `.runfiles` and probing
+/// still resolves correctly.
+pub fn executable_path() -> Option<Vec<u8>> {
+    // Probe the required size, then fetch.
+    let mut size: u32 = 0;
+    unsafe {
+        // First call with size 0 sets `size` to the required capacity and
+        // returns -1.
+        sys::_NSGetExecutablePath(core::ptr::null_mut(), &mut size);
+    }
+    if size == 0 {
+        return None;
+    }
+    let mut buf: Vec<u8> = alloc::vec![0u8; size as usize];
+    let rc = unsafe { sys::_NSGetExecutablePath(buf.as_mut_ptr(), &mut size) };
+    if rc != 0 {
+        return None;
+    }
+    // Trim at the NUL terminator _NSGetExecutablePath wrote.
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    buf.truncate(len);
+    if buf.is_empty() {
+        None
+    } else {
+        Some(buf)
+    }
 }
 
 // Environment variable lookup via the libc `environ` pointer.

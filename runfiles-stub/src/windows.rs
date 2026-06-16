@@ -126,6 +126,15 @@ extern "system" {
 pub const SEP: char = '\\';
 pub const NEWLINE: &[u8] = b"\r\n";
 
+/// Real executable path for runfiles discovery. Not implemented on Windows:
+/// the Windows backend launches via CreateProcessW and derives argv[0] from the
+/// command line rather than a relative path, so the relative-argv[0] discovery
+/// gap addressed on Unix doesn't arise here. Returns None to keep argv[0]-based
+/// discovery (GetModuleFileNameW could be wired up later if needed).
+pub fn executable_path() -> Option<alloc::vec::Vec<u8>> {
+    None
+}
+
 pub fn is_absolute(path: &str) -> bool {
     let b = path.as_bytes();
     b.len() >= 2

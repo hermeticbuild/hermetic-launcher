@@ -64,8 +64,10 @@ mod syscall_numbers {
     pub const SYS_LSEEK: usize = 8;
     pub const SYS_MMAP: usize = 9;
     pub const SYS_ACCESS: usize = 21;
+    pub const SYS_READLINKAT: usize = 267;
     pub const SYS_EXECVE: usize = 59;
     pub const SYS_EXIT: usize = 60;
+    pub const AT_FDCWD: i32 = -100;
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -77,6 +79,7 @@ mod syscall_numbers {
     pub const SYS_LSEEK: usize = 62;
     pub const SYS_MMAP: usize = 222;
     pub const SYS_FACCESSAT: usize = 48;  // faccessat is used on aarch64
+    pub const SYS_READLINKAT: usize = 78;
     pub const SYS_EXECVE: usize = 221;
     pub const SYS_EXIT: usize = 93;
     pub const AT_FDCWD: i32 = -100;  // Special fd for openat/faccessat to work like open/access
@@ -155,6 +158,15 @@ mod sc {
             ret
         }};
     }
+    macro_rules! syscall4 {
+        ($ty:ty; $nr:expr, $a1:expr, $a2:expr, $a3:expr, $a4:expr) => {{
+            let ret: $ty;
+            core::arch::asm!("syscall", in("rax") $nr, in("rdi") $a1, in("rsi") $a2, in("rdx") $a3,
+                in("r10") $a4,
+                lateout("rax") ret, lateout("rcx") _, lateout("r11") _);
+            ret
+        }};
+    }
     macro_rules! syscall6 {
         ($ty:ty; $nr:expr, $a1:expr, $a2:expr, $a3:expr, $a4:expr, $a5:expr, $a6:expr) => {{
             let ret: $ty;
@@ -164,7 +176,7 @@ mod sc {
             ret
         }};
     }
-    pub(super) use {syscall2, syscall3, syscall6, syscall_noreturn, syscall_void};
+    pub(super) use {syscall2, syscall3, syscall4, syscall6, syscall_noreturn, syscall_void};
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -326,6 +338,32 @@ pub fn path_exists(path: &[u8]) -> bool {
     {
         unsafe { syscall2!(i64; SYS_ACCESS, path.as_ptr(), 0i64) == 0 }
     }
+}
+
+/// Absolute path of the running executable, via `readlinkat(/proc/self/exe)`.
+///
+/// Used for runfiles discovery when `argv[0]` is relative (as under `bazel run`):
+/// `<argv[0]>.runfiles` can't be located against the cwd, so resolve the real
+/// executable path instead. Returns None on failure (callers fall back to
+/// argv[0]). Not wired for s390x (no readlinkat number defined here yet).
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub fn executable_path() -> Option<alloc::vec::Vec<u8>> {
+    let mut buf = alloc::vec![0u8; 4096];
+    // readlinkat(AT_FDCWD, "/proc/self/exe", buf, buf.len()); readlink does NOT
+    // NUL-terminate, so the return value is the byte length.
+    let path = b"/proc/self/exe\0";
+    let n: i64 =
+        unsafe { syscall4!(i64; SYS_READLINKAT, AT_FDCWD, path.as_ptr(), buf.as_mut_ptr(), buf.len()) };
+    if n <= 0 || (n as usize) >= buf.len() {
+        return None;
+    }
+    buf.truncate(n as usize);
+    Some(buf)
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn executable_path() -> Option<alloc::vec::Vec<u8>> {
+    None
 }
 
 fn execve(filename: *const u8, argv: *const *const u8, envp: *const *const u8) -> i32 {
