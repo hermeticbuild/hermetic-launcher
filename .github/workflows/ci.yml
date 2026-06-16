@@ -104,7 +104,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          IS_FORK: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
         run: |
+          if [ "$IS_FORK" = "true" ]; then
+            echo "Fork PR — binary size report is in the job summary above."
+            exit 0
+          fi
           EXISTING_ID=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
             --jq 'map(select(.body | startswith("<!-- binary-size-report -->"))) | first | .id // empty')
           if [ -n "$EXISTING_ID" ]; then
