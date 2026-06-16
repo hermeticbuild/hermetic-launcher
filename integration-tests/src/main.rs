@@ -697,6 +697,78 @@ fn test_fallback_runfiles_dir(config: &TestConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Test: Fallback runfiles discovery when the stub is invoked via a RELATIVE
+/// argv[0] from a different working directory (the `bazel run` / deployed-binary
+/// scenario), with no RUNFILES_DIR / RUNFILES_MANIFEST_FILE set.
+///
+/// Regression for aspect-build/rules_py#1113: a py_binary launched this way
+/// aborted with "execve failed with errno 2". `<argv[0]>.runfiles` discovery
+/// must resolve to an absolute location so the resolved program path is valid
+/// regardless of the caller's cwd. `test_fallback_runfiles_dir` only covers the
+/// absolute-argv[0] case (which already works).
+fn test_relative_argv0_discovery(config: &TestConfig) -> Result<(), String> {
+    println!("  Running test: relative_argv0_discovery");
+
+    let test_dir = config.work_dir.join("test_relative_argv0");
+    let sub_dir = test_dir.join("subdir");
+    fs::create_dir_all(&sub_dir).map_err(|e| format!("Failed to create test dir: {}", e))?;
+
+    // Stub + its .runfiles live in subdir/; we invoke it as "subdir/<stub>"
+    // from test_dir so argv[0] is relative.
+    let stub_name = format!("relstub{}", EXE_EXT);
+    let stub_path = sub_dir.join(&stub_name);
+    let runfiles_dir = sub_dir.join(format!("{}.runfiles", stub_name));
+
+    let binary_dir = runfiles_dir.join(WORKSPACE_NAME).join("bin");
+    fs::create_dir_all(&binary_dir).map_err(|e| format!("Failed to create binary dir: {}", e))?;
+
+    let add_binary = config.test_binaries_dir.join(format!("add-numbers{}", EXE_EXT));
+    let dest_binary = binary_dir.join(format!("add-numbers{}", EXE_EXT));
+    fs::copy(&add_binary, &dest_binary).map_err(|e| format!("Failed to copy binary: {}", e))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&dest_binary)
+            .map_err(|e| format!("Failed to get permissions: {}", e))?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&dest_binary, perms)
+            .map_err(|e| format!("Failed to set permissions: {}", e))?;
+    }
+
+    let add_rlocation = format!("{}/bin/add-numbers{}", WORKSPACE_NAME, EXE_EXT);
+    finalize_stub(config, &stub_path, &[&add_rlocation, "5", "10"], &[0])?;
+
+    // Invoke the stub via a RELATIVE argv[0] ("subdir/relstub") with cwd =
+    // test_dir, and no runfiles env vars. This forces the launcher to (a)
+    // discover <argv[0]>.runfiles and (b) produce an absolute program path for
+    // execve — not one relative to the (here different) cwd.
+    let relative_argv0 = PathBuf::from("subdir").join(&stub_name);
+    let mut cmd = Command::new(&relative_argv0);
+    cmd.current_dir(&test_dir);
+    cmd.env_remove("RUNFILES_DIR");
+    cmd.env_remove("RUNFILES_MANIFEST_FILE");
+
+    let output = cmd.output().map_err(|e| format!("Failed to run stub: {}", e))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let exit_code = output.status.code().unwrap_or(-1);
+
+    if exit_code != 0 {
+        return Err(format!(
+            "Stub failed with exit code {} (relative argv[0], no RUNFILES_DIR): {}",
+            exit_code, stderr
+        ));
+    }
+    if !stdout.contains("SUM:15") {
+        return Err(format!("Unexpected output: {}. Expected 'SUM:15'", stdout));
+    }
+
+    println!("    PASS");
+    Ok(())
+}
+
 /// Test: Fallback runfiles_manifest file discovery
 fn test_fallback_runfiles_manifest(config: &TestConfig) -> Result<(), String> {
     println!("  Running test: fallback_runfiles_manifest");
@@ -977,6 +1049,7 @@ fn main() -> ExitCode {
         ("orchestrator_env_propagation", test_orchestrator_env_propagation),
         ("mixed_arguments", test_mixed_arguments),
         ("fallback_runfiles_dir", test_fallback_runfiles_dir),
+        ("relative_argv0_discovery", test_relative_argv0_discovery),
         ("fallback_runfiles_manifest", test_fallback_runfiles_manifest),
         ("print_env", test_print_env),
         ("large_manifest", test_large_manifest),
