@@ -3,9 +3,6 @@ load("//:defs.bzl", "rust_release_binary")
 rust_release_binary(
     name = "runfiles-stub",
     srcs = glob(["src/*.rs"]),
-    deps = [
-        "@runfiles_crates//:talc",
-    ],
     visibility = ["//visibility:public"],
     rustc_flags = ["-C", "panic=abort"] + select({
         "@platforms//os:linux": [
