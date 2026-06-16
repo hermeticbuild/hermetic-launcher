@@ -23,7 +23,7 @@ pub struct Runfiles {
 }
 
 impl Runfiles {
-    pub fn create(executable_path: Option<&[u8]>) -> Option<Self> {
+    pub fn create(rt: &platform::RuntimeArgs) -> Option<Self> {
         // Try RUNFILES_MANIFEST_FILE first
         if let Some(manifest_path) = platform::get_env_var(b"RUNFILES_MANIFEST_FILE") {
             if !manifest_path.is_empty() {
@@ -52,13 +52,14 @@ impl Runfiles {
             }
         }
 
-        // Try to find runfiles next to the executable:
+        // Locate runfiles next to the launching executable:
         // <executable>.runfiles_manifest file first (preferred), then
-        // <executable>.runfiles directory.
-        if let Some(exe_path) = executable_path {
-            let exe_len = cstr_len(exe_path);
+        // <executable>.runfiles directory. The executable path comes from the OS
+        // (an absolute, non-symlink-resolved launch path), not from argv[0].
+        if let Some(exe_path) = rt.executable_path() {
+            let exe_len = cstr_len(&exe_path);
             if exe_len > 0 {
-                // Convert executable path to string (if valid UTF-8)
+                // Convert the executable path to a string (if valid UTF-8).
                 let exe_str = core::str::from_utf8(&exe_path[..exe_len]).ok()?;
 
                 // Try <executable>.runfiles_manifest file first
