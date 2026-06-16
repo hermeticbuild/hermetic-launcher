@@ -145,8 +145,12 @@ jobs:
           common:remote --noexperimental_throttle_remote_action_building
           EOF
           fi
-      - run: bazel test --config=remote //integration-tests:integration_test
-      - run: bazel test --config=cache //...
+      - env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+        run: bazel test ${BUILDBUDDY_API_KEY:+--config=remote} //integration-tests:integration_test
+      - env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+        run: bazel test ${BUILDBUDDY_API_KEY:+--config=cache} //...
         working-directory: e2e/bzlmod
 
   test-macos:
@@ -168,8 +172,12 @@ jobs:
           common:cache --remote_header=x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}
           EOF
           fi
-      - run: bazel test --config=cache //integration-tests:integration_test
-      - run: bazel test --config=cache //...
+      - env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+        run: bazel test ${BUILDBUDDY_API_KEY:+--config=cache} //integration-tests:integration_test
+      - env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+        run: bazel test ${BUILDBUDDY_API_KEY:+--config=cache} //...
         working-directory: e2e/bzlmod
 
   test-windows:
@@ -192,6 +200,14 @@ jobs:
             )
             Add-Content "$env:USERPROFILE\.bazelrc" $lines
           }
-      - run: bazel --output_user_root=C:/b test --config=cache //integration-tests:integration_test
-      - run: bazel test --config=cache //...
+      - env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+        run: |
+          $config = if ($env:BUILDBUDDY_API_KEY) { "--config=cache" } else { $null }
+          bazel --output_user_root=C:/b test $config //integration-tests:integration_test
+      - env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+        run: |
+          $config = if ($env:BUILDBUDDY_API_KEY) { "--config=cache" } else { $null }
+          bazel test $config //...
         working-directory: e2e/bzlmod
