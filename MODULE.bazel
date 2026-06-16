@@ -65,18 +65,12 @@ crate.from_cargo(
     platform_triples = RUST_TRIPLES,
 )
 crate.from_cargo(
-    name = "runfiles_crates",
-    cargo_lock = "//runfiles-stub:Cargo.lock",
-    cargo_toml = "//runfiles-stub:Cargo.toml",
-    platform_triples = RUST_TRIPLES,
-)
-crate.from_cargo(
     name = "integration_crates",
     cargo_lock = "//integration-tests:Cargo.lock",
     cargo_toml = "//integration-tests:Cargo.toml",
     platform_triples = RUST_TRIPLES,
 )
-use_repo(crate, "finalize_crates", "integration_crates", "runfiles_crates")
+use_repo(crate, "finalize_crates", "integration_crates")
 
 bazel_dep(name = "bzip2", version = "1.0.8.bcr.3", dev_dependency = True)
 
