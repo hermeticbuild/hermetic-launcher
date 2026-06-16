@@ -120,6 +120,13 @@ extern "system" {
     fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *mut DWORD) -> BOOL;
     fn GetEnvironmentStringsW() -> *mut u16;
     fn FreeEnvironmentStringsW(lpszEnvironmentBlock: *mut u16) -> BOOL;
+    fn GetCurrentProcess() -> HANDLE;
+    fn QueryFullProcessImageNameW(
+        hProcess: HANDLE,
+        dwFlags: DWORD,
+        lpExeName: *mut u16,
+        lpdwSize: *mut DWORD,
+    ) -> BOOL;
 }
 
 // --- path semantics ---
@@ -169,6 +176,30 @@ pub fn path_exists(path: &[u8]) -> bool {
             false
         }
     }
+}
+
+// Path used to launch this process, via QueryFullProcessImageNameW (the
+// documented API for a process's own image path). With dwFlags = 0 it returns a
+// fully-qualified Win32 path, i.e. already absolute. UTF-16 is narrowed to bytes
+// the same way argv is elsewhere in this backend. None on failure.
+fn launch_path() -> Option<Vec<u8>> {
+    let mut wide = vec![0u16; 4096];
+    let mut size: DWORD = wide.len() as DWORD;
+    let ok = unsafe {
+        QueryFullProcessImageNameW(GetCurrentProcess(), 0, wide.as_mut_ptr(), &mut size)
+    };
+    if ok == 0 || size == 0 || size as usize > wide.len() {
+        return None;
+    }
+    // `size` is the number of characters written, excluding the NUL terminator.
+    Some(wide[..size as usize].iter().map(|&w| (w & 0xFF) as u8).collect())
+}
+
+// QueryFullProcessImageNameW already yields an absolute path, so the cwd is
+// never needed to absolutize it; this exists only to satisfy the shared
+// `absolutize` seam and is not expected to be called on Windows.
+pub fn current_dir() -> Option<Vec<u8>> {
+    None
 }
 
 // Environment variable lookup (two-call GetEnvironmentVariableA pattern).
@@ -458,52 +489,18 @@ fn parse_command_line(
     }
 }
 
-// Extract argv[0] from the command line, narrowed to bytes (for runfiles fallback).
-fn parse_argv0(cmdline: *const u16) -> Vec<u8> {
-    let mut exe_path_buf = Vec::new();
-    unsafe {
-        let mut pos = 0usize;
-        while *cmdline.add(pos) != 0
-            && (*cmdline.add(pos) == b' ' as u16 || *cmdline.add(pos) == b'\t' as u16)
-        {
-            pos += 1;
-        }
-        let quoted = *cmdline.add(pos) == b'"' as u16;
-        if quoted {
-            pos += 1;
-        }
-        while exe_path_buf.len() < 1048576 && *cmdline.add(pos) != 0 {
-            let wchar = *cmdline.add(pos);
-            if quoted {
-                if wchar == b'"' as u16 {
-                    break;
-                }
-            } else if wchar == b' ' as u16 || wchar == b'\t' as u16 {
-                break;
-            }
-            exe_path_buf.push((wchar & 0xFF) as u8);
-            pos += 1;
-        }
-    }
-    exe_path_buf
-}
-
 // --- runtime args & launch ---
 pub struct RuntimeArgs {
-    argv0_bytes: Vec<u8>,
     runtime_argv: [*const u16; 128],
     runtime_argv_len: [usize; 128],
     runtime_count: usize,
 }
 
 impl RuntimeArgs {
-    /// argv[0] (the stub's own path) as bytes, for runfiles fallback discovery.
-    pub fn program_path(&self) -> Option<&[u8]> {
-        if self.argv0_bytes.is_empty() {
-            None
-        } else {
-            Some(&self.argv0_bytes)
-        }
+    /// Absolute path of the launching executable (QueryFullProcessImageNameW),
+    /// for runfiles self-location. Independent of the command-line argv[0].
+    pub fn executable_path(&self) -> Option<Vec<u8>> {
+        launch_path().map(crate::common::absolutize)
     }
 }
 
@@ -628,9 +625,7 @@ pub extern "C" fn main() -> ! {
     let mut runtime_argv: [*const u16; 128] = [core::ptr::null(); 128];
     let mut runtime_argv_len: [usize; 128] = [0; 128];
     let runtime_count = parse_command_line(cmdline, &mut runtime_argv, &mut runtime_argv_len);
-    let argv0_bytes = parse_argv0(cmdline);
     crate::run::main(RuntimeArgs {
-        argv0_bytes,
         runtime_argv,
         runtime_argv_len,
         runtime_count,

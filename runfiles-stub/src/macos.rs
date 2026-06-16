@@ -3,9 +3,10 @@
 // functions that form the platform seam consumed by the shared core.
 
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::common::{print_number, Manifest};
+use crate::common::{cstr_len, print_number, Manifest};
 use crate::run::Launch;
 use crate::runfiles::Runfiles;
 
@@ -26,6 +27,10 @@ mod sys {
             offset: i64,
         ) -> *mut core::ffi::c_void;
         pub fn lseek(fd: i32, offset: i64, whence: i32) -> i64;
+        // Launch path + working directory, for runfiles self-location.
+        #[allow(non_snake_case)]
+        pub fn _NSGetExecutablePath(buf: *mut u8, bufsize: *mut u32) -> i32;
+        pub fn getcwd(buf: *mut u8, size: usize) -> *mut u8;
         // Thread-local errno is reached via __error() on macOS.
         pub fn __error() -> *mut i32;
         pub static mut environ: *const *const u8;
@@ -64,6 +69,45 @@ pub fn exit(code: i32) -> ! {
 
 pub fn path_exists(path: &[u8]) -> bool {
     unsafe { sys::access(path.as_ptr(), 0) == 0 } // F_OK = 0
+}
+
+// Path used to launch this process, via _NSGetExecutablePath. This is the path
+// as exec'd (symlinks NOT resolved); it is absolutized separately. None on
+// failure.
+fn launch_path() -> Option<Vec<u8>> {
+    unsafe {
+        // First query the required buffer size, then read the NUL-terminated path.
+        let mut size: u32 = 0;
+        sys::_NSGetExecutablePath(core::ptr::null_mut(), &mut size);
+        if size == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; size as usize];
+        if sys::_NSGetExecutablePath(buf.as_mut_ptr(), &mut size) != 0 {
+            return None;
+        }
+        buf.truncate(cstr_len(&buf));
+        if buf.is_empty() {
+            None
+        } else {
+            Some(buf)
+        }
+    }
+}
+
+// Current working directory via getcwd(3), used to absolutize a relative launch
+// path. None on failure.
+pub fn current_dir() -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; 4096];
+    if unsafe { sys::getcwd(buf.as_mut_ptr(), buf.len()) }.is_null() {
+        return None;
+    }
+    buf.truncate(cstr_len(&buf));
+    if buf.is_empty() {
+        None
+    } else {
+        Some(buf)
+    }
 }
 
 // Environment variable lookup via the libc `environ` pointer.
@@ -185,23 +229,10 @@ pub struct RuntimeArgs {
 }
 
 impl RuntimeArgs {
-    /// argv[0] (the stub's own path) as bytes, for runfiles fallback discovery.
-    pub fn program_path(&self) -> Option<&[u8]> {
-        if self.argc <= 0 {
-            return None;
-        }
-        unsafe {
-            let p = *self.argv;
-            let mut len = 0;
-            while *p.add(len) != 0 && len < 1048576 {
-                len += 1;
-            }
-            if len > 0 {
-                Some(core::slice::from_raw_parts(p, len))
-            } else {
-                None
-            }
-        }
+    /// Absolute path of the launching executable (`_NSGetExecutablePath`, made
+    /// absolute), for runfiles self-location. Independent of argv[0].
+    pub fn executable_path(&self) -> Option<Vec<u8>> {
+        launch_path().map(crate::common::absolutize)
     }
 }
 

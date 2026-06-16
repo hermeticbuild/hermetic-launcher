@@ -64,6 +64,7 @@ mod syscall_numbers {
     pub const SYS_LSEEK: usize = 8;
     pub const SYS_MMAP: usize = 9;
     pub const SYS_ACCESS: usize = 21;
+    pub const SYS_GETCWD: usize = 79;
     pub const SYS_EXECVE: usize = 59;
     pub const SYS_EXIT: usize = 60;
 }
@@ -77,6 +78,7 @@ mod syscall_numbers {
     pub const SYS_LSEEK: usize = 62;
     pub const SYS_MMAP: usize = 222;
     pub const SYS_FACCESSAT: usize = 48;  // faccessat is used on aarch64
+    pub const SYS_GETCWD: usize = 17;
     pub const SYS_EXECVE: usize = 221;
     pub const SYS_EXIT: usize = 93;
     pub const AT_FDCWD: i32 = -100;  // Special fd for openat/faccessat to work like open/access
@@ -92,6 +94,7 @@ mod syscall_numbers {
     pub const SYS_LSEEK: usize = 19;
     pub const SYS_EXECVE: usize = 11;
     pub const SYS_ACCESS: usize = 33;
+    pub const SYS_GETCWD: usize = 183;
     pub const SYS_MMAP: usize = 90;
 }
 
@@ -104,6 +107,10 @@ const STDOUT: i32 = 1;
 const PROT_READ: usize = 1;
 const MAP_PRIVATE: usize = 2;
 const SEEK_END: i32 = 2;
+
+// ELF auxiliary-vector entry type holding a pointer to the pathname used to exec
+// this process (arch-independent).
+const AT_EXECFN: usize = 31;
 
 // --- path semantics ---
 pub const SEP: char = '/';
@@ -179,6 +186,14 @@ mod sc {
             core::arch::asm!("svc #0", in("x8") $nr, in("x0") $a1, lateout("x0") _)
         };
     }
+    macro_rules! syscall2 {
+        ($ty:ty; $nr:expr, $a1:expr, $a2:expr) => {{
+            let ret: $ty;
+            core::arch::asm!("svc #0", in("x8") $nr, in("x0") $a1, in("x1") $a2,
+                lateout("x0") ret);
+            ret
+        }};
+    }
     macro_rules! syscall3 {
         ($ty:ty; $nr:expr, $a1:expr, $a2:expr, $a3:expr) => {{
             let ret: $ty;
@@ -203,7 +218,7 @@ mod sc {
             ret
         }};
     }
-    pub(super) use {syscall3, syscall4, syscall6, syscall_noreturn, syscall_void};
+    pub(super) use {syscall2, syscall3, syscall4, syscall6, syscall_noreturn, syscall_void};
 }
 
 #[cfg(target_arch = "s390x")]
@@ -326,6 +341,36 @@ pub fn path_exists(path: &[u8]) -> bool {
     {
         unsafe { syscall2!(i64; SYS_ACCESS, path.as_ptr(), 0i64) == 0 }
     }
+}
+
+// getcwd(2) into `buf`. Returns the number of bytes written (including the
+// trailing NUL) on success, or a negative value on error.
+fn getcwd(buf: &mut [u8]) -> isize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { syscall2!(isize; SYS_GETCWD, buf.as_mut_ptr(), buf.len()) }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { syscall2!(isize; SYS_GETCWD, buf.as_mut_ptr(), buf.len()) }
+    }
+    #[cfg(target_arch = "s390x")]
+    {
+        unsafe { syscall2!(i64; SYS_GETCWD, buf.as_mut_ptr(), buf.len()) as isize }
+    }
+}
+
+// Current working directory, used to absolutize a relative launch path. None on
+// failure.
+pub fn current_dir() -> Option<Vec<u8>> {
+    let mut buf = [0u8; 4096];
+    if getcwd(&mut buf) > 0 {
+        let len = crate::common::cstr_len(&buf);
+        if len > 0 {
+            return Some(buf[..len].to_vec());
+        }
+    }
+    None
 }
 
 fn execve(filename: *const u8, argv: *const *const u8, envp: *const *const u8) -> i32 {
@@ -487,26 +532,31 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> (Vec<u8>, Vec<*const u
 pub struct RuntimeArgs {
     argc: usize,
     argv: *const *const u8,
+    // Pointer to the AT_EXECFN string (the pathname used to exec us), or null.
+    execfn: *const u8,
 }
 
 impl RuntimeArgs {
-    /// argv[0] (the stub's own path) as bytes, for runfiles fallback discovery.
-    pub fn program_path(&self) -> Option<&[u8]> {
-        if self.argc == 0 {
+    /// Absolute path of the launching executable, from AT_EXECFN made absolute,
+    /// for runfiles self-location. Independent of argv[0].
+    pub fn executable_path(&self) -> Option<Vec<u8>> {
+        if self.execfn.is_null() {
             return None;
         }
+        let mut len = 0;
         unsafe {
-            let p = *self.argv;
-            let mut len = 0;
-            while *p.add(len) != 0 && len < 1048576 {
+            while *self.execfn.add(len) != 0 {
                 len += 1;
-            }
-            if len > 0 {
-                Some(core::slice::from_raw_parts(p, len))
-            } else {
-                None
+                if len > 1048576 {
+                    return None;
+                }
             }
         }
+        if len == 0 {
+            return None;
+        }
+        let raw = unsafe { core::slice::from_raw_parts(self.execfn, len) }.to_vec();
+        Some(crate::common::absolutize(raw))
     }
 }
 
@@ -593,13 +643,40 @@ core::arch::global_asm!(
     "brasl %r14, _start_rust",     // Call the actual start function
 );
 
+// Walk the ELF auxiliary vector (which follows argv and envp on the initial
+// stack) and return the AT_EXECFN value: a pointer to the pathname used to exec
+// this process. Null if the entry is absent.
+unsafe fn find_execfn(initial_sp: *const usize, argc: usize) -> *const u8 {
+    // Skip argc, the argc argv entries, and the argv NULL terminator -> envp[0].
+    let mut p = initial_sp.add(1 + argc + 1);
+    // Skip the environment pointers up to their NULL terminator -> auxv[0].
+    while *p != 0 {
+        p = p.add(1);
+    }
+    p = p.add(1);
+    // Walk auxv entries (pairs of {type, value}) until AT_NULL (type 0).
+    loop {
+        let a_type = *p;
+        if a_type == 0 {
+            return core::ptr::null();
+        }
+        if a_type == AT_EXECFN {
+            return *p.add(1) as *const u8;
+        }
+        p = p.add(2);
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn _start_rust(initial_sp: *const usize) -> ! {
-    // Stack layout: [sp] = argc, [sp + 8] = argv[0], [sp + 16] = argv[1], ...
-    let (argc, argv) = unsafe {
+    // Stack layout: [sp] = argc, [sp + 8] = argv[0], [sp + 16] = argv[1], ...,
+    // the argv NULL terminator, the environment pointers, a NULL, then the ELF
+    // auxiliary vector.
+    let rt = unsafe {
         let argc = *initial_sp;
         let argv = (initial_sp as usize + 8) as *const *const u8;
-        (argc, argv)
+        let execfn = find_execfn(initial_sp, argc);
+        RuntimeArgs { argc, argv, execfn }
     };
-    crate::run::main(RuntimeArgs { argc, argv })
+    crate::run::main(rt)
 }

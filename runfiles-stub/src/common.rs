@@ -3,12 +3,33 @@
 
 extern crate alloc;
 
+use alloc::vec::Vec;
+
 use crate::platform;
 
 /// Length of a NUL-terminated byte string stored in a fixed-size buffer:
 /// the offset of the first NUL, or the full length if there is none.
 pub fn cstr_len(s: &[u8]) -> usize {
     s.iter().position(|&b| b == 0).unwrap_or(s.len())
+}
+
+/// Make `path` absolute without resolving symlinks. An already-absolute path is
+/// returned unchanged; a relative one is joined onto the current working
+/// directory. Best-effort: if the cwd is unavailable, the path is returned as-is.
+pub fn absolutize(path: Vec<u8>) -> Vec<u8> {
+    if let Ok(s) = core::str::from_utf8(&path) {
+        if platform::is_absolute(s) {
+            return path;
+        }
+    }
+    if let Some(mut cwd) = platform::current_dir() {
+        if cwd.last().copied() != Some(platform::SEP as u8) {
+            cwd.push(platform::SEP as u8);
+        }
+        cwd.extend_from_slice(&path);
+        return cwd;
+    }
+    path
 }
 
 /// Print a decimal number to stdout (used in diagnostics).

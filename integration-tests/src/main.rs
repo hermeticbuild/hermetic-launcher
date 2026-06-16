@@ -769,6 +769,96 @@ fn test_fallback_runfiles_manifest(config: &TestConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Regression test: runfiles discovery under `bazel run` semantics.
+///
+/// argv[0] is not guaranteed to be a reliable, absolute path that points at the
+/// executable. Instead, it may be relative (and it may be completely fake).
+/// The stub should use reliable, operating-system specific APIs to find it's own
+/// path and not rely on argv[0] at all.
+///
+/// `bazel test` masks the bug because it pre-sets RUNFILES_DIR, and the other
+/// fallback tests above invoke the stub by its *absolute* path, so neither
+/// exercises this code path. See https://github.com/aspect-build/rules_py/pull/1113.
+fn test_run_runfiles_discovery(config: &TestConfig) -> Result<(), String> {
+    println!("  Running test: run_runfiles_discovery");
+
+    let test_dir = config.work_dir.join("test_run_discovery");
+    fs::create_dir_all(&test_dir).map_err(|e| format!("Failed to create test dir: {}", e))?;
+
+    // A stub with its <stub>.runfiles directory next to it, like a built binary.
+    let stub_name = format!("run_disc_stub{}", EXE_EXT);
+    let stub_path = test_dir.join(&stub_name);
+    let runfiles_dir = test_dir.join(format!("{}.runfiles", stub_name));
+
+    // Place the target binary inside the runfiles tree.
+    let binary_dir = runfiles_dir.join(WORKSPACE_NAME).join("bin");
+    fs::create_dir_all(&binary_dir).map_err(|e| format!("Failed to create binary dir: {}", e))?;
+    let add_binary = config.test_binaries_dir.join(format!("add-numbers{}", EXE_EXT));
+    let dest_binary = binary_dir.join(format!("add-numbers{}", EXE_EXT));
+    fs::copy(&add_binary, &dest_binary).map_err(|e| format!("Failed to copy binary: {}", e))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&dest_binary)
+            .map_err(|e| format!("Failed to get permissions: {}", e))?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&dest_binary, perms)
+            .map_err(|e| format!("Failed to set permissions: {}", e))?;
+    }
+
+    let add_rlocation = format!("{}/bin/add-numbers{}", WORKSPACE_NAME, EXE_EXT);
+    finalize_stub(config, &stub_path, &[&add_rlocation, "5", "10"], &[0])?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        // The working directory `bazel run` leaves us in: inside the runfiles tree.
+        let cwd_inside_runfiles = runfiles_dir.join(WORKSPACE_NAME);
+
+        // Exec the stub by its absolute path (so the OS can self-locate the running
+        // binary) but with a *relative* argv[0], exactly as `bazel run` does.
+        let mut cmd = Command::new(&stub_path);
+        cmd.arg0(format!("bazel-bin/{}", stub_name));
+        cmd.current_dir(&cwd_inside_runfiles);
+        cmd.env_remove("RUNFILES_DIR");
+        cmd.env_remove("RUNFILES_MANIFEST_FILE");
+        cmd.env_remove("JAVA_RUNFILES");
+
+        let output = cmd.output().map_err(|e| format!("Failed to run stub: {}", e))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let exit_code = output.status.code().unwrap_or(-1);
+
+        if exit_code != 0 {
+            return Err(format!(
+                "Stub failed with exit code {} (rules_py #1113 regression: relative argv[0] \
+                 + cwd inside the runfiles tree).\nstdout: {}\nstderr: {}",
+                exit_code, stdout, stderr
+            ));
+        }
+        if !stdout.contains("SUM:15") {
+            return Err(format!("Unexpected output: {}. Expected 'SUM:15'", stdout));
+        }
+
+        println!("    PASS (relative argv[0], cwd inside runfiles)");
+    }
+
+    #[cfg(not(unix))]
+    {
+        // The relative-argv[0] failure mode is Unix-specific; on Windows the
+        // launcher derives runfiles from the command-line argv[0], which Bazel
+        // passes as an absolute path. The setup above still keeps the case
+        // compiling and the stub finalized.
+        let _ = &stub_path;
+        println!("    SKIP (Unix-only reproduction)");
+    }
+
+    Ok(())
+}
+
 /// Test: print-env to verify environment and argument passing
 fn test_print_env(config: &TestConfig) -> Result<(), String> {
     println!("  Running test: print_env");
@@ -978,6 +1068,7 @@ fn main() -> ExitCode {
         ("mixed_arguments", test_mixed_arguments),
         ("fallback_runfiles_dir", test_fallback_runfiles_dir),
         ("fallback_runfiles_manifest", test_fallback_runfiles_manifest),
+        ("run_runfiles_discovery", test_run_runfiles_discovery),
         ("print_env", test_print_env),
         ("large_manifest", test_large_manifest),
     ];

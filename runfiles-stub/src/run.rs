@@ -95,11 +95,8 @@ pub fn main(rt: platform::RuntimeArgs) -> ! {
     let needs_transform = (transform_flags & argc_mask) != 0;
     let needs_runfiles = needs_transform || export_runfiles_env;
 
-    // argv[0] (the stub's own path) is the fallback for runfiles discovery.
-    let executable_path = rt.program_path();
-
     let runfiles = if needs_runfiles {
-        match Runfiles::create(executable_path) {
+        match Runfiles::create(&rt) {
             Some(rf) => Some(rf),
             None => {
                 eline(b"ERROR: Failed to initialize runfiles");
