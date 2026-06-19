@@ -13,6 +13,15 @@ rust_release_binary(
             "-Clink-arg=-lc",
             "-Clink-self-contained=no",
         ],
+        # Fold __DATA_CONST (only ~192 B: __got + a little __const) into __DATA.
+        # On arm64 macOS every segment is 16 KiB-page-aligned, so a standalone
+        # __DATA_CONST wastes a whole 16 KiB page; merging it reclaims that page
+        # (aarch64: 50656 -> 34144, x86_64: 25484 -> 21388). The stub does its
+        # work and execve's immediately, so giving up the read-only-after-reloc
+        # hardening on the GOT is irrelevant here.
+        "@platforms//os:macos": [
+            "-Clink-arg=-Wl,-no_data_const",
+        ],
         "//conditions:default": [],
     }),
 )
