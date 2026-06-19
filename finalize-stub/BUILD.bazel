@@ -2,6 +2,9 @@ load("//:defs.bzl", "rust_release_binary")
 
 rust_release_binary(
     name = "finalize-stub",
+    # The finalizer is panic = "unwind" (unlike the runfiles stub), so its unwind
+    # tables are live; skip the optimizer, which would strip them.
+    optimize = False,
     srcs = glob(["src/*.rs"]),
     deps = [
         "@finalize_crates//:apple-codesign",

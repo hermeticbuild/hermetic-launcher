@@ -1,0 +1,7 @@
+# Allow normal linking for this host tool (the parent .cargo/config.toml in the
+# repo root tunes the no_std stub link; this tool is an ordinary std binary).
+[build]
+rustflags = []
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = []

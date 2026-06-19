@@ -1,5 +1,4 @@
 load("@bazel_lib//lib:copy_to_directory.bzl", "copy_to_directory")
-load("@rules_platform//platform_data:defs.bzl", "platform_data")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
 
 config_setting(
@@ -25,12 +24,47 @@ config_setting(
     ],
 )
 
-STATIC_BINARY_PLATFORM = select({
-    ":linux_x86_64": "@rules_rs//rs/platforms:x86_64-unknown-linux-musl",
-    ":linux_aarch64": "@rules_rs//rs/platforms:aarch64-unknown-linux-musl",
-    ":windows": "//platforms:local_windows_gnullvm",
-    "//conditions:default": "@platforms//host:host",
-})
+config_setting(
+    name = "macos_x86_64",
+    constraint_values = [
+        "@platforms//os:macos",
+        "@platforms//cpu:x86_64",
+    ],
+)
+
+config_setting(
+    name = "macos_aarch64",
+    constraint_values = [
+        "@platforms//os:macos",
+        "@platforms//cpu:aarch64",
+    ],
+)
+
+# The released artifacts for the host platform: the runfiles-stub template and the
+# finalizer, each already platform-transitioned and run through the optimization
+# pipeline (the exact bytes a release ships). The integration test exercises these
+# end to end instead of a separately-transitioned, unoptimized build.
+alias(
+    name = "release-template",
+    actual = select({
+        ":linux_x86_64": "//runfiles-stub:runfiles-stub_x86_64-unknown-linux-musl",
+        ":linux_aarch64": "//runfiles-stub:runfiles-stub_aarch64-unknown-linux-musl",
+        ":macos_x86_64": "//runfiles-stub:runfiles-stub_x86_64-apple-darwin",
+        ":macos_aarch64": "//runfiles-stub:runfiles-stub_aarch64-apple-darwin",
+        ":windows": "//runfiles-stub:runfiles-stub_x86_64-pc-windows-gnullvm",
+    }),
+)
+
+alias(
+    name = "release-finalizer",
+    actual = select({
+        ":linux_x86_64": "//finalize-stub:finalize-stub_x86_64-unknown-linux-musl",
+        ":linux_aarch64": "//finalize-stub:finalize-stub_aarch64-unknown-linux-musl",
+        ":macos_x86_64": "//finalize-stub:finalize-stub_x86_64-apple-darwin",
+        ":macos_aarch64": "//finalize-stub:finalize-stub_aarch64-apple-darwin",
+        ":windows": "//finalize-stub:finalize-stub_x86_64-pc-windows-gnullvm",
+    }),
+)
 
 rust_binary(
     name = "hash-file",
@@ -64,18 +98,6 @@ rust_binary(
     edition = "2021",
 )
 
-platform_data(
-    name = "static-runfiles-stub",
-    platform = STATIC_BINARY_PLATFORM,
-    target = "//runfiles-stub",
-)
-
-platform_data(
-    name = "static-finalize-stub.exe",
-    platform = STATIC_BINARY_PLATFORM,
-    target = "//finalize-stub",
-)
-
 copy_to_directory(
     name = "test-binaries",
     srcs = [
@@ -92,15 +114,15 @@ rust_test(
     srcs = ["src/main.rs"],
     args = [
         "--template",
-        "$(rlocationpath :static-runfiles-stub)",
+        "$(rlocationpath :release-template)",
         "--finalizer",
-        "$(rlocationpath :static-finalize-stub.exe)",
+        "$(rlocationpath :release-finalizer)",
         "--test-binaries",
         "$(rlocationpath :test-binaries)",
     ],
     data = [
-        ":static-finalize-stub.exe",
-        ":static-runfiles-stub",
+        ":release-finalizer",
+        ":release-template",
         ":test-binaries",
     ],
     deps = ["@rules_rust//rust/runfiles"],
