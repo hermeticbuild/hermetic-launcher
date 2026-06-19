@@ -1,0 +1,13 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary")
+
+# Host/exec tool: runs as part of the launcher build pipeline, so it is an
+# ordinary std binary (not one of the no_std stubs). Built for the exec platform
+# by the `optimize_binary` rule.
+rust_binary(
+    name = "optimize-binary",
+    srcs = glob(["src/*.rs"]),
+    edition = "2021",
+    visibility = ["//visibility:public"],
+)
+
+exports_files(["optimize_binary.bzl"])
