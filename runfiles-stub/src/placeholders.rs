@@ -23,43 +23,27 @@ macro_rules! define_placeholders {
         #[link_section = $section]
         static mut EXPORT_RUNFILES_ENV: [u8; 32] = *b"@@RUNFILES_EXPORT_ENV@@\0\0\0\0\0\0\0\0\0";
 
+        // The ten argument placeholders as one contiguous 2D array rather than ten
+        // separate statics. `arg()` indexes it with pointer arithmetic, which lowers
+        // to a single PC-relative `adrp+add`; ten distinct statics made the compiler
+        // materialize a table of ten absolute addresses, and under PIE (mandatory on
+        // arm64 macOS) that table needs load-time rebasing — which would force a
+        // writable, file-backed `__DATA` page back into existence. The bytes on disk
+        // (2560 contiguous '@') are identical either way, so the finalizer's
+        // 256-byte-run scan is unaffected.
         #[used]
         #[link_section = $section]
-        static mut ARG0_PLACEHOLDER: [u8; ARG_SIZE] = [b'@'; ARG_SIZE];
-        #[used]
-        #[link_section = $section]
-        static mut ARG1_PLACEHOLDER: [u8; ARG_SIZE] = [b'@'; ARG_SIZE];
-        #[used]
-        #[link_section = $section]
-        static mut ARG2_PLACEHOLDER: [u8; ARG_SIZE] = [b'@'; ARG_SIZE];
-        #[used]
-        #[link_section = $section]
-        static mut ARG3_PLACEHOLDER: [u8; ARG_SIZE] = [b'@'; ARG_SIZE];
-        #[used]
-        #[link_section = $section]
-        static mut ARG4_PLACEHOLDER: [u8; ARG_SIZE] = [b'@'; ARG_SIZE];
-        #[used]
-        #[link_section = $section]
-        static mut ARG5_PLACEHOLDER: [u8; ARG_SIZE] = [b'@'; ARG_SIZE];
-        #[used]
-        #[link_section = $section]
-        static mut ARG6_PLACEHOLDER: [u8; ARG_SIZE] = [b'@'; ARG_SIZE];
-        #[used]
-        #[link_section = $section]
-        static mut ARG7_PLACEHOLDER: [u8; ARG_SIZE] = [b'@'; ARG_SIZE];
-        #[used]
-        #[link_section = $section]
-        static mut ARG8_PLACEHOLDER: [u8; ARG_SIZE] = [b'@'; ARG_SIZE];
-        #[used]
-        #[link_section = $section]
-        static mut ARG9_PLACEHOLDER: [u8; ARG_SIZE] = [b'@'; ARG_SIZE];
+        static mut ARGS: [[u8; ARG_SIZE]; 10] = [[b'@'; ARG_SIZE]; 10];
     };
 }
 
 #[cfg(target_os = "linux")]
 define_placeholders!(".runfiles_stubs");
+// Read-only `__TEXT` section: the placeholders are only ever read at runtime (the
+// finalizer patches them on disk), so keeping them in `__TEXT` avoids a writable,
+// load-time `__DATA` file page. See macos.rs for the no-libc rationale.
 #[cfg(target_os = "macos")]
-define_placeholders!("__DATA,__runfiles");
+define_placeholders!("__TEXT,__runfiles");
 #[cfg(target_os = "windows")]
 define_placeholders!(".runfiles");
 
@@ -81,19 +65,13 @@ pub fn export_runfiles_env() -> &'static [u8] {
 }
 
 pub fn arg(i: usize) -> &'static [u8] {
-    let ptr = match i {
-        0 => core::ptr::addr_of!(ARG0_PLACEHOLDER),
-        1 => core::ptr::addr_of!(ARG1_PLACEHOLDER),
-        2 => core::ptr::addr_of!(ARG2_PLACEHOLDER),
-        3 => core::ptr::addr_of!(ARG3_PLACEHOLDER),
-        4 => core::ptr::addr_of!(ARG4_PLACEHOLDER),
-        5 => core::ptr::addr_of!(ARG5_PLACEHOLDER),
-        6 => core::ptr::addr_of!(ARG6_PLACEHOLDER),
-        7 => core::ptr::addr_of!(ARG7_PLACEHOLDER),
-        8 => core::ptr::addr_of!(ARG8_PLACEHOLDER),
-        _ => core::ptr::addr_of!(ARG9_PLACEHOLDER),
-    };
-    read(ptr as *const u8, ARG_SIZE)
+    // Clamp to the last slot, matching the previous per-index behaviour. Indexing
+    // the single ARGS array lowers to a PC-relative address (no rebased pointer
+    // table); see the note on ARGS above.
+    let idx = if i < 10 { i } else { 9 };
+    let base = core::ptr::addr_of!(ARGS) as *const u8;
+    let ptr = unsafe { base.add(idx * ARG_SIZE) };
+    read(ptr, ARG_SIZE)
 }
 
 /// True if the placeholder still holds its unpatched template value.

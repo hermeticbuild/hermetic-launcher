@@ -2,7 +2,7 @@
 
 Tiny, cross-platform native launchers that replace shell-script wrappers in Bazel.
 A launcher resolves its target's runfiles, forwards arguments, and `exec`s the real
-program — in ~10–70 KB, identically on Linux, macOS, and Windows.
+program — in ~16–30 KB, identically on Linux, macOS, and Windows.
 
 ## Why
 

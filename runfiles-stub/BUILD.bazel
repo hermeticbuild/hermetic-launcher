@@ -13,14 +13,12 @@ rust_release_binary(
             "-Clink-arg=-lc",
             "-Clink-self-contained=no",
         ],
-        # Fold __DATA_CONST (only ~192 B: __got + a little __const) into __DATA.
-        # On arm64 macOS every segment is 16 KiB-page-aligned, so a standalone
-        # __DATA_CONST wastes a whole 16 KiB page; merging it reclaims that page
-        # (aarch64: 50656 -> 34144, x86_64: 25484 -> 21388). The stub does its
-        # work and execve's immediately, so giving up the read-only-after-reloc
-        # hardening on the GOT is irrelevant here.
+        # The macOS backend makes no libc calls (raw syscalls only, see
+        # src/macos.rs), so there is no GOT and no __DATA_CONST to fold — the
+        # linked image already carries no writable __DATA file page. We only need
+        # to drop the dead Foundation dependency the toolchain injects.
         "@platforms//os:macos": [
-            "-Clink-arg=-Wl,-no_data_const",
+            "-Clink-arg=-Wl,-dead_strip_dylibs",
         ],
         "//conditions:default": [],
     }),
