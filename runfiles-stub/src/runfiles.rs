@@ -107,18 +107,7 @@ impl Runfiles {
         }
 
         match &self.mode {
-            RunfilesMode::ManifestBased(manifest) => {
-                if let Some(resolved) = manifest.lookup(path) {
-                    return Some(platform::to_native_path(resolved));
-                }
-                // Prefix match for paths within TreeArtifacts
-                if let Some((resolved_prefix, suffix)) = manifest.prefix_lookup(path) {
-                    let mut result = String::from(resolved_prefix);
-                    result.push_str(suffix);
-                    return Some(platform::to_native_path(&result));
-                }
-                None
-            }
+            RunfilesMode::ManifestBased(manifest) => resolve_manifest(manifest, path),
             RunfilesMode::DirectoryBased(dir) => {
                 let mut result = dir.clone();
                 // Add separator if needed.
@@ -130,4 +119,86 @@ impl Runfiles {
             }
         }
     }
+}
+
+/// Maximum number of relative manifest hops to follow before giving up. Bazel
+/// emits only short symlink chains (e.g. `python` -> `python3` -> `../../interp`),
+/// so a small bound is plenty and also breaks any accidental cycle.
+const MAX_MANIFEST_HOPS: usize = 32;
+
+/// Resolve a runfiles-relative `path` through a manifest.
+///
+/// A manifest line maps a runfiles-relative key (LHS) to a target (RHS) that
+/// behaves exactly like a filesystem symlink target: an absolute RHS is the final
+/// location, while a relative RHS is interpreted relative to the directory of its
+/// key (POSIX symlink semantics). A relative target therefore names another
+/// runfiles-relative path, which may itself be another manifest entry — Bazel
+/// chains venv interpreter shims this way — so we follow the chain until it lands
+/// on an absolute path.
+fn resolve_manifest(manifest: &Manifest, path: &str) -> Option<String> {
+    let mut key = String::from(path);
+    for _ in 0..MAX_MANIFEST_HOPS {
+        let value = match manifest.lookup(&key) {
+            Some(v) => v,
+            None => {
+                // Prefix match for paths within a TreeArtifact: only the directory
+                // is listed, the file beneath it is not. Such directory entries are
+                // always absolute, so the joined path is the final location.
+                if let Some((resolved_prefix, suffix)) = manifest.prefix_lookup(&key) {
+                    let mut result = String::from(resolved_prefix);
+                    result.push_str(suffix);
+                    return Some(platform::to_native_path(&result));
+                }
+                return None;
+            }
+        };
+
+        // An absolute target is the final location; hand it back natively.
+        if platform::is_absolute(value) {
+            return Some(platform::to_native_path(value));
+        }
+
+        // A relative target is a symlink relative to the key's directory. Resolve
+        // it into a new runfiles-relative key and look that up in turn.
+        key = join_relative(parent_dir(&key), value)?;
+    }
+    None
+}
+
+/// Directory portion of a forward-slash runfiles key, without the trailing slash.
+/// `"a/b/c"` -> `"a/b"`; a key with no slash -> `""` (the runfiles root).
+fn parent_dir(key: &str) -> &str {
+    match key.rfind('/') {
+        Some(i) => &key[..i],
+        None => "",
+    }
+}
+
+/// Resolve a relative symlink `target` against directory `base` — both
+/// forward-slash, runfiles-relative — normalizing `.` and `..` components.
+/// Returns the new runfiles-relative key, or `None` if it would escape the
+/// runfiles root (a malformed entry we refuse rather than follow outside the tree).
+fn join_relative(base: &str, target: &str) -> Option<String> {
+    let mut stack: Vec<&str> = Vec::new();
+    for comp in base.split('/').chain(target.split('/')) {
+        match comp {
+            "" | "." => {}
+            // `pop()?` fails the whole resolution if `..` reaches above the root.
+            ".." => {
+                stack.pop()?;
+            }
+            other => stack.push(other),
+        }
+    }
+    if stack.is_empty() {
+        return None;
+    }
+    let mut result = String::new();
+    for (i, comp) in stack.iter().enumerate() {
+        if i > 0 {
+            result.push('/');
+        }
+        result.push_str(comp);
+    }
+    Some(result)
 }
