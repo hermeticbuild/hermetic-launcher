@@ -208,6 +208,24 @@ bazel test //integration-tests:integration_test   # finalize + run on the host p
 
 `flake.nix` provides a dev shell (Rust, Wine for Windows testing, gdb).
 
+## Updating the prebuilt binaries
+
+1. Check out the latest commit of `main` and create a `binaries-YYYYMMDD` tag, then push it:
+   ```bash
+   git checkout main && git pull
+   git tag binaries-$(date +%Y%m%d)
+   git push origin binaries-$(date +%Y%m%d)
+   ```
+2. The [release workflow](.github/workflows/release.yml) builds all 14 binaries and publishes a GitHub release with a `SHA256SUMS.txt`.
+3. Once the release is published, run the updater and commit:
+   ```bash
+   bazel run //tools:update-binaries
+   git add launcher/private/extensions.bzl
+   git commit -m "chore: update prebuilt binaries to binaries-YYYYMMDD"
+   ```
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
