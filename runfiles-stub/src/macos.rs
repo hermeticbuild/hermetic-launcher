@@ -1,48 +1,90 @@
-// macOS backend: libc (libSystem) primitives, the C `main` entry point, and an
-// execve-based launch. All FFI is confined to the `sys` module and wrapped in safe
-// functions that form the platform seam consumed by the shared core.
+// macOS backend: raw syscalls (no libc), a register-based entry point, and an
+// execve-based launch. macOS still requires *linking* libSystem, but this backend
+// never *calls* it: every primitive is a direct syscall (`svc #0x80` on arm64,
+// `syscall` on x86_64) and the few compiler-intrinsic symbols are provided in-tree.
+// With no dynamic calls there is no GOT and no load-time-written data, so the linked
+// image carries no writable `__DATA` file page — the binary collapses to a single
+// `__TEXT` page (mirroring the Linux backend; see linux.rs).
 
 use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::common::{cstr_len, print_number, Manifest};
+use crate::common::{cstr_len, Manifest};
 use crate::run::Launch;
 use crate::runfiles::Runfiles;
 
-mod sys {
-    extern "C" {
-        pub fn exit(code: i32) -> !;
-        pub fn write(fd: i32, buf: *const u8, count: usize) -> isize;
-        pub fn open(path: *const u8, flags: i32, ...) -> i32;
-        pub fn close(fd: i32) -> i32;
-        pub fn access(path: *const u8, mode: i32) -> i32;
-        pub fn execve(path: *const u8, argv: *const *const u8, envp: *const *const u8) -> i32;
-        pub fn mmap(
-            addr: *mut core::ffi::c_void,
-            len: usize,
-            prot: i32,
-            flags: i32,
-            fd: i32,
-            offset: i64,
-        ) -> *mut core::ffi::c_void;
-        pub fn lseek(fd: i32, offset: i64, whence: i32) -> i64;
-        // Launch path + working directory, for runfiles self-location.
-        #[allow(non_snake_case)]
-        pub fn _NSGetExecutablePath(buf: *mut u8, bufsize: *mut u32) -> i32;
-        pub fn getcwd(buf: *mut u8, size: usize) -> *mut u8;
-        // Thread-local errno is reached via __error() on macOS.
-        pub fn __error() -> *mut i32;
-        pub static mut environ: *const *const u8;
+// Compiler intrinsics. Provided in-tree because we own the entry point and make no
+// libc calls, so nothing else defines them; the optimizer/codegen still emits calls
+// to memcpy/memset/memcmp for bulk moves and comparisons.
+#[no_mangle]
+pub unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    let mut i = 0;
+    while i < n {
+        *dst.add(i) = *src.add(i);
+        i += 1;
     }
+    dst
 }
+
+#[no_mangle]
+pub unsafe extern "C" fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
+    let mut i = 0;
+    while i < n {
+        *s.add(i) = c as u8;
+        i += 1;
+    }
+    s
+}
+
+// ld64 references `_bzero` for zero-fills; route it through memset.
+#[no_mangle]
+pub unsafe extern "C" fn bzero(s: *mut u8, n: usize) {
+    memset(s, 0, n);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memcmp(s1: *const u8, s2: *const u8, n: usize) -> i32 {
+    let mut i = 0;
+    while i < n {
+        let a = *s1.add(i);
+        let b = *s2.add(i);
+        if a != b {
+            return a as i32 - b as i32;
+        }
+        i += 1;
+    }
+    0
+}
+
+// macOS BSD syscall numbers, shared by both arches (arm64 and x86_64 use the same
+// unix-class numbers; only the class selector and trap instruction differ — see the
+// `sc` modules). Stable across releases.
+mod syscall_numbers {
+    pub const SYS_EXIT: usize = 1;
+    pub const SYS_WRITE: usize = 4;
+    pub const SYS_OPEN: usize = 5;
+    pub const SYS_CLOSE: usize = 6;
+    pub const SYS_ACCESS: usize = 33;
+    pub const SYS_EXECVE: usize = 59;
+    pub const SYS_FCNTL: usize = 92;
+    pub const SYS_MMAP: usize = 197;
+    pub const SYS_LSEEK: usize = 199;
+}
+
+use syscall_numbers::*;
 
 const O_RDONLY: i32 = 0;
 const STDOUT: i32 = 1;
-const PROT_READ: i32 = 1;
-const MAP_PRIVATE: i32 = 2;
+
+// mmap parameters for read-only file mapping.
+const PROT_READ: usize = 1;
+const MAP_PRIVATE: usize = 2;
 const SEEK_END: i32 = 2;
-const MAP_FAILED: *mut core::ffi::c_void = (-1isize) as *mut core::ffi::c_void;
+
+// fcntl command: write the fd's full path into a caller buffer (>= MAXPATHLEN).
+// Used to read the cwd, which has no public BSD syscall on macOS.
+const F_GETPATH: i32 = 50;
+const MAXPATHLEN: usize = 1024;
 
 // --- path semantics ---
 pub const SEP: char = '/';
@@ -56,107 +98,302 @@ pub fn to_native_path(s: &str) -> String {
     String::from(s)
 }
 
+// --- syscall instruction layer ---
+//
+// One macro per arity, cfg-gated per arch so exactly one set compiles. macOS
+// differs from Linux on both arches: errors are reported via the carry flag with a
+// *positive* errno, so each macro's `b.cc/jnc + neg` tail converts that into Linux's
+// convention (success unchanged, failure returns `-errno`) and the wrapper bodies
+// and shared-core `< 0` / null checks stay identical to the Linux backend. The
+// kernel does not preserve the argument registers across the trap, so every register
+// the instruction touches is declared as written (`inout(...) => _`), not just read;
+// declaring them as bare `in(...)` let the compiler assume a stale value survived the
+// call — a layout-dependent miscompile that corrupted, e.g., the mmap length.
+//
+// arm64: number in `x16` (not `x8`), instruction `svc #0x80`. x86_64: number in
+// `rax` OR'd with the BSD `SYSCALL_CLASS_UNIX` selector (0x2000000), instruction
+// `syscall` (which additionally clobbers `rcx` and `r11`), args in
+// rdi/rsi/rdx/r10/r8/r9. Inputs are widened to `i64` so a single register width
+// satisfies `inout`'s same-type requirement regardless of the caller's arg types;
+// the result is read back as `i64` and cast to the requested type.
+
+#[cfg(target_arch = "aarch64")]
+mod sc {
+    macro_rules! syscall_noreturn {
+        ($nr:expr, $a1:expr) => {
+            core::arch::asm!(
+                "svc #0x80",
+                in("x16") $nr as i64, in("x0") $a1 as i64, options(noreturn))
+        };
+    }
+    macro_rules! syscall_void {
+        ($nr:expr, $a1:expr) => {
+            core::arch::asm!(
+                "svc #0x80",
+                inout("x16") $nr as i64 => _, inout("x0") $a1 as i64 => _,
+                options(nostack))
+        };
+    }
+    macro_rules! syscall2 {
+        ($ty:ty; $nr:expr, $a1:expr, $a2:expr) => {{
+            let ret: i64;
+            core::arch::asm!(
+                "svc #0x80",
+                "b.cc 3f",
+                "neg x0, x0",
+                "3:",
+                inout("x16") $nr as i64 => _, inout("x0") $a1 as i64 => ret,
+                inout("x1") $a2 as i64 => _,
+                options(nostack));
+            ret as $ty
+        }};
+    }
+    macro_rules! syscall3 {
+        ($ty:ty; $nr:expr, $a1:expr, $a2:expr, $a3:expr) => {{
+            let ret: i64;
+            core::arch::asm!(
+                "svc #0x80",
+                "b.cc 3f",
+                "neg x0, x0",
+                "3:",
+                inout("x16") $nr as i64 => _, inout("x0") $a1 as i64 => ret,
+                inout("x1") $a2 as i64 => _, inout("x2") $a3 as i64 => _,
+                options(nostack));
+            ret as $ty
+        }};
+    }
+    macro_rules! syscall6 {
+        ($ty:ty; $nr:expr, $a1:expr, $a2:expr, $a3:expr, $a4:expr, $a5:expr, $a6:expr) => {{
+            let ret: i64;
+            core::arch::asm!(
+                "svc #0x80",
+                "b.cc 3f",
+                "neg x0, x0",
+                "3:",
+                inout("x16") $nr as i64 => _, inout("x0") $a1 as i64 => ret,
+                inout("x1") $a2 as i64 => _, inout("x2") $a3 as i64 => _,
+                inout("x3") $a4 as i64 => _, inout("x4") $a5 as i64 => _,
+                inout("x5") $a6 as i64 => _,
+                options(nostack));
+            ret as $ty
+        }};
+    }
+    pub(super) use {syscall2, syscall3, syscall6, syscall_noreturn, syscall_void};
+}
+
+// macOS x86_64: the BSD class selector is OR'd into the number, the `syscall`
+// instruction additionally clobbers rcx and r11, and the 4th argument goes in r10
+// (not rcx). Carry-clear (`jnc`) marks success; failure is negated to `-errno`.
+#[cfg(target_arch = "x86_64")]
+mod sc {
+    // BSD (unix) syscall class selector OR'd into the call number. Inlined as a plain
+    // expression (not a sibling macro) so it resolves at each syscall macro's call
+    // site, where a nested `macro_rules!` would be out of scope.
+    macro_rules! syscall_noreturn {
+        ($nr:expr, $a1:expr) => {
+            core::arch::asm!(
+                "syscall",
+                in("rax") (0x2000000i64 | ($nr as i64)), in("rdi") $a1 as i64,
+                options(noreturn))
+        };
+    }
+    macro_rules! syscall_void {
+        ($nr:expr, $a1:expr) => {
+            core::arch::asm!(
+                "syscall",
+                inout("rax") (0x2000000i64 | ($nr as i64)) => _, inout("rdi") $a1 as i64 => _,
+                lateout("rcx") _, lateout("r11") _, options(nostack))
+        };
+    }
+    macro_rules! syscall2 {
+        ($ty:ty; $nr:expr, $a1:expr, $a2:expr) => {{
+            let ret: i64;
+            core::arch::asm!(
+                "syscall",
+                "jnc 3f",
+                "neg rax",
+                "3:",
+                inout("rax") (0x2000000i64 | ($nr as i64)) => ret, inout("rdi") $a1 as i64 => _,
+                inout("rsi") $a2 as i64 => _,
+                lateout("rcx") _, lateout("r11") _, options(nostack));
+            ret as $ty
+        }};
+    }
+    macro_rules! syscall3 {
+        ($ty:ty; $nr:expr, $a1:expr, $a2:expr, $a3:expr) => {{
+            let ret: i64;
+            core::arch::asm!(
+                "syscall",
+                "jnc 3f",
+                "neg rax",
+                "3:",
+                inout("rax") (0x2000000i64 | ($nr as i64)) => ret, inout("rdi") $a1 as i64 => _,
+                inout("rsi") $a2 as i64 => _, inout("rdx") $a3 as i64 => _,
+                lateout("rcx") _, lateout("r11") _, options(nostack));
+            ret as $ty
+        }};
+    }
+    macro_rules! syscall6 {
+        ($ty:ty; $nr:expr, $a1:expr, $a2:expr, $a3:expr, $a4:expr, $a5:expr, $a6:expr) => {{
+            let ret: i64;
+            core::arch::asm!(
+                "syscall",
+                "jnc 3f",
+                "neg rax",
+                "3:",
+                inout("rax") (0x2000000i64 | ($nr as i64)) => ret, inout("rdi") $a1 as i64 => _,
+                inout("rsi") $a2 as i64 => _, inout("rdx") $a3 as i64 => _,
+                inout("r10") $a4 as i64 => _, inout("r8") $a5 as i64 => _,
+                inout("r9") $a6 as i64 => _,
+                lateout("rcx") _, lateout("r11") _, options(nostack));
+            ret as $ty
+        }};
+    }
+    pub(super) use {syscall2, syscall3, syscall6, syscall_noreturn, syscall_void};
+}
+
+use sc::*;
+
+// --- syscall wrappers ---
+pub fn exit(code: i32) -> ! {
+    unsafe { syscall_noreturn!(SYS_EXIT, code) }
+}
+
+fn write(fd: i32, buf: &[u8]) -> isize {
+    unsafe { syscall3!(isize; SYS_WRITE, fd, buf.as_ptr(), buf.len()) }
+}
+
+fn close(fd: i32) {
+    unsafe { syscall_void!(SYS_CLOSE, fd) }
+}
+
+// open(path, O_RDONLY). macOS has a plain `open` syscall (no openat needed).
+fn open(path: &[u8]) -> i32 {
+    unsafe { syscall3!(i32; SYS_OPEN, path.as_ptr(), O_RDONLY, 0) }
+}
+
+// Seek to the end of the file and return its size (lseek with SEEK_END). Negative
+// on error.
+fn lseek_end(fd: i32) -> i64 {
+    unsafe { syscall3!(i64; SYS_LSEEK, fd, 0i64, SEEK_END) }
+}
+
+// Memory-map `len` bytes of `fd` read-only (PROT_READ, MAP_PRIVATE, offset 0).
+// Null on error: the carry-flag conversion makes failures return a small negative
+// value, while valid user addresses are large and positive.
+fn mmap_read(fd: i32, len: usize) -> *const u8 {
+    let ret: isize =
+        unsafe { syscall6!(isize; SYS_MMAP, 0usize, len, PROT_READ, MAP_PRIVATE, fd, 0usize) };
+    if ret < 0 {
+        core::ptr::null()
+    } else {
+        ret as *const u8
+    }
+}
+
+// Check if a path exists using access() with F_OK (0).
+pub fn path_exists(path: &[u8]) -> bool {
+    unsafe { syscall2!(i32; SYS_ACCESS, path.as_ptr(), 0i32) == 0 }
+}
+
+fn fcntl(fd: i32, cmd: i32, arg: *mut u8) -> i32 {
+    unsafe { syscall3!(i32; SYS_FCNTL, fd, cmd, arg) }
+}
+
+fn execve(filename: *const u8, argv: *const *const u8, envp: *const *const u8) -> i32 {
+    unsafe { syscall3!(i32; SYS_EXECVE, filename, argv, envp) }
+}
+
 // --- primitives ---
 pub fn print(s: &[u8]) {
-    unsafe {
-        sys::write(STDOUT, s.as_ptr(), s.len());
-    }
+    write(STDOUT, s);
 }
 
-pub fn exit(code: i32) -> ! {
-    unsafe { sys::exit(code) }
-}
-
-pub fn path_exists(path: &[u8]) -> bool {
-    unsafe { sys::access(path.as_ptr(), 0) == 0 } // F_OK = 0
-}
-
-// Path used to launch this process, via _NSGetExecutablePath. This is the path
-// as exec'd (symlinks NOT resolved); it is absolutized separately. None on
-// failure.
-fn launch_path() -> Option<Vec<u8>> {
-    unsafe {
-        // First query the required buffer size, then read the NUL-terminated path.
-        let mut size: u32 = 0;
-        sys::_NSGetExecutablePath(core::ptr::null_mut(), &mut size);
-        if size == 0 {
-            return None;
-        }
-        let mut buf = vec![0u8; size as usize];
-        if sys::_NSGetExecutablePath(buf.as_mut_ptr(), &mut size) != 0 {
-            return None;
-        }
-        buf.truncate(cstr_len(&buf));
-        if buf.is_empty() {
-            None
-        } else {
-            Some(buf)
-        }
-    }
-}
-
-// Current working directory via getcwd(3), used to absolutize a relative launch
-// path. None on failure.
+// Current working directory, used to absolutize a relative launch path. macOS has
+// no public getcwd syscall, so open(".") and ask the kernel for its full path via
+// fcntl(F_GETPATH). Best-effort: None on failure.
 pub fn current_dir() -> Option<Vec<u8>> {
-    let mut buf = vec![0u8; 4096];
-    if unsafe { sys::getcwd(buf.as_mut_ptr(), buf.len()) }.is_null() {
+    let fd = open(b".\0");
+    if fd < 0 {
         return None;
     }
-    buf.truncate(cstr_len(&buf));
-    if buf.is_empty() {
-        None
-    } else {
-        Some(buf)
+    let mut buf = [0u8; MAXPATHLEN];
+    let rc = fcntl(fd, F_GETPATH, buf.as_mut_ptr());
+    close(fd);
+    if rc != 0 {
+        return None;
+    }
+    let len = cstr_len(&buf);
+    if len == 0 {
+        return None;
+    }
+    Some(buf[..len].to_vec())
+}
+
+// Memory-map the manifest file read-only. None on open/empty/mmap failure.
+pub fn load_manifest(path: &[u8]) -> Option<Manifest> {
+    let fd = open(path);
+    if fd < 0 {
+        return None;
+    }
+    let size = lseek_end(fd);
+    if size <= 0 {
+        close(fd);
+        return None;
+    }
+    let len = size as usize;
+    let ptr = mmap_read(fd, len);
+    // The mapping keeps its own reference to the file; the fd can be closed.
+    close(fd);
+    if ptr.is_null() {
+        return None;
+    }
+    // Leak the mapping: execve replaces the address space.
+    Some(unsafe { Manifest::from_mapping(ptr, len) })
+}
+
+// --- environment ---
+//
+// The kernel hands us `envp` at entry, so there is no need for the libc `environ`
+// global or /proc. The pointer array lives until execve replaces the address space.
+static mut ENVP: *const *const u8 = core::ptr::null();
+
+// Iterate the captured envp entries as byte slices.
+unsafe fn each_env(mut f: impl FnMut(&[u8])) {
+    let mut p = ENVP;
+    if p.is_null() {
+        return;
+    }
+    while !(*p).is_null() {
+        let entry_ptr = *p;
+        let mut len = 0;
+        while *entry_ptr.add(len) != 0 {
+            len += 1;
+            if len > 1048576 {
+                break;
+            }
+        }
+        f(core::slice::from_raw_parts(entry_ptr, len));
+        p = p.add(1);
     }
 }
 
-// Environment variable lookup via the libc `environ` pointer.
+// Environment variable lookup over the captured envp array.
 pub fn get_env_var(name: &[u8]) -> Option<String> {
+    let mut found: Option<String> = None;
     unsafe {
-        let mut env_ptr = sys::environ;
-        while !(*env_ptr).is_null() {
-            let entry_ptr = *env_ptr;
-            let mut len = 0;
-            while *entry_ptr.add(len) != 0 {
-                len += 1;
-                if len > 1048576 {
-                    break;
-                }
+        each_env(|entry| {
+            if found.is_some() {
+                return;
             }
-            let entry = core::slice::from_raw_parts(entry_ptr, len);
             if let Some(eq_pos) = entry.iter().position(|&b| b == b'=') {
                 if &entry[..eq_pos] == name {
-                    return String::from_utf8(entry[eq_pos + 1..].to_vec()).ok();
+                    found = String::from_utf8(entry[eq_pos + 1..].to_vec()).ok();
                 }
             }
-            env_ptr = env_ptr.add(1);
-        }
+        });
     }
-    None
-}
-
-// Memory-map the manifest file read-only. Returns None on open/empty/mmap failure.
-pub fn load_manifest(path: &[u8]) -> Option<Manifest> {
-    unsafe {
-        let fd = sys::open(path.as_ptr(), O_RDONLY);
-        if fd < 0 {
-            return None;
-        }
-        let size = sys::lseek(fd, 0, SEEK_END);
-        if size <= 0 {
-            sys::close(fd);
-            return None;
-        }
-        let len = size as usize;
-        let addr = sys::mmap(core::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, fd, 0);
-        // The mapping keeps its own reference to the file; the fd can be closed.
-        sys::close(fd);
-        if addr == MAP_FAILED || addr.is_null() {
-            return None;
-        }
-        // Leak the mapping: execve replaces the address space.
-        Some(Manifest::from_mapping(addr as *const u8, len))
-    }
+    found
 }
 
 // Build modified environment with runfiles variables, returning (data, pointers).
@@ -187,17 +424,7 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> (Vec<u8>, Vec<*const u
 
     // Copy existing environment, filtering out the runfiles vars we just set.
     unsafe {
-        let mut env_ptr = sys::environ;
-        while !(*env_ptr).is_null() {
-            let entry_ptr = *env_ptr;
-            let mut len = 0;
-            while *entry_ptr.add(len) != 0 {
-                len += 1;
-                if len > 1048576 {
-                    break;
-                }
-            }
-            let entry = core::slice::from_raw_parts(entry_ptr, len);
+        each_env(|entry| {
             let should_skip = entry.starts_with(b"RUNFILES_MANIFEST_FILE=")
                 || entry.starts_with(b"RUNFILES_DIR=")
                 || entry.starts_with(b"JAVA_RUNFILES=");
@@ -207,8 +434,7 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> (Vec<u8>, Vec<*const u
                 env_data.push(0);
                 env_ptrs.push(start_pos as *const u8);
             }
-            env_ptr = env_ptr.add(1);
-        }
+        });
     }
 
     // Fix up offsets to real addresses now that env_data won't move.
@@ -222,17 +448,57 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> (Vec<u8>, Vec<*const u
     (env_data, env_ptrs)
 }
 
+// Copy the captured envp into a fresh pointer array (terminated by NULL), for the
+// no-export path.
+unsafe fn clone_environ() -> Vec<*const u8> {
+    let mut ptrs = Vec::new();
+    let mut p = ENVP;
+    if !p.is_null() {
+        while !(*p).is_null() {
+            ptrs.push(*p);
+            p = p.add(1);
+        }
+    }
+    ptrs.push(core::ptr::null());
+    ptrs
+}
+
 // --- runtime args & launch ---
 pub struct RuntimeArgs {
-    argc: i32,
+    argc: usize,
     argv: *const *const u8,
+    // Pointer to the "executable_path=..." entry from the apple[] array, or null.
+    apple0: *const u8,
 }
 
 impl RuntimeArgs {
-    /// Absolute path of the launching executable (`_NSGetExecutablePath`, made
-    /// absolute), for runfiles self-location. Independent of argv[0].
+    /// Absolute path of the launching executable, from the kernel-provided
+    /// `apple[0]` ("executable_path=<path>") made absolute, for runfiles
+    /// self-location. Independent of argv[0].
     pub fn executable_path(&self) -> Option<Vec<u8>> {
-        launch_path().map(crate::common::absolutize)
+        if self.apple0.is_null() {
+            return None;
+        }
+        // Read the NUL-terminated "executable_path=<path>" string.
+        let mut len = 0;
+        unsafe {
+            while *self.apple0.add(len) != 0 {
+                len += 1;
+                if len > 1048576 {
+                    return None;
+                }
+            }
+        }
+        let entry = unsafe { core::slice::from_raw_parts(self.apple0, len) };
+        const PREFIX: &[u8] = b"executable_path=";
+        if !entry.starts_with(PREFIX) {
+            return None;
+        }
+        let path = &entry[PREFIX.len()..];
+        if path.is_empty() {
+            return None;
+        }
+        Some(crate::common::absolutize(path.to_vec()))
     }
 }
 
@@ -241,7 +507,7 @@ pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
         // Collect runtime args [1..] as NUL-terminated copies.
         let mut runtime: Vec<Vec<u8>> = Vec::new();
         if rt.argc > 1 {
-            for i in 1..rt.argc as usize {
+            for i in 1..rt.argc {
                 let p = *rt.argv.add(i);
                 let mut len = 0;
                 while *p.add(len) != 0 {
@@ -266,7 +532,7 @@ pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
         ptrs.push(core::ptr::null());
 
         // The program to execute is the fully-resolved arg0; argv[0] may be overridden
-        // with the runfiles-relative path (must read program before overwriting ptrs[0]).
+        // with the runfiles-relative path (read program before overwriting ptrs[0]).
         let program = launch.resolved[0].as_ptr();
         if let Some(override0) = launch.argv0_override {
             ptrs[0] = override0.as_ptr();
@@ -276,30 +542,48 @@ pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
         let (_env_data, env_ptrs) = if launch.export_env {
             build_runfiles_environ(launch.runfiles)
         } else {
-            let mut p = Vec::new();
-            let mut e = sys::environ;
-            while !(*e).is_null() {
-                p.push(*e);
-                e = e.add(1);
-            }
-            p.push(core::ptr::null());
-            (Vec::new(), p)
+            (Vec::new(), clone_environ())
         };
 
-        let ret = sys::execve(program, ptrs.as_ptr(), env_ptrs.as_ptr());
+        let ret = execve(program, ptrs.as_ptr(), env_ptrs.as_ptr());
 
-        // execve only returns on failure; libc sets errno (reachable via __error()).
-        let errno = *sys::__error();
-        print(b"ERROR: execve failed with errno ");
-        print_number(errno as usize);
-        print(b" (return code ");
-        print_number((-ret) as usize);
-        print(b")\n");
+        // execve only returns on failure.
+        print(b"ERROR: execve failed with code ");
+        let digit = if ret < 0 {
+            print(b"-");
+            (-ret) as u8 + b'0'
+        } else {
+            ret as u8 + b'0'
+        };
+        print(&[digit]);
+        print(b"\n");
         exit(1);
     }
 }
 
+// Entry point. dyld invokes the LC_MAIN entry as a C `main`, passing
+// argc/argv/envp/apple in the first four argument registers on both arm64 and
+// x86_64. We capture envp and apple[0] into globals/args and hand off to the shared
+// core. Returning a value here is fine — but the core never returns (it execve's or
+// exit's).
 #[no_mangle]
-pub extern "C" fn main(argc: i32, argv: *const *const u8) -> ! {
-    crate::run::main(RuntimeArgs { argc, argv })
+pub extern "C" fn main(
+    argc: i32,
+    argv: *const *const u8,
+    envp: *const *const u8,
+    apple: *const *const u8,
+) -> i32 {
+    unsafe {
+        ENVP = envp;
+        let apple0 = if apple.is_null() {
+            core::ptr::null()
+        } else {
+            *apple
+        };
+        crate::run::main(RuntimeArgs {
+            argc: argc as usize,
+            argv,
+            apple0,
+        })
+    }
 }
