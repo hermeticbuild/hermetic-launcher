@@ -13,6 +13,7 @@ register_toolchains("//launcher/private/prebuilt:all")
 # Only dev dependencies below this line
 
 bazel_dep(name = "bazel_lib", version = "3.2.2", dev_dependency = True)
+bazel_dep(name = "rules_shell", version = "0.8.0", dev_dependency = True)
 bazel_dep(name = "rules_cc", version = "0.2.18", dev_dependency = True)
 bazel_dep(name = "rules_platform", version = "0.1.0", dev_dependency = True)
 bazel_dep(name = "rules_rs", version = "0.0.77", dev_dependency = True)
