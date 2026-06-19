@@ -226,6 +226,17 @@ impl RunfilesSetup {
         Ok(())
     }
 
+    /// Append raw `<source> <target>` manifest lines after the normal entries.
+    /// Used to inject relative (symlink-style) targets that Bazel emits for
+    /// unresolved symlinks, which `add_file`'s absolute entries can't represent.
+    fn append_manifest_lines(&self, lines: &[(&str, &str)]) -> std::io::Result<()> {
+        let mut file = fs::OpenOptions::new().append(true).open(&self.manifest_path)?;
+        for (source, target) in lines {
+            writeln!(file, "{} {}", source, target)?;
+        }
+        Ok(())
+    }
+
     /// Get the absolute path for an rlocation path
     fn get_path(&self, rlocation_path: &str) -> Option<&PathBuf> {
         self.entries.get(rlocation_path)
@@ -859,6 +870,80 @@ fn test_run_runfiles_discovery(config: &TestConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Regression test: manifest entries with relative (symlink-style) targets.
+///
+/// Bazel writes an unresolved symlink's `readlink` target into the manifest
+/// verbatim, so a manifest target can be relative — interpreted, like any symlink
+/// target, relative to the directory of its own key. aspect_rules_py's venv chains
+/// these: the entrypoint `bin/python` is a relative symlink to a sibling
+/// `bin/python3`, which is itself a relative symlink up to the real interpreter.
+/// The launcher must resolve such relative targets (re-looking-up each hop) rather
+/// than feeding the raw `../../..` string to execve.
+/// See https://github.com/lucidsoftware/rules_py_hermetic_launcher_repro.
+fn test_relative_manifest_symlinks(config: &TestConfig) -> Result<(), String> {
+    println!("  Running test: relative_manifest_symlinks");
+
+    let test_dir = config.work_dir.join("test_relative_symlinks");
+    fs::create_dir_all(&test_dir).map_err(|e| format!("Failed to create test dir: {}", e))?;
+
+    let mut runfiles = RunfilesSetup::new(&test_dir, "relsym_stub")
+        .map_err(|e| format!("Failed to create runfiles: {}", e))?;
+
+    // The real interpreter lives in a separate (canonical) repo directory and is
+    // listed with an absolute target, exactly as Bazel does for the interpreter.
+    let add_binary = config.test_binaries_dir.join(format!("add-numbers{}", EXE_EXT));
+    let interp_rlocation = format!("interpreter_repo/bin/add-numbers{}", EXE_EXT);
+    runfiles
+        .add_file(&interp_rlocation, &add_binary)
+        .map_err(|e| format!("Failed to add interpreter: {}", e))?;
+
+    runfiles
+        .write_manifest()
+        .map_err(|e| format!("Failed to write manifest: {}", e))?;
+
+    // Two relative-target hops, mirroring the venv interpreter shim chain. The
+    // finalized entrypoint is `python`; resolution must follow both hops:
+    //   _main/venv/bin/python  -> python3                                  (sibling)
+    //   _main/venv/bin/python3 -> ../../../interpreter_repo/bin/add-numbers (up to repo)
+    // landing on the absolute interpreter entry written above. The three `..`
+    // segments pop the three key dirs (_main, venv, bin) back to the runfiles root.
+    let entry_key = format!("{}/venv/bin/python", WORKSPACE_NAME);
+    let sibling_key = format!("{}/venv/bin/python3", WORKSPACE_NAME);
+    runfiles
+        .append_manifest_lines(&[
+            // python -> sibling python3 (relative, single component)
+            (&entry_key, "python3"),
+            // python3 -> up three dirs into the interpreter repo (relative, with ..)
+            (
+                &sibling_key,
+                &format!("../../../interpreter_repo/bin/add-numbers{}", EXE_EXT),
+            ),
+        ])
+        .map_err(|e| format!("Failed to append relative entries: {}", e))?;
+
+    // Finalize a stub whose entrypoint is the chained relative symlink `python`.
+    let stub_path = test_dir.join(format!("relsym_stub{}", EXE_EXT));
+    finalize_stub(config, &stub_path, &[&entry_key, "21", "21"], &[0])?;
+
+    // Manifest mode is the path that fed execve the raw "../../.." string before
+    // the fix; this must now resolve through both hops to the real interpreter.
+    let (stdout, stderr, exit_code) = run_stub(&stub_path, &runfiles, &[], true)?;
+    if exit_code != 0 {
+        return Err(format!(
+            "Relative-symlink stub failed with exit code {} (relative manifest target \
+             fed to execve unresolved).\nstdout: {}\nstderr: {}",
+            exit_code, stdout, stderr
+        ));
+    }
+    if !stdout.contains("SUM:42") {
+        return Err(format!("Unexpected output: {}. Expected 'SUM:42'", stdout));
+    }
+
+    println!("    PASS (two relative-target hops, manifest mode)");
+
+    Ok(())
+}
+
 /// Test: print-env to verify environment and argument passing
 fn test_print_env(config: &TestConfig) -> Result<(), String> {
     println!("  Running test: print_env");
@@ -1069,6 +1154,7 @@ fn main() -> ExitCode {
         ("fallback_runfiles_dir", test_fallback_runfiles_dir),
         ("fallback_runfiles_manifest", test_fallback_runfiles_manifest),
         ("run_runfiles_discovery", test_run_runfiles_discovery),
+        ("relative_manifest_symlinks", test_relative_manifest_symlinks),
         ("print_env", test_print_env),
         ("large_manifest", test_large_manifest),
     ];
