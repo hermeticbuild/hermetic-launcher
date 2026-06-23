@@ -42,8 +42,9 @@ config_setting(
 
 # The released artifacts for the host platform: the runfiles-stub template and the
 # finalizer, each already platform-transitioned and run through the optimization
-# pipeline (the exact bytes a release ships). The integration test exercises these
-# end to end instead of a separately-transitioned, unoptimized build.
+# pipeline. CI runs the integration test with --config=release because the platform
+# transition does not set Rust optimization or LTO; both are part of the shipped
+# binary contract.
 alias(
     name = "release-template",
     actual = select({

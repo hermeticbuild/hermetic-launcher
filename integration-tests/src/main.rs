@@ -782,10 +782,9 @@ fn test_fallback_runfiles_manifest(config: &TestConfig) -> Result<(), String> {
 
 /// Regression test: runfiles discovery under `bazel run` semantics.
 ///
-/// argv[0] is not guaranteed to be a reliable, absolute path that points at the
-/// executable. Instead, it may be relative (and it may be completely fake).
-/// The stub should use reliable, operating-system specific APIs to find it's own
-/// path and not rely on argv[0] at all.
+/// Both the path used to launch the executable and argv[0] may be relative;
+/// argv[0] may also be completely fake. The stub should use reliable,
+/// operating-system specific APIs to find its own path and not rely on argv[0].
 ///
 /// `bazel test` masks the bug because it pre-sets RUNFILES_DIR, and the other
 /// fallback tests above invoke the stub by its *absolute* path, so neither
@@ -829,24 +828,50 @@ fn test_run_runfiles_discovery(config: &TestConfig) -> Result<(), String> {
         // The working directory `bazel run` leaves us in: inside the runfiles tree.
         let cwd_inside_runfiles = runfiles_dir.join(WORKSPACE_NAME);
 
-        // Exec the stub by its absolute path (so the OS can self-locate the running
-        // binary) but with a *relative* argv[0], exactly as `bazel run` does.
-        let mut cmd = Command::new(&stub_path);
+        // Execute the release artifact itself by a relative path, not merely
+        // with a relative argv[0]. This covers the optimized macOS stub's cwd
+        // lookup while retaining the argv[0] shape used by `bazel run`.
+        let relative_stub_path = PathBuf::from("../..").join(&stub_name);
+        let mut cmd = Command::new(&relative_stub_path);
         cmd.arg0(format!("bazel-bin/{}", stub_name));
         cmd.current_dir(&cwd_inside_runfiles);
         cmd.env_remove("RUNFILES_DIR");
         cmd.env_remove("RUNFILES_MANIFEST_FILE");
         cmd.env_remove("JAVA_RUNFILES");
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
 
-        let output = cmd.output().map_err(|e| format!("Failed to run stub: {}", e))?;
+        let mut child = cmd.spawn().map_err(|e| format!("Failed to run stub: {}", e))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if child
+                .try_wait()
+                .map_err(|e| format!("Failed to wait for stub: {}", e))?
+                .is_some()
+            {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "Stub timed out when executed by relative path {}",
+                    relative_stub_path.display()
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|e| format!("Failed to collect stub output: {}", e))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let exit_code = output.status.code().unwrap_or(-1);
 
         if exit_code != 0 {
             return Err(format!(
-                "Stub failed with exit code {} (rules_py #1113 regression: relative argv[0] \
-                 + cwd inside the runfiles tree).\nstdout: {}\nstderr: {}",
+                "Stub failed with exit code {} (rules_py #1113 regression: relative executable \
+                 and argv[0] with cwd inside the runfiles tree).\nstdout: {}\nstderr: {}",
                 exit_code, stdout, stderr
             ));
         }
@@ -854,7 +879,7 @@ fn test_run_runfiles_discovery(config: &TestConfig) -> Result<(), String> {
             return Err(format!("Unexpected output: {}. Expected 'SUM:15'", stdout));
         }
 
-        println!("    PASS (relative argv[0], cwd inside runfiles)");
+        println!("    PASS (relative executable and argv[0], cwd inside runfiles)");
     }
 
     #[cfg(not(unix))]

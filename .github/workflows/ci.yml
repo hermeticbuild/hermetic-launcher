@@ -152,7 +152,7 @@ jobs:
           fi
       - env:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
-        run: bazel test ${BUILDBUDDY_API_KEY:+--config=remote} //integration-tests:integration_test
+        run: bazel test ${BUILDBUDDY_API_KEY:+--config=remote} --config=release //integration-tests:integration_test
       - env:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         run: bazel test ${BUILDBUDDY_API_KEY:+--config=cache} //...
@@ -179,7 +179,7 @@ jobs:
           fi
       - env:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
-        run: bazel test ${BUILDBUDDY_API_KEY:+--config=cache} //integration-tests:integration_test
+        run: bazel test ${BUILDBUDDY_API_KEY:+--config=cache} --config=release //integration-tests:integration_test
       - env:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         run: bazel test ${BUILDBUDDY_API_KEY:+--config=cache} //...
@@ -209,7 +209,7 @@ jobs:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         run: |
           $config = if ($env:BUILDBUDDY_API_KEY) { "--config=cache" } else { $null }
-          bazel --output_user_root=C:/b test $config //integration-tests:integration_test
+          bazel --output_user_root=C:/b test $config --config=release //integration-tests:integration_test
       - env:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         run: |
