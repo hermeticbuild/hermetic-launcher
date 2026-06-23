@@ -18,7 +18,6 @@ type HANDLE = *mut core::ffi::c_void;
 type LPVOID = *mut core::ffi::c_void;
 
 const INVALID_HANDLE_VALUE: HANDLE = -1isize as HANDLE;
-const INVALID_FILE_ATTRIBUTES: DWORD = 0xFFFFFFFF;
 const STD_OUTPUT_HANDLE: DWORD = 0xFFFFFFF5u32;
 const GENERIC_READ: DWORD = 0x80000000;
 const OPEN_EXISTING: DWORD = 3;
@@ -29,6 +28,9 @@ const ERROR_INSUFFICIENT_BUFFER: DWORD = 122;
 
 // File sharing and memory-mapping parameters (for the runfiles manifest)
 const FILE_SHARE_READ: DWORD = 0x00000001;
+const FILE_SHARE_WRITE: DWORD = 0x00000002;
+const FILE_SHARE_DELETE: DWORD = 0x00000004;
+const FILE_FLAG_BACKUP_SEMANTICS: DWORD = 0x02000000;
 const PAGE_READONLY: DWORD = 0x02;
 const FILE_MAP_READ: DWORD = 0x04;
 
@@ -86,7 +88,6 @@ extern "system" {
         dwFlagsAndAttributes: DWORD,
         hTemplateFile: HANDLE,
     ) -> HANDLE;
-    fn GetFileAttributesW(lpFileName: *const u16) -> DWORD;
     fn GetFileSizeEx(hFile: HANDLE, lpFileSize: *mut i64) -> BOOL;
     fn CreateFileMappingW(
         hFile: HANDLE,
@@ -161,7 +162,27 @@ pub fn exit(code: i32) -> ! {
 
 fn wide_path_exists(path: &[u16]) -> bool {
     let api_path = crate::native_path::windows_api_path(path);
-    unsafe { GetFileAttributesW(api_path.as_ptr()) != INVALID_FILE_ATTRIBUTES }
+    unsafe {
+        // Follow reparse points so a dangling symlink does not suppress an
+        // executable-relative fallback. Zero desired access avoids imposing
+        // read permissions; backup semantics permits directory candidates.
+        // https://learn.microsoft.com/windows/win32/fileio/symbolic-link-effects-on-file-systems-functions
+        let handle = CreateFileW(
+            api_path.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            core::ptr::null_mut(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            core::ptr::null_mut(),
+        );
+        if handle == INVALID_HANDLE_VALUE {
+            false
+        } else {
+            CloseHandle(handle);
+            true
+        }
+    }
 }
 
 pub fn utf8_path_exists(path: &str) -> bool {

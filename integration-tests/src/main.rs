@@ -1166,6 +1166,19 @@ fn test_executable_fallback_selection(config: &TestConfig) -> Result<(), String>
         format!("{} {}\n", key, test_dir.join("missing-primary").display()),
     )
     .map_err(|e| format!("Failed to write stale manifest: {}", e))?;
+    let dangling_primary = test_dir.join("dangling-primary");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(test_dir.join("missing-primary"), &dangling_primary)
+        .map_err(|e| format!("Failed to create dangling primary symlink: {}", e))?;
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(test_dir.join("missing-primary"), &dangling_primary)
+        .map_err(|e| format!("Failed to create dangling primary symlink: {}", e))?;
+    let dangling_manifest = test_dir.join("dangling.runfiles_manifest");
+    fs::write(
+        &dangling_manifest,
+        format!("{} {}\n", key, dangling_primary.display()),
+    )
+    .map_err(|e| format!("Failed to write dangling manifest: {}", e))?;
     let cases = [
         ("stale RUNFILES_DIR", None, fallback_argv0.as_str()),
         (
@@ -1176,6 +1189,11 @@ fn test_executable_fallback_selection(config: &TestConfig) -> Result<(), String>
         (
             "stale manifest target",
             Some(("RUNFILES_MANIFEST_FILE", stale_manifest.as_path())),
+            fallback_argv0.as_str(),
+        ),
+        (
+            "dangling manifest symlink",
+            Some(("RUNFILES_MANIFEST_FILE", dangling_manifest.as_path())),
             fallback_argv0.as_str(),
         ),
         (
