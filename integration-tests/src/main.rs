@@ -402,13 +402,32 @@ fn run_successful_stub(command: &mut Command, context: &str) -> Result<String, S
     Ok(stdout)
 }
 
+#[cfg(windows)]
+fn windows_paths_equal(left: &str, right: &str) -> bool {
+    let normalize = |path: &str| {
+        let path = if let Some(rest) = path.strip_prefix("\\\\?\\UNC\\") {
+            format!("\\\\{rest}")
+        } else if let Some(rest) = path.strip_prefix("\\\\?\\") {
+            rest.to_string()
+        } else {
+            path.to_string()
+        };
+        path.replace('/', "\\")
+    };
+    normalize(left).eq_ignore_ascii_case(&normalize(right))
+}
+
 fn assert_argv0(stdout: &str, expected: &str, context: &str) -> Result<(), String> {
     let actual = stdout
         .lines()
         .next()
         .and_then(|line| line.strip_prefix("ARGS:"))
         .and_then(|args| args.split('|').next());
-    if actual != Some(expected) {
+    #[cfg(windows)]
+    let matches = actual.map_or(false, |actual| windows_paths_equal(actual, expected));
+    #[cfg(not(windows))]
+    let matches = actual == Some(expected);
+    if !matches {
         return Err(format!(
             "{} selected the wrong executable path\nexpected argv0: {}\nstdout: {}",
             context, expected, stdout
@@ -1461,21 +1480,22 @@ fn test_windows_extended_paths(config: &TestConfig) -> Result<(), String> {
     println!("  Running test: windows_extended_paths");
 
     let test_dir = config.work_dir.join("test_windows_extended_paths");
-    let stub_dir = test_dir
-        .join(format!("launcher-東京-{}", "a".repeat(180)))
+    let stub_dir = test_dir.join("launcher-東京");
+    let target_dir = stub_dir
+        .join(format!("targets-{}", "a".repeat(180)))
         .join(format!("nested-{}", "b".repeat(100)));
     fs::create_dir_all(&stub_dir)
-        .map_err(|e| format!("Failed to create long launcher directory: {}", e))?;
-    if stub_dir.as_os_str().encode_wide().count() <= 260 {
-        return Err(format!(
-            "Windows extended-path fixture did not exceed MAX_PATH: {}",
-            stub_dir.display()
-        ));
-    }
+        .map_err(|e| format!("Failed to create launcher directory: {}", e))?;
 
     let source_binary = config.test_binaries_dir.join("print-env.exe");
-    let fallback_binary = stub_dir.join("fallback-東京").join("print-env.exe");
-    let primary_binary = stub_dir.join("primary-主要").join("print-env.exe");
+    let fallback_binary = target_dir.join("fallback-東京").join("print-env.exe");
+    let primary_binary = target_dir.join("primary-主要").join("print-env.exe");
+    if fallback_binary.as_os_str().encode_wide().count() <= 260 {
+        return Err(format!(
+            "Windows extended-path fixture did not exceed MAX_PATH: {}",
+            fallback_binary.display()
+        ));
+    }
     for destination in [&fallback_binary, &primary_binary] {
         fs::create_dir_all(destination.parent().unwrap())
             .map_err(|e| format!("Failed to create {}: {}", destination.display(), e))?;
@@ -1490,15 +1510,8 @@ fn test_windows_extended_paths(config: &TestConfig) -> Result<(), String> {
             .and_then(|line| line.strip_prefix("ARGS:"))
             .and_then(|args| args.split('|').next())
             .ok_or_else(|| format!("{} did not print argv[0]\nstdout: {}", context, stdout))?;
-        let actual = if let Some(rest) = actual.strip_prefix("\\\\?\\UNC\\") {
-            format!("\\\\{rest}")
-        } else if let Some(rest) = actual.strip_prefix("\\\\?\\") {
-            rest.to_string()
-        } else {
-            actual.to_string()
-        };
         let expected = expected.to_string_lossy();
-        if !actual.eq_ignore_ascii_case(&expected) {
+        if !windows_paths_equal(actual, &expected) {
             return Err(format!(
                 "{} selected the wrong long path\nexpected argv0: {}\nactual argv0: {}\nstdout: {}",
                 context, expected, actual, stdout
@@ -1507,13 +1520,21 @@ fn test_windows_extended_paths(config: &TestConfig) -> Result<(), String> {
         Ok(())
     };
 
+    let target_relative = target_dir
+        .strip_prefix(&stub_dir)
+        .map_err(|e| format!("Failed to relativize long target directory: {}", e))?;
+    let fallback_arg = target_relative
+        .join("fallback-東京")
+        .join("print-env.exe")
+        .to_string_lossy()
+        .replace('\\', "/");
     let fallback_stub = stub_dir.join("fallback-stub.exe");
     finalize_stub_with_fallbacks(
         config,
         &fallback_stub,
         &["_main/missing-long-primary.exe"],
         &[0],
-        &[(0, "fallback-東京/print-env.exe")],
+        &[(0, &fallback_arg)],
         false,
     )?;
     let mut fallback_command = Command::new(&fallback_stub);
@@ -1538,7 +1559,7 @@ fn test_windows_extended_paths(config: &TestConfig) -> Result<(), String> {
         &manifest_stub,
         &[key],
         &[0],
-        &[(0, "fallback-東京/print-env.exe")],
+        &[(0, &fallback_arg)],
         false,
     )?;
     let mut manifest_command = Command::new(&manifest_stub);
