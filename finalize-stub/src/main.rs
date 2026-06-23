@@ -35,6 +35,10 @@ struct Cli {
     #[arg(long, action = ArgAction::Append, value_delimiter = ',', value_parser = clap::value_parser!(u32).range(0..10))]
     transform: Vec<u32>,
 
+    /// Executable-relative fallback for a transformed argument, encoded as N=PATH. Repeatable; each argument may have at most one fallback.
+    #[arg(long, action = ArgAction::Append, value_name = "N=PATH")]
+    fallback: Vec<String>,
+
     /// Export runfiles environment variables (RUNFILES_DIR, RUNFILES_MANIFEST_FILE, JAVA_RUNFILES) to the executed process
     #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
     export_runfiles_env: bool,
@@ -92,7 +96,15 @@ fn replace_at(data: &mut [u8], offset: usize, new_value: &[u8], fixed_size: usiz
     Ok(())
 }
 
-fn finalize_stub(template_path: &str, output_path: Option<&str>, argv: &[String], transform_flags: u32, export_runfiles_env: bool, verbose: bool) -> Result<(), String> {
+fn is_target_portably_absolute(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    let windows_drive_qualified = bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':';
+    path.starts_with('/') || path.starts_with('\\') || windows_drive_qualified
+}
+
+fn finalize_stub(template_path: &str, output_path: Option<&str>, argv: &[String], transform_flags: u32, fallbacks: &[(usize, String)], export_runfiles_env: bool, verbose: bool) -> Result<(), String> {
     if argv.is_empty() {
         return Err("At least one argument (argv[0]) is required".to_string());
     }
@@ -140,11 +152,24 @@ fn finalize_stub(template_path: &str, output_path: Option<&str>, argv: &[String]
         eprintln!("Replaced TRANSFORM_FLAGS with: {} (0b{:b})", flags_str, transform_flags);
     }
 
-    // Find and replace EXPORT_RUNFILES_ENV
-    let export_pattern = b"@@RUNFILES_EXPORT_ENV@@";
-    let export_pos = find_pattern(&data, export_pattern)
-        .ok_or("EXPORT_RUNFILES_ENV placeholder not found in template")?;
-
+    // V2 uses the existing export slot as a capability marker, so it does not
+    // enlarge the template. V1 templates retain their existing export option,
+    // but cannot carry fallback metadata that their runtime would ignore.
+    let export_v2_pattern = b"@@RUNFILES_EXPORT_ENV@@V2";
+    let export_v1_pattern = b"@@RUNFILES_EXPORT_ENV@@";
+    let (export_pos, is_v2) = if let Some(pos) = find_pattern(&data, export_v2_pattern) {
+        (pos, true)
+    } else if let Some(pos) = find_pattern(&data, export_v1_pattern) {
+        (pos, false)
+    } else {
+        return Err("EXPORT_RUNFILES_ENV placeholder not found in template".to_string());
+    };
+    if !fallbacks.is_empty() && !is_v2 {
+        return Err(
+            "template does not support executable-relative fallbacks; use a V2 runfiles stub template"
+                .to_string(),
+        );
+    }
     let export_str = if export_runfiles_env { "1" } else { "0" };
     replace_at(&mut data, export_pos, export_str.as_bytes(), 32)?;
 
@@ -166,9 +191,28 @@ fn finalize_stub(template_path: &str, output_path: Option<&str>, argv: &[String]
     // Now do the replacements
     for (i, arg) in argv.iter().enumerate() {
         let arg_pos = arg_positions[i];
-        replace_at(&mut data, arg_pos, arg.as_bytes(), ARG_SIZE)?;
+        let fallback = fallbacks
+            .iter()
+            .find_map(|(index, path)| (*index == i).then_some(path));
+        let mut encoded_arg = Vec::from(arg.as_bytes());
+        if let Some(fallback) = fallback {
+            encoded_arg.push(0);
+            encoded_arg.extend_from_slice(fallback.as_bytes());
+        }
+        if encoded_arg.len() > ARG_SIZE {
+            return Err(format!(
+                "ARG{} and its fallback require {} bytes; maximum combined size is {} bytes",
+                i,
+                encoded_arg.len(),
+                ARG_SIZE,
+            ));
+        }
+        replace_at(&mut data, arg_pos, &encoded_arg, ARG_SIZE)?;
         if verbose {
             eprintln!("Replaced ARG{} with: {}", i, arg);
+            if let Some(fallback) = fallback {
+                eprintln!("Embedded fallback for ARG{}: {}", i, fallback);
+            }
         }
     }
 
@@ -288,7 +332,67 @@ fn main() {
         flags
     };
 
-    match finalize_stub(&cli.template, cli.output.as_deref(), &cli.args, transform_flags, cli.export_runfiles_env, cli.verbose) {
+    let fallbacks = (|| -> Result<Vec<(usize, String)>, String> {
+        let mut seen = 0u32;
+        let mut fallbacks = Vec::new();
+        for value in &cli.fallback {
+            let (index, path) = value
+                .split_once('=')
+                .ok_or_else(|| format!("invalid fallback {:?}; expected N=PATH", value))?;
+            let index: usize = index
+                .parse()
+                .map_err(|_| format!("invalid fallback argument index {:?}", index))?;
+            if index >= 10 {
+                return Err(format!(
+                    "fallback argument index {} exceeds the maximum index 9",
+                    index
+                ));
+            }
+            if index >= cli.args.len() {
+                return Err(format!(
+                    "fallback argument index {} is outside the {} embedded arguments",
+                    index,
+                    cli.args.len()
+                ));
+            }
+            if transform_flags & (1 << index) == 0 {
+                return Err(format!(
+                    "fallback argument {} is not marked for runfiles transformation",
+                    index
+                ));
+            }
+            if is_target_portably_absolute(&cli.args[index]) {
+                return Err(format!(
+                    "fallback argument {} cannot be attached to absolute embedded argument {:?}",
+                    index, cli.args[index]
+                ));
+            }
+            if path.is_empty() {
+                return Err(format!("fallback argument {} has an empty path", index));
+            }
+            if is_target_portably_absolute(path) {
+                return Err(format!(
+                    "fallback argument {} path {:?} must be executable-relative",
+                    index, path
+                ));
+            }
+            if seen & (1 << index) != 0 {
+                return Err(format!("fallback argument {} is declared more than once", index));
+            }
+            seen |= 1 << index;
+            fallbacks.push((index, path.to_owned()));
+        }
+        Ok(fallbacks)
+    })();
+    let fallbacks = match fallbacks {
+        Ok(fallbacks) => fallbacks,
+        Err(error) => {
+            eprintln!("Error: {}", error);
+            process::exit(1);
+        }
+    };
+
+    match finalize_stub(&cli.template, cli.output.as_deref(), &cli.args, transform_flags, &fallbacks, cli.export_runfiles_env, cli.verbose) {
         Ok(()) => {
             if cli.verbose {
                 if let Some(output) = cli.output {

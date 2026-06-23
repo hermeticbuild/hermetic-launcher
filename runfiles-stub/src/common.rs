@@ -17,6 +17,11 @@ pub fn cstr_len(s: &[u8]) -> usize {
 /// returned unchanged; a relative one is joined onto the current working
 /// directory. Best-effort: if the cwd is unavailable, the path is returned as-is.
 pub fn absolutize(path: Vec<u8>) -> Vec<u8> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if crate::native_path::unix_path_is_absolute(&path) {
+        return path;
+    }
+    #[cfg(target_os = "windows")]
     if let Ok(s) = core::str::from_utf8(&path) {
         if platform::is_absolute(s) {
             return path;

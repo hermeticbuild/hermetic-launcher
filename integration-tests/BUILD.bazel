@@ -57,6 +57,17 @@ alias(
 )
 
 alias(
+    name = "published-v1-template",
+    actual = select({
+        ":linux_x86_64": "@v1_compat_20260619_runfiles_stub_x86_64_linux//file",
+        ":linux_aarch64": "@v1_compat_20260619_runfiles_stub_aarch64_linux//file",
+        ":macos_x86_64": "@v1_compat_20260619_runfiles_stub_x86_64_macos//file",
+        ":macos_aarch64": "@v1_compat_20260619_runfiles_stub_aarch64_macos//file",
+        ":windows": "@v1_compat_20260619_runfiles_stub_x86_64_windows//file",
+    }),
+)
+
+alias(
     name = "release-finalizer",
     actual = select({
         ":linux_x86_64": "//finalize-stub:finalize-stub_x86_64-unknown-linux-musl",
@@ -64,6 +75,17 @@ alias(
         ":macos_x86_64": "//finalize-stub:finalize-stub_x86_64-apple-darwin",
         ":macos_aarch64": "//finalize-stub:finalize-stub_aarch64-apple-darwin",
         ":windows": "//finalize-stub:finalize-stub_x86_64-pc-windows-gnullvm",
+    }),
+)
+
+alias(
+    name = "published-v1-finalizer",
+    actual = select({
+        ":linux_x86_64": "@v1_compat_20260619_finalize_stub_x86_64_linux//file",
+        ":linux_aarch64": "@v1_compat_20260619_finalize_stub_aarch64_linux//file",
+        ":macos_x86_64": "@v1_compat_20260619_finalize_stub_x86_64_macos//file",
+        ":macos_aarch64": "@v1_compat_20260619_finalize_stub_aarch64_macos//file",
+        ":windows": "@v1_compat_20260619_finalize_stub_x86_64_windows//file",
     }),
 )
 
@@ -99,6 +121,12 @@ rust_binary(
     edition = "2021",
 )
 
+rust_binary(
+    name = "print-opaque-argv",
+    srcs = ["src/bin/print_opaque_argv.rs"],
+    edition = "2021",
+)
+
 copy_to_directory(
     name = "test-binaries",
     srcs = [
@@ -107,6 +135,7 @@ copy_to_directory(
         ":merge-json",
         ":orchestrator",
         ":print-env",
+        ":print-opaque-argv",
     ],
 )
 
@@ -118,10 +147,16 @@ rust_test(
         "$(rlocationpath :release-template)",
         "--finalizer",
         "$(rlocationpath :release-finalizer)",
+        "--v1-template",
+        "$(rlocationpath :published-v1-template)",
+        "--v1-finalizer",
+        "$(rlocationpath :published-v1-finalizer)",
         "--test-binaries",
         "$(rlocationpath :test-binaries)",
     ],
     data = [
+        ":published-v1-finalizer",
+        ":published-v1-template",
         ":release-finalizer",
         ":release-template",
         ":test-binaries",

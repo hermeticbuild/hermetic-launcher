@@ -21,7 +21,7 @@ macro_rules! define_placeholders {
 
         #[used]
         #[link_section = $section]
-        static mut EXPORT_RUNFILES_ENV: [u8; 32] = *b"@@RUNFILES_EXPORT_ENV@@\0\0\0\0\0\0\0\0\0";
+        static mut EXPORT_RUNFILES_ENV: [u8; 32] = *b"@@RUNFILES_EXPORT_ENV@@V2\0\0\0\0\0\0\0";
 
         // The ten argument placeholders as one contiguous 2D array rather than ten
         // separate statics. `arg()` indexes it with pointer arithmetic, which lowers
@@ -30,7 +30,8 @@ macro_rules! define_placeholders {
         // arm64 macOS) that table needs load-time rebasing — which would force a
         // writable, file-backed `__DATA` page back into existence. The bytes on disk
         // (2560 contiguous '@') are identical either way, so the finalizer's
-        // 256-byte-run scan is unaffected.
+        // 256-byte-run scan is unaffected. A fallback, when present, follows
+        // the argument's terminating NUL in the same slot.
         #[used]
         #[link_section = $section]
         static mut ARGS: [[u8; ARG_SIZE]; 10] = [[b'@'; ARG_SIZE]; 10];
@@ -72,6 +73,14 @@ pub fn arg(i: usize) -> &'static [u8] {
     let base = core::ptr::addr_of!(ARGS) as *const u8;
     let ptr = unsafe { base.add(idx * ARG_SIZE) };
     read(ptr, ARG_SIZE)
+}
+
+pub fn fallback(i: usize) -> &'static [u8] {
+    let arg = arg(i);
+    match arg.iter().position(|byte| *byte == 0) {
+        Some(arg_len) if arg_len + 1 < arg.len() => &arg[arg_len + 1..],
+        _ => &[],
+    }
 }
 
 /// True if the placeholder still holds its unpatched template value.

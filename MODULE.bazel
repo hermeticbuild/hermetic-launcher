@@ -12,6 +12,25 @@ register_toolchains("//launcher/private/prebuilt:all")
 
 # Only dev dependencies below this line
 
+v1_compatibility_repositories = use_extension(
+    "//integration-tests:v1_compatibility_repositories.bzl",
+    "v1_compatibility_repositories",
+    dev_dependency = True,
+)
+use_repo(
+    v1_compatibility_repositories,
+    "v1_compat_20260619_finalize_stub_aarch64_linux",
+    "v1_compat_20260619_finalize_stub_aarch64_macos",
+    "v1_compat_20260619_finalize_stub_x86_64_linux",
+    "v1_compat_20260619_finalize_stub_x86_64_macos",
+    "v1_compat_20260619_finalize_stub_x86_64_windows",
+    "v1_compat_20260619_runfiles_stub_aarch64_linux",
+    "v1_compat_20260619_runfiles_stub_aarch64_macos",
+    "v1_compat_20260619_runfiles_stub_x86_64_linux",
+    "v1_compat_20260619_runfiles_stub_x86_64_macos",
+    "v1_compat_20260619_runfiles_stub_x86_64_windows",
+)
+
 bazel_dep(name = "bazel_lib", version = "3.2.2", dev_dependency = True)
 bazel_dep(name = "rules_shell", version = "0.8.0", dev_dependency = True)
 bazel_dep(name = "rules_cc", version = "0.2.18", dev_dependency = True)

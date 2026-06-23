@@ -136,13 +136,17 @@ finalize-stub --template <PATH> [OPTIONS] -- <arg0> [arg1 ...]
 -o, --output <PATH>              Output path (default: stdout; chmod +x on Unix)
     --transform <N>              Mark embedded arg N (0–9) for runfiles resolution.
                                  Repeatable or comma-separated. Default: none.
+    --fallback <N=PATH>          Fall back to PATH relative to the launcher for transformed
+                                 arg N. Repeatable; at most one fallback per argument.
     --export-runfiles-env <B>    Export RUNFILES_DIR/RUNFILES_MANIFEST_FILE/JAVA_RUNFILES
-                                 to the child (default: true)
+                                 to the child. False preserves inherited values (default: true)
 -v, --verbose                    Verbose output
 ```
 
-Up to 10 embedded arguments (`arg0`–`arg9`), each ≤ 256 bytes. `arg0` is the program to
-execute; the rest are its leading arguments. Runtime arguments are unrestricted.
+Up to 10 embedded arguments (`arg0`–`arg9`), each ≤ 256 bytes. For a fallback-enabled
+argument, the argument, a NUL separator, and its fallback share that 256-byte slot.
+`arg0` is the program to execute; the rest are its leading arguments. Runtime arguments
+are limited only by the target operating system's process invocation constraints.
 
 ### Runfiles discovery
 
@@ -154,9 +158,34 @@ At startup the finalized launcher locates runfiles in this order:
 4. `<executable>.runfiles/`
 
 Each argument marked `--transform` is resolved through runfiles (manifest lookup or
-directory join; tree-artifact prefixes supported). Absolute paths (leading `/`) pass
-through unchanged. The launcher then appends its own runtime arguments and replaces
-itself with the target.
+directory join; tree-artifact prefixes supported). Without a fallback, absolute paths
+(leading `/`) pass through unchanged. The launcher then appends its own runtime
+arguments and replaces itself with the target.
+
+For an argument with `--fallback N=PATH`, the runfiles result wins only when it
+exists. Otherwise the launcher joins `PATH` to the parent of its OS-reported
+executable path, converts separators for the target platform, and requires the
+result to exist. The join preserves `..` components and does not depend on the
+current working directory. Unix uses the path through which the launcher was
+invoked, including a symlinked directory. Windows uses the physical image path
+reported by `QueryFullProcessImageNameW`. Before Windows filesystem and process
+APIs consume an absolute DOS or UNC path, the launcher normalizes it to
+`\\?\C:\...` or `\\?\UNC\server\share\...` form. This avoids `MAX_PATH`
+without depending on host policy or an application manifest; the complete child
+command line remains subject to the `CreateProcessW` length limit. A fallback can
+only accompany a relative embedded runfiles path; absolute embedded paths retain
+their pass-through semantics. A missing runfiles tree is allowed when at least
+one argument is transformed and every transformed argument has a fallback. With
+no transformed arguments, the default environment export still requires
+runfiles.
+
+With `--export-runfiles-env=true`, a runfiles context used by the launch replaces
+the child's inherited runfiles variables. If at least one fallback is selected
+and no transformed argument resolves through runfiles, the launcher removes
+those inherited variables rather than exporting an unrelated context. With
+`--export-runfiles-env=false`, the child inherits the variables unchanged.
+Fallbacks require a V2 template. V1 custom templates retain their existing
+`--export-runfiles-env` behavior.
 
 ---
 
@@ -165,21 +194,23 @@ itself with the target.
 ```
 runfiles-stub (template)           finalize-stub                  launcher
 ┌────────────────────────┐         patches placeholders:         ┌──────────────────────┐
-│ argc / flags / arg0..N │  ──────▶  argc, transform bitmask,  ─▶│ same size, runs the  │
-│   = placeholder bytes  │           export flag, arg values     │ embedded program     │
+│ argc / flags / arg0..N │  ──────▶  argc, transform flags,    ─▶│ same size, runs the  │
+│   = placeholder bytes  │           args + in-slot fallbacks     │ embedded program     │
 └────────────────────────┘                                       └──────────────────────┘
 ```
 
 The finalizer scans the template for fixed-size placeholder byte patterns and
-overwrites them in place — argument count, a bitmask of which args to resolve, the
-export-env flag, and the argument strings. Output size equals input size, and the
-result is identical regardless of which host produced it.
+overwrites them in place — argument count, the runfiles-resolution bitmask, the
+export-env flag, and argument strings. A fallback follows its argument's terminating
+NUL in the same fixed-size slot; that nonempty suffix is the sole record that the
+argument has a fallback. Output size equals template size, and the result is identical
+regardless of which host produced it.
 
 | OS | Arches | Entry | Syscall layer | Process exec | Notes |
 |----|--------|-------|---------------|--------------|-------|
 | Linux | x86_64, aarch64, s390x | custom `_start` | raw syscalls, no libc | `execve` | fully static (musl), zero deps |
 | macOS | x86_64, aarch64 | `main` | libSystem | `execve` | finalizer re-signs ad-hoc (patching invalidates the Mach-O signature) |
-| Windows | x86_64, aarch64 | `main` | Win32 (UTF-16) | `CreateProcessW` + wait | converts `/` → `\` |
+| Windows | x86_64, aarch64 | `main` | Win32 (UTF-16) | `CreateProcessW` + wait | verbatim DOS/UNC API paths |
 
 The stubs are `no_std` Rust with a static-arena allocator. Patched Mach-O binaries are
 re-signed automatically by the finalizer.

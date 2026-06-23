@@ -23,6 +23,7 @@ fn panic(_info: &PanicInfo) -> ! {
 
 mod allocator;
 mod common;
+mod native_path;
 mod placeholders;
 mod run;
 mod runfiles;

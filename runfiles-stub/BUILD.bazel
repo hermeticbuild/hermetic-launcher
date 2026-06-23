@@ -1,3 +1,4 @@
+load("@rules_rust//rust:defs.bzl", "rust_test")
 load("//:defs.bzl", "rust_release_binary")
 
 rust_release_binary(
@@ -22,4 +23,13 @@ rust_release_binary(
         ],
         "//conditions:default": [],
     }),
+)
+
+rust_test(
+    name = "native_path_test",
+    srcs = [
+        "src/native_path.rs",
+        "tests/native_path_test.rs",
+    ],
+    edition = "2021",
 )

@@ -82,12 +82,7 @@ impl Runfiles {
 
                 // Try <executable>.runfiles directory
                 let runfiles_dir = String::from(exe_str) + ".runfiles";
-
-                // Add null terminator for the existence check
-                let mut dir_with_null = Vec::from(runfiles_dir.as_bytes());
-                dir_with_null.push(0);
-
-                if platform::path_exists(&dir_with_null) {
+                if path_exists(&runfiles_dir) {
                     return Some(Self {
                         mode: RunfilesMode::DirectoryBased(runfiles_dir.clone()),
                         manifest_path: None,
@@ -119,6 +114,10 @@ impl Runfiles {
             }
         }
     }
+}
+
+pub(crate) fn path_exists(path: &str) -> bool {
+    platform::utf8_path_exists(path)
 }
 
 /// Maximum number of relative manifest hops to follow before giving up. Bazel

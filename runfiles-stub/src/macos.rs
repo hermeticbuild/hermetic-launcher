@@ -10,7 +10,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::common::{cstr_len, Manifest};
-use crate::run::Launch;
+use crate::run::{Launch, ResolvedArg};
 use crate::runfiles::Runfiles;
 
 // Compiler intrinsics. Provided in-tree because we own the entry point and make no
@@ -301,6 +301,24 @@ pub fn path_exists(path: &[u8]) -> bool {
     unsafe { syscall2!(i32; SYS_ACCESS, path.as_ptr(), 0i32) == 0 }
 }
 
+pub fn utf8_path_exists(path: &str) -> bool {
+    let mut terminated = Vec::from(path.as_bytes());
+    terminated.push(0);
+    path_exists(&terminated)
+}
+
+pub fn executable_relative(executable: &[u8], fallback: &str) -> Option<ResolvedArg> {
+    crate::native_path::unix_executable_relative(executable, fallback.as_bytes())
+        .map(ResolvedArg::Bytes)
+}
+
+pub fn resolved_arg_exists(arg: &ResolvedArg) -> bool {
+    let ResolvedArg::Bytes(path) = arg;
+    let mut terminated = path.clone();
+    terminated.push(0);
+    path_exists(&terminated)
+}
+
 fn fcntl(fd: i32, cmd: i32, arg: *mut u8) -> i32 {
     unsafe { syscall3!(i32; SYS_FCNTL, fd, cmd, arg) }
 }
@@ -427,7 +445,7 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> (Vec<u8>, Vec<*const u
         }
     }
 
-    // Copy existing environment, filtering out the runfiles vars we just set.
+    // Copy the existing environment without inherited runfiles variables.
     unsafe {
         each_env(|entry| {
             let should_skip = entry.starts_with(b"RUNFILES_MANIFEST_FILE=")
@@ -505,6 +523,10 @@ impl RuntimeArgs {
         }
         Some(crate::common::absolutize(path.to_vec()))
     }
+
+    pub fn fallback_executable_path(&self) -> Option<Vec<u8>> {
+        self.executable_path()
+    }
 }
 
 pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
@@ -529,7 +551,8 @@ pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
         // Build the argv pointer array: embedded resolved + runtime + NULL.
         let mut ptrs: Vec<*const u8> = Vec::with_capacity(launch.resolved.len() + runtime.len() + 1);
         for a in launch.resolved {
-            ptrs.push(a.as_ptr());
+            let ResolvedArg::Bytes(bytes) = a;
+            ptrs.push(bytes.as_ptr());
         }
         for a in &runtime {
             ptrs.push(a.as_ptr());
@@ -538,14 +561,15 @@ pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
 
         // The program to execute is the fully-resolved arg0; argv[0] may be overridden
         // with the runfiles-relative path (read program before overwriting ptrs[0]).
-        let program = launch.resolved[0].as_ptr();
+        let ResolvedArg::Bytes(program) = &launch.resolved[0];
+        let program = program.as_ptr();
         if let Some(override0) = launch.argv0_override {
             ptrs[0] = override0.as_ptr();
         }
 
         // Build the environment.
-        let (_env_data, env_ptrs) = if launch.export_env {
-            build_runfiles_environ(launch.runfiles)
+        let (_env_data, env_ptrs) = if launch.export_runfiles_env {
+            build_runfiles_environ(launch.child_runfiles)
         } else {
             (Vec::new(), clone_environ())
         };

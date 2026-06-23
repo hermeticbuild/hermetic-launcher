@@ -7,7 +7,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::common::Manifest;
-use crate::run::Launch;
+use crate::run::{Launch, ResolvedArg};
 use crate::runfiles::Runfiles;
 
 // Compiler intrinsics and glibc-compat symbols. These are needed because we link
@@ -343,6 +343,24 @@ pub fn path_exists(path: &[u8]) -> bool {
     }
 }
 
+pub fn utf8_path_exists(path: &str) -> bool {
+    let mut terminated = Vec::from(path.as_bytes());
+    terminated.push(0);
+    path_exists(&terminated)
+}
+
+pub fn executable_relative(executable: &[u8], fallback: &str) -> Option<ResolvedArg> {
+    crate::native_path::unix_executable_relative(executable, fallback.as_bytes())
+        .map(ResolvedArg::Bytes)
+}
+
+pub fn resolved_arg_exists(arg: &ResolvedArg) -> bool {
+    let ResolvedArg::Bytes(path) = arg;
+    let mut terminated = path.clone();
+    terminated.push(0);
+    path_exists(&terminated)
+}
+
 // getcwd(2) into `buf`. Returns the number of bytes written (including the
 // trailing NUL) on success, or a negative value on error.
 fn getcwd(buf: &mut [u8]) -> isize {
@@ -474,12 +492,7 @@ fn read_environ() -> (Vec<u8>, Vec<*const u8>) {
 
 // Build modified environment with runfiles variables; pointers point into data.
 fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> (Vec<u8>, Vec<*const u8>) {
-    let (base_data, base_ptrs) = read_environ();
-
-    let rf = match runfiles {
-        Some(r) => r,
-        None => return (base_data, base_ptrs),
-    };
+    let (base_data, _) = read_environ();
 
     let mut env_data = Vec::new();
     let mut env_ptrs = Vec::new();
@@ -493,15 +506,17 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> (Vec<u8>, Vec<*const u
         ptrs.push(start_pos as *const u8);
     };
 
-    if let Some(ref path) = rf.manifest_path {
-        add_env_var(&mut env_data, &mut env_ptrs, b"RUNFILES_MANIFEST_FILE", path);
-    }
-    if let Some(ref path) = rf.dir_path {
-        add_env_var(&mut env_data, &mut env_ptrs, b"RUNFILES_DIR", path);
-        add_env_var(&mut env_data, &mut env_ptrs, b"JAVA_RUNFILES", path);
+    if let Some(rf) = runfiles {
+        if let Some(ref path) = rf.manifest_path {
+            add_env_var(&mut env_data, &mut env_ptrs, b"RUNFILES_MANIFEST_FILE", path);
+        }
+        if let Some(ref path) = rf.dir_path {
+            add_env_var(&mut env_data, &mut env_ptrs, b"RUNFILES_DIR", path);
+            add_env_var(&mut env_data, &mut env_ptrs, b"JAVA_RUNFILES", path);
+        }
     }
 
-    // Copy existing environment (skip runfiles vars we're setting).
+    // Copy the existing environment without inherited runfiles variables.
     for env_entry in base_data.split(|&b| b == 0) {
         if env_entry.is_empty() {
             continue;
@@ -558,6 +573,10 @@ impl RuntimeArgs {
         let raw = unsafe { core::slice::from_raw_parts(self.execfn, len) }.to_vec();
         Some(crate::common::absolutize(raw))
     }
+
+    pub fn fallback_executable_path(&self) -> Option<Vec<u8>> {
+        self.executable_path()
+    }
 }
 
 pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
@@ -583,7 +602,8 @@ pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
     // Build the argv pointer array: embedded resolved + runtime + NULL.
     let mut ptrs: Vec<*const u8> = Vec::with_capacity(launch.resolved.len() + runtime.len() + 1);
     for a in launch.resolved {
-        ptrs.push(a.as_ptr());
+        let ResolvedArg::Bytes(bytes) = a;
+        ptrs.push(bytes.as_ptr());
     }
     for a in &runtime {
         ptrs.push(a.as_ptr());
@@ -592,13 +612,14 @@ pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
 
     // The program to execute is the fully-resolved arg0; argv[0] may be overridden
     // with the runfiles-relative path (read program before overwriting ptrs[0]).
-    let program = launch.resolved[0].as_ptr();
+    let ResolvedArg::Bytes(program) = &launch.resolved[0];
+    let program = program.as_ptr();
     if let Some(override0) = launch.argv0_override {
         ptrs[0] = override0.as_ptr();
     }
 
-    let (_env_data, env_ptrs) = if launch.export_env {
-        build_runfiles_environ(launch.runfiles)
+    let (_env_data, env_ptrs) = if launch.export_runfiles_env {
+        build_runfiles_environ(launch.child_runfiles)
     } else {
         read_environ()
     };
