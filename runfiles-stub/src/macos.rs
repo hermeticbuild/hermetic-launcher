@@ -36,10 +36,15 @@ pub unsafe extern "C" fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
     s
 }
 
-// ld64 references `_bzero` for zero-fills; route it through memset.
+// Optimized Darwin codegen emits bzero for zero-fills. Use volatile writes so
+// LLVM cannot replace this implementation with a recursive call to bzero.
 #[no_mangle]
 pub unsafe extern "C" fn bzero(s: *mut u8, n: usize) {
-    memset(s, 0, n);
+    let mut i = 0;
+    while i < n {
+        core::ptr::write_volatile(s.add(i), 0);
+        i += 1;
+    }
 }
 
 #[no_mangle]
