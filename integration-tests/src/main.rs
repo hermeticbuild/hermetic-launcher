@@ -1365,20 +1365,26 @@ fn test_executable_fallback_selection(config: &TestConfig) -> Result<(), String>
         "transformed absolute executable with runfiles",
     )?;
 
-    // A valid but unrelated context must not leak into a child selected through
-    // executable-relative fallback. A nested launcher would otherwise mistake
-    // this manifest for its own runfiles and disable usable physical paths.
+    // A context that resolves a data argument must not leak into a child selected
+    // through executable-relative fallback. A nested launcher would otherwise
+    // mistake this manifest for its own runfiles and disable usable physical paths.
     let child_manifest = test_dir.join("child-東京.runfiles_manifest");
+    let child_data_key = format!("{}/child-only", WORKSPACE_NAME);
     fs::write(
         &child_manifest,
-        format!(
-            "{}/child-only {}\n",
-            WORKSPACE_NAME,
-            print_env_binary.display()
-        ),
+        format!("{} {}\n", child_data_key, print_env_binary.display()),
     )
     .map_err(|e| format!("Failed to write child-only manifest: {}", e))?;
-    let mut child_manifest_command = Command::new(&exporting_stub);
+    let mixed_source_stub = stub_dir.join(format!("mixed-source-stub{}", EXE_EXT));
+    finalize_stub_with_fallbacks(
+        config,
+        &mixed_source_stub,
+        &[&key, &child_data_key],
+        &[0, 1],
+        &[(0, &fallback_arg)],
+        true,
+    )?;
+    let mut child_manifest_command = Command::new(&mixed_source_stub);
     child_manifest_command
         .env_clear()
         .env("RUNFILES_MANIFEST_FILE", &child_manifest);
@@ -1402,7 +1408,7 @@ fn test_executable_fallback_selection(config: &TestConfig) -> Result<(), String>
     )?;
 
     println!(
-        "    PASS (Unicode path, inherited no-export env, fallback export, primary runfile, and unrelated-manifest scrub)"
+        "    PASS (Unicode path, inherited no-export env, fallback export, primary runfile, and mixed-source scrub)"
     );
     Ok(())
 }

@@ -147,6 +147,7 @@ pub fn main(rt: platform::RuntimeArgs) -> ! {
     // Resolve each embedded argument (NUL-terminated). resolved[0] is the program.
     let mut resolved: Vec<ResolvedArg> = Vec::with_capacity(argc);
     let mut arg0_from_runfiles = false;
+    let mut arg0_fallback_selected = false;
     let mut any_arg_from_runfiles = false;
     let mut any_fallback_selected = false;
     for i in 0..argc {
@@ -192,6 +193,9 @@ pub fn main(rt: platform::RuntimeArgs) -> ! {
                 // child and obscure why fallback resolution failed.
                 match fallback_path.filter(platform::resolved_arg_exists) {
                     Some(path) => {
+                        if i == 0 {
+                            arg0_fallback_selected = true;
+                        }
                         any_fallback_selected = true;
                         path
                     }
@@ -251,7 +255,11 @@ pub fn main(rt: platform::RuntimeArgs) -> ! {
         resolved: &resolved,
         argv0_override: argv0_override.as_deref(),
         export_runfiles_env,
-        child_runfiles: if export_runfiles_env && (!any_fallback_selected || any_arg_from_runfiles)
+        // Data arguments can come from the parent runfiles without making that
+        // context belong to an executable selected by adjacent fallback.
+        child_runfiles: if export_runfiles_env
+            && !arg0_fallback_selected
+            && (!any_fallback_selected || any_arg_from_runfiles)
         {
             runfiles.as_ref()
         } else {
