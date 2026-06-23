@@ -24,6 +24,8 @@ pub struct Launch<'a> {
     pub argv0_override: Option<&'a [u8]>,
     pub runfiles: Option<&'a Runfiles>,
     pub export_env: bool,
+    /// NUL-separated UTF-8 environment variable names to remove before launch.
+    pub unset_environment: &'a [u8],
 }
 
 /// Print `msg` followed by the platform newline.
@@ -88,6 +90,16 @@ pub fn main(rt: platform::RuntimeArgs) -> ! {
         export_str[0] != b'0'
     } else {
         true
+    };
+
+    // An untouched placeholder means an older finalizer produced this executable.
+    // Trim only trailing padding; internal NULs separate variable names.
+    let unset_environment = placeholders::unset_environment();
+    let unset_environment = if unset_environment.starts_with(b"@@RUNFILES_UNSET_ENV=@@") {
+        &[][..]
+    } else {
+        let len = unset_environment.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+        &unset_environment[..len]
     };
 
     // Decide whether runfiles are needed at all.
@@ -163,6 +175,7 @@ pub fn main(rt: platform::RuntimeArgs) -> ! {
         argv0_override: argv0_override.as_deref(),
         runfiles: runfiles.as_ref(),
         export_env: export_runfiles_env,
+        unset_environment,
     };
     platform::launch(&launch, &rt)
 }

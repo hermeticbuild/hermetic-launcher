@@ -8,6 +8,20 @@
 // template bytes into the code, so the patched values are actually read at runtime.
 
 pub const ARG_SIZE: usize = 256;
+pub const UNSET_ENV_SIZE: usize = 256;
+
+const fn unset_env_placeholder() -> [u8; UNSET_ENV_SIZE] {
+    // '=' cannot occur in a finalized environment variable name, so no valid
+    // payload can be mistaken for this unpatched marker.
+    const MARKER: &[u8] = b"@@RUNFILES_UNSET_ENV=@@";
+    let mut placeholder = [0; UNSET_ENV_SIZE];
+    let mut i = 0;
+    while i < MARKER.len() {
+        placeholder[i] = MARKER[i];
+        i += 1;
+    }
+    placeholder
+}
 
 macro_rules! define_placeholders {
     ($section:literal) => {
@@ -22,6 +36,10 @@ macro_rules! define_placeholders {
         #[used]
         #[link_section = $section]
         static mut EXPORT_RUNFILES_ENV: [u8; 32] = *b"@@RUNFILES_EXPORT_ENV@@\0\0\0\0\0\0\0\0\0";
+
+        #[used]
+        #[link_section = $section]
+        static mut UNSET_ENVIRONMENT: [u8; UNSET_ENV_SIZE] = unset_env_placeholder();
 
         // The ten argument placeholders as one contiguous 2D array rather than ten
         // separate statics. `arg()` indexes it with pointer arithmetic, which lowers
@@ -62,6 +80,9 @@ pub fn transform_flags() -> &'static [u8] {
 }
 pub fn export_runfiles_env() -> &'static [u8] {
     read(core::ptr::addr_of!(EXPORT_RUNFILES_ENV) as *const u8, 32)
+}
+pub fn unset_environment() -> &'static [u8] {
+    read(core::ptr::addr_of!(UNSET_ENVIRONMENT) as *const u8, UNSET_ENV_SIZE)
 }
 
 pub fn arg(i: usize) -> &'static [u8] {

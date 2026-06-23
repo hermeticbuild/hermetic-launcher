@@ -91,7 +91,7 @@ def _impl(ctx):
 | `append_embedded_arg(arg, …)` | Append a literal string argument. |
 | `append_raw_transformed_arg(arg, …)` | Append a string argument marked for resolution. |
 | `to_rlocation_path(file)` | Convert a `File` to its rlocation path string. |
-| `compile_stub(ctx, embedded_args, transformed_args, output_file, cfg, template_exec_group, template_file)` | Run the finalizer to emit the launcher. `cfg` is `"target"` (default) or `"exec"`. |
+| `compile_stub(ctx, embedded_args, transformed_args, output_file, cfg, template_exec_group, template_file, export_runfiles_env, environment_variables_to_unset)` | Run the finalizer to emit the launcher. `cfg` is `"target"` (default) or `"exec"`. Runfiles environment export defaults to true; `environment_variables_to_unset` removes named variables before launch. |
 
 Declare the relevant toolchains on your rule:
 
@@ -138,11 +138,16 @@ finalize-stub --template <PATH> [OPTIONS] -- <arg0> [arg1 ...]
                                  Repeatable or comma-separated. Default: none.
     --export-runfiles-env <B>    Export RUNFILES_DIR/RUNFILES_MANIFEST_FILE/JAVA_RUNFILES
                                  to the child (default: true)
+    --unset-env <NAME>           Remove NAME from the child environment. Repeatable.
 -v, --verbose                    Verbose output
 ```
 
 Up to 10 embedded arguments (`arg0`–`arg9`), each ≤ 256 bytes. `arg0` is the program to
 execute; the rest are its leading arguments. Runtime arguments are unrestricted.
+Environment variable names occupy at most 256 bytes in total, including NUL separators.
+Names must be nonempty and cannot contain `=`. They compare case-sensitively on Unix and
+case-insensitively on Windows. Explicit removal wins over `--export-runfiles-env`,
+including for the three runfiles variables.
 
 ### Runfiles discovery
 

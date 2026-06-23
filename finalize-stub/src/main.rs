@@ -7,6 +7,7 @@ use std::process;
 
 const ARG_SIZE: usize = 256;
 const ARGC_SIZE: usize = 32;
+const UNSET_ENV_SIZE: usize = 256;
 
 /// Finalize a runfiles stub template with actual arguments
 #[derive(Parser)]
@@ -38,6 +39,10 @@ struct Cli {
     /// Export runfiles environment variables (RUNFILES_DIR, RUNFILES_MANIFEST_FILE, JAVA_RUNFILES) to the executed process
     #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
     export_runfiles_env: bool,
+
+    /// Environment variable names to remove before starting the executed process
+    #[arg(long = "unset-env", action = ArgAction::Append, allow_hyphen_values = true)]
+    unset_environment: Vec<String>,
 
     /// Enable verbose output
     #[arg(short, long)]
@@ -92,13 +97,33 @@ fn replace_at(data: &mut [u8], offset: usize, new_value: &[u8], fixed_size: usiz
     Ok(())
 }
 
-fn finalize_stub(template_path: &str, output_path: Option<&str>, argv: &[String], transform_flags: u32, export_runfiles_env: bool, verbose: bool) -> Result<(), String> {
+fn finalize_stub(template_path: &str, output_path: Option<&str>, argv: &[String], transform_flags: u32, export_runfiles_env: bool, unset_environment: &[String], verbose: bool) -> Result<(), String> {
     if argv.is_empty() {
         return Err("At least one argument (argv[0]) is required".to_string());
     }
 
     if argv.len() > 10 {
         return Err("Maximum 10 arguments supported (argv[0] to argv[9])".to_string());
+    }
+
+    let mut unset_environment_data = Vec::new();
+    for name in unset_environment {
+        if name.is_empty() {
+            return Err("Environment variable name to unset cannot be empty".to_string());
+        }
+        if name.as_bytes().contains(&b'=') {
+            return Err(format!("Environment variable name to unset cannot contain '=': {name}"));
+        }
+        if !unset_environment_data.is_empty() {
+            unset_environment_data.push(0);
+        }
+        unset_environment_data.extend_from_slice(name.as_bytes());
+        if unset_environment_data.len() > UNSET_ENV_SIZE {
+            return Err(format!(
+                "Environment variable names to unset require {} bytes; maximum is {} bytes",
+                unset_environment_data.len(), UNSET_ENV_SIZE
+            ));
+        }
     }
 
     // Prevent overwriting the input file
@@ -150,6 +175,21 @@ fn finalize_stub(template_path: &str, output_path: Option<&str>, argv: &[String]
 
     if verbose {
         eprintln!("Replaced EXPORT_RUNFILES_ENV with: {}", export_str);
+    }
+
+    // Preserve compatibility with older templates when no environment names are
+    // requested. A nonempty list requires the corresponding runtime capability.
+    if !unset_environment_data.is_empty() {
+        const UNSET_MARKER: &[u8] = b"@@RUNFILES_UNSET_ENV=@@";
+        let mut unset_pattern = [0; UNSET_ENV_SIZE];
+        unset_pattern[..UNSET_MARKER.len()].copy_from_slice(UNSET_MARKER);
+        let unset_pos = find_pattern(&data, &unset_pattern)
+            .ok_or("UNSET_ENVIRONMENT placeholder not found; template does not support --unset-env")?;
+        replace_at(&mut data, unset_pos, &unset_environment_data, UNSET_ENV_SIZE)?;
+
+        if verbose {
+            eprintln!("Embedded {} environment variable name(s) to unset", unset_environment.len());
+        }
     }
 
     // Find and replace ARG placeholders
@@ -288,7 +328,7 @@ fn main() {
         flags
     };
 
-    match finalize_stub(&cli.template, cli.output.as_deref(), &cli.args, transform_flags, cli.export_runfiles_env, cli.verbose) {
+    match finalize_stub(&cli.template, cli.output.as_deref(), &cli.args, transform_flags, cli.export_runfiles_env, &cli.unset_environment, cli.verbose) {
         Ok(()) => {
             if cli.verbose {
                 if let Some(output) = cli.output {

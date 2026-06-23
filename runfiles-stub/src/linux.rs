@@ -472,17 +472,16 @@ fn read_environ() -> (Vec<u8>, Vec<*const u8>) {
     (environ_data, env_ptrs)
 }
 
-// Build modified environment with runfiles variables; pointers point into data.
-fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> (Vec<u8>, Vec<*const u8>) {
-    let (base_data, base_ptrs) = read_environ();
-
-    let rf = match runfiles {
-        Some(r) => r,
-        None => return (base_data, base_ptrs),
-    };
-
+// Build a filtered environment, optionally replacing the runfiles variables;
+// pointers point into data.
+fn build_environ(runfiles: Option<&Runfiles>, export_runfiles_env: bool, unset_environment: &[u8]) -> (Vec<u8>, Vec<*const u8>) {
+    let (base_data, _) = read_environ();
     let mut env_data = Vec::new();
     let mut env_ptrs = Vec::new();
+
+    let is_unset = |name: &[u8]| {
+        unset_environment.split(|&b| b == 0).any(|candidate| !candidate.is_empty() && candidate == name)
+    };
 
     let add_env_var = |data: &mut Vec<u8>, ptrs: &mut Vec<*const u8>, name: &[u8], value: &str| {
         let start_pos = data.len();
@@ -493,23 +492,34 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> (Vec<u8>, Vec<*const u
         ptrs.push(start_pos as *const u8);
     };
 
-    if let Some(ref path) = rf.manifest_path {
-        add_env_var(&mut env_data, &mut env_ptrs, b"RUNFILES_MANIFEST_FILE", path);
-    }
-    if let Some(ref path) = rf.dir_path {
-        add_env_var(&mut env_data, &mut env_ptrs, b"RUNFILES_DIR", path);
-        add_env_var(&mut env_data, &mut env_ptrs, b"JAVA_RUNFILES", path);
+    if export_runfiles_env {
+        if let Some(rf) = runfiles {
+            if let Some(ref path) = rf.manifest_path {
+                if !is_unset(b"RUNFILES_MANIFEST_FILE") {
+                    add_env_var(&mut env_data, &mut env_ptrs, b"RUNFILES_MANIFEST_FILE", path);
+                }
+            }
+            if let Some(ref path) = rf.dir_path {
+                if !is_unset(b"RUNFILES_DIR") {
+                    add_env_var(&mut env_data, &mut env_ptrs, b"RUNFILES_DIR", path);
+                }
+                if !is_unset(b"JAVA_RUNFILES") {
+                    add_env_var(&mut env_data, &mut env_ptrs, b"JAVA_RUNFILES", path);
+                }
+            }
+        }
     }
 
-    // Copy existing environment (skip runfiles vars we're setting).
+    // Explicit removals take precedence over implicit runfiles replacements.
     for env_entry in base_data.split(|&b| b == 0) {
         if env_entry.is_empty() {
             continue;
         }
-        let is_runfiles_var = env_entry.starts_with(b"RUNFILES_MANIFEST_FILE=")
-            || env_entry.starts_with(b"RUNFILES_DIR=")
-            || env_entry.starts_with(b"JAVA_RUNFILES=");
-        if !is_runfiles_var {
+        let name = env_entry.iter().position(|&b| b == b'=').map(|i| &env_entry[..i]);
+        let is_runfiles_var = export_runfiles_env && name.is_some_and(|name| {
+            name == b"RUNFILES_MANIFEST_FILE" || name == b"RUNFILES_DIR" || name == b"JAVA_RUNFILES"
+        });
+        if !is_runfiles_var && !name.is_some_and(is_unset) {
             let start_pos = env_data.len();
             env_data.extend_from_slice(env_entry);
             env_data.push(0);
@@ -597,8 +607,8 @@ pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
         ptrs[0] = override0.as_ptr();
     }
 
-    let (_env_data, env_ptrs) = if launch.export_env {
-        build_runfiles_environ(launch.runfiles)
+    let (_env_data, env_ptrs) = if launch.export_env || !launch.unset_environment.is_empty() {
+        build_environ(launch.runfiles, launch.export_env, launch.unset_environment)
     } else {
         read_environ()
     };

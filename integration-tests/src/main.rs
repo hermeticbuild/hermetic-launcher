@@ -250,9 +250,24 @@ fn finalize_stub(
     args: &[&str],
     transform_indices: &[usize],
 ) -> Result<(), String> {
+    finalize_stub_with_environment(config, output_path, args, transform_indices, true, &[])
+}
+
+fn finalize_stub_with_environment(
+    config: &TestConfig,
+    output_path: &Path,
+    args: &[&str],
+    transform_indices: &[usize],
+    export_runfiles_env: bool,
+    unset_environment: &[&str],
+) -> Result<(), String> {
     let mut cmd = Command::new(&config.finalizer_path);
     cmd.arg("--template").arg(&config.template_path);
     cmd.arg("--output").arg(output_path);
+    cmd.arg("--export-runfiles-env").arg(export_runfiles_env.to_string());
+    for name in unset_environment {
+        cmd.arg("--unset-env").arg(name);
+    }
 
     // Add transform flags
     if !transform_indices.is_empty() {
@@ -1060,6 +1075,236 @@ fn test_print_env(config: &TestConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Test: the finalized stub removes selected variables from the child environment.
+fn test_unset_environment(config: &TestConfig) -> Result<(), String> {
+    println!("  Running test: unset_environment");
+
+    let test_dir = config.work_dir.join("test_unset_environment");
+    fs::create_dir_all(&test_dir).map_err(|e| format!("Failed to create test dir: {e}"))?;
+    let print_env_binary = config.test_binaries_dir.join(format!("print-env{EXE_EXT}"));
+    let print_env_rlocation = format!("{WORKSPACE_NAME}/bin/print-env{EXE_EXT}");
+    let mut runfiles = RunfilesSetup::new(&test_dir, "unset_env_stub")
+        .map_err(|e| format!("Failed to create runfiles: {e}"))?;
+    runfiles.add_file(&print_env_rlocation, &print_env_binary)
+        .map_err(|e| format!("Failed to add print-env: {e}"))?;
+    runfiles.write_manifest().map_err(|e| format!("Failed to write manifest: {e}"))?;
+
+    let exported_stub = test_dir.join(format!("unset_exported{EXE_EXT}"));
+    #[cfg(windows)]
+    let unset_names = ["@@RUNFILES_CUSTOM", "--HL_UNSET", "HL_UNSET_EXACT", "hl_unset_case", "RUNFILES_MANIFEST_FILE", "å_hl_unset"];
+    #[cfg(not(windows))]
+    let unset_names = ["@@RUNFILES_CUSTOM", "--HL_UNSET", "HL_UNSET_EXACT", "hl_unset_case", "RUNFILES_MANIFEST_FILE"];
+    finalize_stub_with_environment(
+        config, &exported_stub, &[&print_env_rlocation], &[0], true, &unset_names,
+    )?;
+
+    let mut command = Command::new(&exported_stub);
+    command
+        .env("RUNFILES_MANIFEST_FILE", &runfiles.manifest_path)
+        .env_remove("RUNFILES_DIR")
+        .env("@@RUNFILES_CUSTOM", "remove-marker-prefix")
+        .env("@@RUNFILES_CUSTOM_SUFFIX", "keep-marker-prefix")
+        .env("--HL_UNSET", "remove-hyphen-prefix")
+        .env("HL_UNSET_EXACT", "remove-me")
+        .env("HL_UNSET_CASE", "case-control")
+        .env("HL_KEEP_CONTROL", "keep-me");
+    #[cfg(windows)]
+    command.env("Å_HL_UNSET", "unicode-case-control");
+    let output = command.output().map_err(|e| format!("Failed to run exported environment stub: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(format!("Exported environment stub failed: {stderr}\nstdout: {stdout}"));
+    }
+    if stdout.lines().any(|line| line.starts_with("ALL_ENV:HL_UNSET_EXACT=")) {
+        return Err(format!("Explicitly unset variable reached child:\n{stdout}"));
+    }
+    if stdout.contains("ALL_ENV:@@RUNFILES_CUSTOM=remove-marker-prefix") {
+        return Err(format!("Marker-prefixed unset variable reached child:\n{stdout}"));
+    }
+    if stdout.contains("ALL_ENV:--HL_UNSET=remove-hyphen-prefix") {
+        return Err(format!("Hyphen-prefixed unset variable reached child:\n{stdout}"));
+    }
+    if !stdout.contains("ALL_ENV:@@RUNFILES_CUSTOM_SUFFIX=keep-marker-prefix") {
+        return Err(format!("Complete-name matching removed a prefixed variable:\n{stdout}"));
+    }
+    if !stdout.contains("ALL_ENV:HL_KEEP_CONTROL=keep-me") {
+        return Err(format!("Unrelated environment variable was lost:\n{stdout}"));
+    }
+    if !stdout.contains("ENV:RUNFILES_MANIFEST_FILE=<unset>") {
+        return Err(format!("Explicit removal did not override runfiles export:\n{stdout}"));
+    }
+    #[cfg(unix)]
+    if !stdout.contains("ALL_ENV:HL_UNSET_CASE=case-control") {
+        return Err(format!("Unix environment removal was not case-sensitive:\n{stdout}"));
+    }
+    #[cfg(windows)]
+    {
+        let lowercase = stdout.to_lowercase();
+        if lowercase.contains("all_env:hl_unset_case=") {
+            return Err(format!("Windows environment removal was not case-insensitive:\n{stdout}"));
+        }
+        if lowercase.contains("all_env:å_hl_unset=") {
+            return Err(format!("Windows environment removal did not use Unicode case semantics:\n{stdout}"));
+        }
+    }
+
+    // No transformed arguments and no runfiles export: this must execute without
+    // initializing runfiles while still constructing a filtered child environment.
+    let unexported_stub = test_dir.join(format!("unset_unexported{EXE_EXT}"));
+    finalize_stub_with_environment(
+        config,
+        &unexported_stub,
+        &[print_env_binary.to_string_lossy().as_ref()],
+        &[],
+        false,
+        &["HL_UNSET_EXACT"],
+    )?;
+    let output = Command::new(&unexported_stub)
+        .env_remove("RUNFILES_DIR")
+        .env_remove("RUNFILES_MANIFEST_FILE")
+        .env("HL_UNSET_EXACT", "remove-me")
+        .env("HL_KEEP_CONTROL", "keep-me")
+        .output()
+        .map_err(|e| format!("Failed to run unexported environment stub: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(format!("Unexported environment stub failed without runfiles: {stderr}\nstdout: {stdout}"));
+    }
+    if stdout.lines().any(|line| line.starts_with("ALL_ENV:HL_UNSET_EXACT=")) {
+        return Err(format!("Unexported stub retained unset variable:\n{stdout}"));
+    }
+    if !stdout.contains("ALL_ENV:HL_KEEP_CONTROL=keep-me") {
+        return Err(format!("Unexported stub lost control variable:\n{stdout}"));
+    }
+
+    #[cfg(windows)]
+    {
+        let output = Command::new(&unexported_stub)
+            .env_clear()
+            .env("HL_UNSET_EXACT", "remove-me")
+            .output()
+            .map_err(|e| format!("Failed to run stub with empty result environment: {e}"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() {
+            return Err(format!("Stub rejected an empty result environment: {stderr}\nstdout: {stdout}"));
+        }
+        if stdout.to_lowercase().contains("all_env:hl_unset_exact=") {
+            return Err(format!("Empty result environment retained unset variable:\n{stdout}"));
+        }
+    }
+
+    println!("    PASS (exported and unexported child environments)");
+    Ok(())
+}
+
+/// Test: invalid environment-removal requests fail with identifying diagnostics.
+fn test_invalid_unset_environment(config: &TestConfig) -> Result<(), String> {
+    println!("  Running test: invalid_unset_environment");
+
+    let test_dir = config.work_dir.join("test_invalid_unset_environment");
+    fs::create_dir_all(&test_dir).map_err(|e| format!("Failed to create test dir: {e}"))?;
+    let output_path = test_dir.join(format!("invalid{EXE_EXT}"));
+    let boundary_a = "a".repeat(127);
+    let boundary_b = "b".repeat(128);
+    let output = Command::new(&config.finalizer_path)
+        .arg("--template").arg(&config.template_path)
+        .arg("--output").arg(&output_path)
+        .arg("--unset-env").arg(&boundary_a)
+        .arg("--unset-env").arg(&boundary_b)
+        .arg("--").arg("unused")
+        .output()
+        .map_err(|e| format!("Failed to run finalizer: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("Finalizer rejected a 256-byte unset payload: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+
+    let long_name = "x".repeat(257);
+    let cases = [
+        ("", "cannot be empty"),
+        ("INVALID=NAME", "cannot contain '='"),
+        (long_name.as_str(), "maximum is 256 bytes"),
+    ];
+
+    for (name, expected_error) in cases {
+        let output = Command::new(&config.finalizer_path)
+            .arg("--template").arg(&config.template_path)
+            .arg("--output").arg(&output_path)
+            .arg("--unset-env").arg(name)
+            .arg("--").arg("unused")
+            .output()
+            .map_err(|e| format!("Failed to run finalizer: {e}"))?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.success() || !stderr.contains(expected_error) {
+            return Err(format!("Invalid unset name {name:?} did not fail with {expected_error:?}: {stderr}"));
+        }
+    }
+
+    println!("    PASS (empty, invalid, and oversized names rejected)");
+    Ok(())
+}
+
+/// Test: a new finalizer can use an older template when the unset list is empty.
+fn test_unset_environment_template_compatibility(config: &TestConfig) -> Result<(), String> {
+    println!("  Running test: unset_environment_template_compatibility");
+
+    const UNSET_ENV_SIZE: usize = 256;
+    const UNSET_MARKER: &[u8] = b"@@RUNFILES_UNSET_ENV=@@";
+    let test_dir = config.work_dir.join("test_unset_environment_template_compatibility");
+    fs::create_dir_all(&test_dir).map_err(|e| format!("Failed to create test dir: {e}"))?;
+
+    let mut old_template_data = fs::read(&config.template_path)
+        .map_err(|e| format!("Failed to read template: {e}"))?;
+    let mut unset_pattern = [0; UNSET_ENV_SIZE];
+    unset_pattern[..UNSET_MARKER.len()].copy_from_slice(UNSET_MARKER);
+    let unset_offset = old_template_data.windows(UNSET_ENV_SIZE)
+        .position(|window| window == unset_pattern)
+        .ok_or("UNSET_ENVIRONMENT placeholder not found in current template")?;
+    old_template_data[unset_offset..unset_offset + UNSET_ENV_SIZE].fill(0);
+    let old_template = test_dir.join(format!("old_template{EXE_EXT}"));
+    fs::write(&old_template, old_template_data)
+        .map_err(|e| format!("Failed to write simulated old template: {e}"))?;
+
+    let print_env_binary = config.test_binaries_dir.join(format!("print-env{EXE_EXT}"));
+    let compatible_stub = test_dir.join(format!("compatible{EXE_EXT}"));
+    let output = Command::new(&config.finalizer_path)
+        .arg("--template").arg(&old_template)
+        .arg("--output").arg(&compatible_stub)
+        .arg("--export-runfiles-env").arg("false")
+        .arg("--").arg(&print_env_binary)
+        .output()
+        .map_err(|e| format!("Failed to finalize simulated old template: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("Empty unset list rejected an old template: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+    let output = Command::new(&compatible_stub)
+        .env_remove("RUNFILES_DIR")
+        .env_remove("RUNFILES_MANIFEST_FILE")
+        .output()
+        .map_err(|e| format!("Failed to run compatible stub: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("Old-template-compatible stub failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+
+    let incompatible_stub = test_dir.join(format!("incompatible{EXE_EXT}"));
+    let output = Command::new(&config.finalizer_path)
+        .arg("--template").arg(&old_template)
+        .arg("--output").arg(&incompatible_stub)
+        .arg("--unset-env").arg("HL_UNSET_EXACT")
+        .arg("--").arg(&print_env_binary)
+        .output()
+        .map_err(|e| format!("Failed to test old template capability error: {e}"))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.success() || !stderr.contains("template does not support --unset-env") {
+        return Err(format!("Nonempty unset list did not reject an old template: {stderr}"));
+    }
+
+    println!("    PASS (empty list compatible; nonempty list rejected)");
+    Ok(())
+}
+
 /// Regression test for issue #35: a multi-megabyte manifest must not OOM.
 ///
 /// The previous implementation copied the entire manifest into a growable `Vec`
@@ -1181,6 +1426,9 @@ fn main() -> ExitCode {
         ("run_runfiles_discovery", test_run_runfiles_discovery),
         ("relative_manifest_symlinks", test_relative_manifest_symlinks),
         ("print_env", test_print_env),
+        ("unset_environment", test_unset_environment),
+        ("invalid_unset_environment", test_invalid_unset_environment),
+        ("unset_environment_template_compatibility", test_unset_environment_template_compatibility),
         ("large_manifest", test_large_manifest),
     ];
 

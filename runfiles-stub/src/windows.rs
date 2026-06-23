@@ -120,6 +120,13 @@ extern "system" {
     fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *mut DWORD) -> BOOL;
     fn GetEnvironmentStringsW() -> *mut u16;
     fn FreeEnvironmentStringsW(lpszEnvironmentBlock: *mut u16) -> BOOL;
+    fn CompareStringOrdinal(
+        lpString1: *const u16,
+        cchCount1: i32,
+        lpString2: *const u16,
+        cchCount2: i32,
+        bIgnoreCase: BOOL,
+    ) -> i32;
     fn GetCurrentProcess() -> HANDLE;
     fn QueryFullProcessImageNameW(
         hProcess: HANDLE,
@@ -276,14 +283,33 @@ pub fn load_manifest(path: &[u8]) -> Option<Manifest> {
     }
 }
 
-// Build the UTF-16 environment block (sorted, double-NUL terminated) with the runfiles
-// variables merged in. Returns an owned Vec the caller keeps alive while CreateProcessW
-// reads it. Previously this used a 128 KB `static mut`; a heap Vec removes the mutable
-// static, the fixed size cap, and the abort-on-overflow path, while preserving the exact
-// sorted-insertion ordering. Windows requires the block sorted alphabetically by name;
-// GetEnvironmentStringsW() already returns it sorted, so we insert our vars in place.
-fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> Vec<u16> {
+// Build a filtered UTF-16 environment block (sorted, double-NUL terminated),
+// optionally replacing the runfiles variables. GetEnvironmentStringsW() already
+// returns a sorted block, so we insert our variables in place.
+fn build_environ(runfiles: Option<&Runfiles>, export_runfiles_env: bool, unset_environment: &[u8]) -> Vec<u16> {
     let mut buf: Vec<u16> = Vec::with_capacity(8192);
+    let unset_names: Vec<Vec<u16>> = unset_environment
+        .split(|&b| b == 0)
+        .filter(|name| !name.is_empty())
+        .filter_map(|name| core::str::from_utf8(name).ok())
+        .map(|name| name.encode_utf16().collect())
+        .collect();
+
+    // Windows environment-variable names are case-insensitive Unicode strings.
+    let name_eq = |left: &[u16], right: &[u16]| unsafe {
+        CompareStringOrdinal(
+            left.as_ptr(), left.len() as i32,
+            right.as_ptr(), right.len() as i32,
+            1,
+        ) == 2
+    };
+    let is_unset = |name: &[u16]| unset_names.iter().any(|candidate| name_eq(name, candidate));
+    let java_runfiles: Vec<u16> = b"JAVA_RUNFILES".iter().map(|&b| b as u16).collect();
+    let runfiles_dir: Vec<u16> = b"RUNFILES_DIR".iter().map(|&b| b as u16).collect();
+    let runfiles_manifest: Vec<u16> = b"RUNFILES_MANIFEST_FILE".iter().map(|&b| b as u16).collect();
+    let export_java_runfiles = export_runfiles_env && !is_unset(&java_runfiles);
+    let export_runfiles_dir = export_runfiles_env && !is_unset(&runfiles_dir);
+    let export_runfiles_manifest = export_runfiles_env && !is_unset(&runfiles_manifest);
 
     // Append "KEY=VALUE\0", widening bytes to UTF-16.
     let push_var = |buf: &mut Vec<u16>, key: &[u8], value: &str| {
@@ -303,11 +329,17 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> Vec<u16> {
             // No parent environment: add runfiles vars in sorted order.
             if let Some(rf) = runfiles {
                 if let Some(ref path) = rf.dir_path {
-                    push_var(&mut buf, b"JAVA_RUNFILES", path);
-                    push_var(&mut buf, b"RUNFILES_DIR", path);
+                    if export_java_runfiles {
+                        push_var(&mut buf, b"JAVA_RUNFILES", path);
+                    }
+                    if export_runfiles_dir {
+                        push_var(&mut buf, b"RUNFILES_DIR", path);
+                    }
                 }
                 if let Some(ref path) = rf.manifest_path {
-                    push_var(&mut buf, b"RUNFILES_MANIFEST_FILE", path);
+                    if export_runfiles_manifest {
+                        push_var(&mut buf, b"RUNFILES_MANIFEST_FILE", path);
+                    }
                 }
             }
         } else {
@@ -327,14 +359,17 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> Vec<u16> {
                 }
                 let entry_ptr = env_block.add(entry_start);
 
-                // Skip existing runfiles vars (we re-insert our own).
-                let prefixed = |needle: &[u8]| -> bool {
-                    entry_len > needle.len()
-                        && (0..needle.len()).all(|i| *entry_ptr.add(i) == needle[i] as u16)
-                };
-                let should_skip = prefixed(b"RUNFILES_MANIFEST_FILE=")
-                    || prefixed(b"RUNFILES_DIR=")
-                    || prefixed(b"JAVA_RUNFILES=");
+                let mut name_len = 0;
+                while name_len < entry_len && *entry_ptr.add(name_len) != b'=' as u16 {
+                    name_len += 1;
+                }
+                let name = core::slice::from_raw_parts(entry_ptr, name_len);
+
+                let is_runfiles_var = export_runfiles_env
+                    && (name_eq(name, &runfiles_manifest)
+                        || name_eq(name, &runfiles_dir)
+                        || name_eq(name, &java_runfiles));
+                let should_skip = is_runfiles_var || is_unset(name);
 
                 if !should_skip {
                     // Case-insensitive "does this entry sort after `target`?"
@@ -351,25 +386,31 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> Vec<u16> {
                     };
 
                     if !java_inserted && var_comes_after(b"JAVA_RUNFILES") {
-                        if let Some(rf) = runfiles {
-                            if let Some(ref path) = rf.dir_path {
-                                push_var(&mut buf, b"JAVA_RUNFILES", path);
+                        if export_java_runfiles {
+                            if let Some(rf) = runfiles {
+                                if let Some(ref path) = rf.dir_path {
+                                    push_var(&mut buf, b"JAVA_RUNFILES", path);
+                                }
                             }
                         }
                         java_inserted = true;
                     }
                     if !dir_inserted && var_comes_after(b"RUNFILES_DIR") {
-                        if let Some(rf) = runfiles {
-                            if let Some(ref path) = rf.dir_path {
-                                push_var(&mut buf, b"RUNFILES_DIR", path);
+                        if export_runfiles_dir {
+                            if let Some(rf) = runfiles {
+                                if let Some(ref path) = rf.dir_path {
+                                    push_var(&mut buf, b"RUNFILES_DIR", path);
+                                }
                             }
                         }
                         dir_inserted = true;
                     }
                     if !manifest_inserted && var_comes_after(b"RUNFILES_MANIFEST_FILE") {
-                        if let Some(rf) = runfiles {
-                            if let Some(ref path) = rf.manifest_path {
-                                push_var(&mut buf, b"RUNFILES_MANIFEST_FILE", path);
+                        if export_runfiles_manifest {
+                            if let Some(rf) = runfiles {
+                                if let Some(ref path) = rf.manifest_path {
+                                    push_var(&mut buf, b"RUNFILES_MANIFEST_FILE", path);
+                                }
                             }
                         }
                         manifest_inserted = true;
@@ -387,17 +428,17 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> Vec<u16> {
 
             // Append any runfiles vars that sort after every existing entry.
             if let Some(rf) = runfiles {
-                if !java_inserted {
+                if export_java_runfiles && !java_inserted {
                     if let Some(ref path) = rf.dir_path {
                         push_var(&mut buf, b"JAVA_RUNFILES", path);
                     }
                 }
-                if !dir_inserted {
+                if export_runfiles_dir && !dir_inserted {
                     if let Some(ref path) = rf.dir_path {
                         push_var(&mut buf, b"RUNFILES_DIR", path);
                     }
                 }
-                if !manifest_inserted {
+                if export_runfiles_manifest && !manifest_inserted {
                     if let Some(ref path) = rf.manifest_path {
                         push_var(&mut buf, b"RUNFILES_MANIFEST_FILE", path);
                     }
@@ -409,6 +450,10 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> Vec<u16> {
     }
 
     // Final NUL: with the last entry's NUL this forms the double-NUL block terminator.
+    // An empty block needs both terminators explicitly.
+    if buf.is_empty() {
+        buf.push(0);
+    }
     buf.push(0);
     buf
 }
@@ -577,16 +622,17 @@ pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
 
         cmdline_wide.push(0);
 
-        // Build the environment with runfiles vars if export is enabled.
-        // `env_storage` keeps the block alive while CreateProcessW reads it.
+        // Build a child environment only when transformation is requested. Passing
+        // NULL preserves Windows' native environment inheritance fast path.
         let env_storage: Vec<u16>;
-        let envp = if launch.export_env {
-            env_storage = build_runfiles_environ(launch.runfiles);
+        let transform_environment = launch.export_env || !launch.unset_environment.is_empty();
+        let envp = if transform_environment {
+            env_storage = build_environ(launch.runfiles, launch.export_env, launch.unset_environment);
             env_storage.as_ptr() as *mut core::ffi::c_void
         } else {
             core::ptr::null_mut()
         };
-        let creation_flags = if launch.export_env { CREATE_UNICODE_ENVIRONMENT } else { 0 };
+        let creation_flags = if transform_environment { CREATE_UNICODE_ENVIRONMENT } else { 0 };
 
         let mut si: STARTUPINFOW = core::mem::zeroed();
         si.cb = core::mem::size_of::<STARTUPINFOW>() as DWORD;
