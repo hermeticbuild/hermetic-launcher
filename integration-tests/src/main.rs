@@ -66,6 +66,14 @@ fn resolve_runfile_path(runfiles: &Runfiles, path: PathBuf) -> PathBuf {
     rlocation!(runfiles, runfiles_key.as_str()).unwrap_or(path)
 }
 
+fn environment_path<'a>(stdout: &'a str, name: &str) -> Option<&'a Path> {
+    let prefix = format!("ENV:{}=", name);
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .map(Path::new)
+}
+
 impl TestConfig {
     fn from_args() -> Result<Self, String> {
         let args: Vec<String> = env::args().collect();
@@ -479,12 +487,10 @@ fn test_runfiles_source_precedence(config: &TestConfig) -> Result<(), String> {
         .map_err(|e| format!("Failed to run stub with both runfiles variables: {}", e))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let expected_dir = format!("ENV:RUNFILES_DIR={}", runfiles.runfiles_dir.display());
-    let expected_java = format!("ENV:JAVA_RUNFILES={}", runfiles.runfiles_dir.display());
     if !output.status.success()
         || !stdout.contains("ARGC:3")
-        || !stdout.contains(&expected_dir)
-        || !stdout.contains(&expected_java)
+        || environment_path(&stdout, "RUNFILES_DIR") != Some(runfiles.runfiles_dir.as_path())
+        || environment_path(&stdout, "JAVA_RUNFILES") != Some(runfiles.runfiles_dir.as_path())
         || !stdout.contains("ENV:RUNFILES_MANIFEST_FILE=<unset>")
     {
         return Err(format!(
@@ -542,12 +548,9 @@ fn test_runfiles_source_precedence(config: &TestConfig) -> Result<(), String> {
         .map_err(|e| format!("Failed to inspect manifest-selected environment: {}", e))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let expected_manifest = format!(
-        "ENV:RUNFILES_MANIFEST_FILE={}",
-        manifest_export_path.display()
-    );
     if !output.status.success()
-        || !stdout.contains(&expected_manifest)
+        || environment_path(&stdout, "RUNFILES_MANIFEST_FILE")
+            != Some(manifest_export_path.as_path())
         || !stdout.contains("ENV:RUNFILES_DIR=<unset>")
         || !stdout.contains("ENV:JAVA_RUNFILES=<unset>")
     {
@@ -571,8 +574,8 @@ fn test_runfiles_source_precedence(config: &TestConfig) -> Result<(), String> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success()
         || !stdout.contains("ARGC:3")
-        || !stdout.contains(&expected_dir)
-        || !stdout.contains(&expected_java)
+        || environment_path(&stdout, "RUNFILES_DIR") != Some(runfiles.runfiles_dir.as_path())
+        || environment_path(&stdout, "JAVA_RUNFILES") != Some(runfiles.runfiles_dir.as_path())
         || !stdout.contains("ENV:RUNFILES_MANIFEST_FILE=<unset>")
     {
         return Err(format!(
@@ -963,8 +966,7 @@ fn test_fallback_runfiles_manifest(config: &TestConfig) -> Result<(), String> {
             exit_code, stdout, stderr
         ));
     }
-    let expected_manifest = format!("ENV:RUNFILES_MANIFEST_FILE={}", manifest_path.display());
-    if !stdout.contains(&expected_manifest)
+    if environment_path(&stdout, "RUNFILES_MANIFEST_FILE") != Some(manifest_path.as_path())
         || !stdout.contains("ENV:RUNFILES_DIR=<unset>")
         || !stdout.contains("ENV:JAVA_RUNFILES=<unset>")
     {
