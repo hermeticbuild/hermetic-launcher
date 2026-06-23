@@ -146,17 +146,17 @@ execute; the rest are its leading arguments. Runtime arguments are unrestricted.
 
 ### Runfiles discovery
 
-At startup the finalized launcher locates runfiles in this order:
+At startup the finalized launcher selects one runfiles source from:
 
-1. `$RUNFILES_MANIFEST_FILE`
-2. `$RUNFILES_DIR`
-3. `<executable>.runfiles_manifest`
-4. `<executable>.runfiles/`
+1. `$RUNFILES_DIR` and `$RUNFILES_MANIFEST_FILE`
+2. `<executable>.runfiles/` and `<executable>.runfiles_manifest`
 
-Each argument marked `--transform` is resolved through runfiles (manifest lookup or
-directory join; tree-artifact prefixes supported). Absolute paths (leading `/`) pass
-through unchanged. The launcher then appends its own runtime arguments and replaces
-itself with the target.
+Valid environment-provided sources take precedence over adjacent sources. When both
+sources exist at the same precedence, the runfiles directory wins. Every argument
+marked `--transform` resolves only through the selected source (manifest lookup or
+directory join; tree-artifact prefixes supported), and only that source is exported to
+the child. Absolute paths (leading `/`) pass through unchanged. The launcher then
+appends its own runtime arguments and replaces itself with the target.
 
 ---
 
