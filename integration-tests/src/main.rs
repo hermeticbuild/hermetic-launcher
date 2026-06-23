@@ -1475,27 +1475,26 @@ fn test_non_utf8_executable_relative_fallback(config: &TestConfig) -> Result<(),
 
 #[cfg(windows)]
 fn test_windows_extended_paths(config: &TestConfig) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
     println!("  Running test: windows_extended_paths");
 
     let test_dir = config.work_dir.join("test_windows_extended_paths");
-    let stub_dir = test_dir.join("launcher-東京");
-    let target_dir = stub_dir
-        .join(format!("targets-{}", "a".repeat(180)))
+    let stub_dir = test_dir
+        .join(format!("launcher-東京-{}", "a".repeat(180)))
         .join(format!("nested-{}", "b".repeat(100)));
     fs::create_dir_all(&stub_dir)
-        .map_err(|e| format!("Failed to create launcher directory: {}", e))?;
-
-    let source_binary = config.test_binaries_dir.join("print-env.exe");
-    let fallback_binary = target_dir.join("fallback-東京").join("print-env.exe");
-    let primary_binary = target_dir.join("primary-主要").join("print-env.exe");
-    if fallback_binary.as_os_str().encode_wide().count() <= 260 {
+        .map_err(|e| format!("Failed to create long launcher directory: {}", e))?;
+    if stub_dir.as_os_str().encode_wide().count() <= 260 {
         return Err(format!(
             "Windows extended-path fixture did not exceed MAX_PATH: {}",
-            fallback_binary.display()
+            stub_dir.display()
         ));
     }
+
+    let source_binary = config.test_binaries_dir.join("print-env.exe");
+    let fallback_binary = stub_dir.join("fallback-東京").join("print-env.exe");
+    let primary_binary = stub_dir.join("primary-主要").join("print-env.exe");
     for destination in [&fallback_binary, &primary_binary] {
         fs::create_dir_all(destination.parent().unwrap())
             .map_err(|e| format!("Failed to create {}: {}", destination.display(), e))?;
@@ -1520,24 +1519,29 @@ fn test_windows_extended_paths(config: &TestConfig) -> Result<(), String> {
         Ok(())
     };
 
-    let target_relative = target_dir
-        .strip_prefix(&stub_dir)
-        .map_err(|e| format!("Failed to relativize long target directory: {}", e))?;
-    let fallback_arg = target_relative
-        .join("fallback-東京")
-        .join("print-env.exe")
-        .to_string_lossy()
-        .replace('\\', "/");
+    // Invoke the long fixture through Win32's verbatim spelling so the test
+    // reaches the launcher's path handling instead of failing in Command.
+    let verbatim_path = |path: &Path| {
+        let mut result: Vec<u16> = "\\\\?\\".encode_utf16().collect();
+        result.extend(path.as_os_str().encode_wide().map(|unit| {
+            if unit == b'/' as u16 {
+                b'\\' as u16
+            } else {
+                unit
+            }
+        }));
+        PathBuf::from(std::ffi::OsString::from_wide(&result))
+    };
     let fallback_stub = stub_dir.join("fallback-stub.exe");
     finalize_stub_with_fallbacks(
         config,
         &fallback_stub,
         &["_main/missing-long-primary.exe"],
         &[0],
-        &[(0, &fallback_arg)],
+        &[(0, "fallback-東京/print-env.exe")],
         false,
     )?;
-    let mut fallback_command = Command::new(&fallback_stub);
+    let mut fallback_command = Command::new(verbatim_path(&fallback_stub));
     fallback_command.env_clear();
     let stdout = run_successful_stub(&mut fallback_command, "long Windows fallback")?;
     assert_path(&stdout, &fallback_binary, "long Windows fallback")?;
@@ -1559,10 +1563,10 @@ fn test_windows_extended_paths(config: &TestConfig) -> Result<(), String> {
         &manifest_stub,
         &[key],
         &[0],
-        &[(0, &fallback_arg)],
+        &[(0, "fallback-東京/print-env.exe")],
         false,
     )?;
-    let mut manifest_command = Command::new(&manifest_stub);
+    let mut manifest_command = Command::new(verbatim_path(&manifest_stub));
     manifest_command
         .env_clear()
         .env("RUNFILES_MANIFEST_FILE", &manifest_path);
