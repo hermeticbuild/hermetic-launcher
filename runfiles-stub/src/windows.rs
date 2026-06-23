@@ -604,7 +604,7 @@ pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
 
         // Build the UTF-16 command line: embedded args (widened) + runtime args (native).
         let mut cmdline_wide: Vec<u16> = Vec::with_capacity(8192);
-        let mut application_name = Vec::new();
+        let mut application_name = None;
 
         for (i, arg) in launch.resolved.iter().enumerate() {
             let wide: Vec<u16> = match arg {
@@ -632,7 +632,11 @@ pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
             };
 
             if i == 0 {
-                application_name = crate::native_path::windows_api_path(&wide);
+                application_name =
+                    crate::native_path::windows_extended_path(&wide).map(|mut path| {
+                        path.push(0);
+                        path
+                    });
             }
 
             // Quote arg0 always (Bazel launcher.cc convention); others as needed.
@@ -674,11 +678,16 @@ pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
         si.cb = core::mem::size_of::<STARTUPINFOW>() as DWORD;
         let mut pi: PROCESS_INFORMATION = core::mem::zeroed();
 
-        // Pass the resolved executable separately so CreateProcessW does not
-        // apply its command-line module-name limit. Keep arg0 in the command
-        // line as well so the child observes the same argv[0] as before.
+        // Pass absolute resolved paths separately so CreateProcessW does not
+        // apply its command-line module-name limit. A relative argv[0] must
+        // remain command-line-only: non-NULL partial application names use the
+        // current directory and do not search PATH or infer an .exe extension.
+        // https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw
+        let application_name = application_name
+            .as_ref()
+            .map_or(core::ptr::null(), |path| path.as_ptr());
         let success = CreateProcessW(
-            application_name.as_ptr(),
+            application_name,
             cmdline_wide.as_mut_ptr(),
             core::ptr::null_mut(),
             core::ptr::null_mut(),

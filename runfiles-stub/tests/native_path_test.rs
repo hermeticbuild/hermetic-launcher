@@ -61,3 +61,14 @@ fn windows_api_path_preserves_relative_semantics() {
         "relative\\dir\\tool.exe",
     );
 }
+
+#[test]
+fn windows_extended_path_rejects_relative_paths() {
+    for path in ["tool.exe", "dir\\tool.exe", "C:tool.exe", "\\tool.exe"] {
+        let wide: Vec<u16> = path.encode_utf16().collect();
+        assert!(
+            native_path::windows_extended_path(&wide).is_none(),
+            "{path} is not a fully qualified path",
+        );
+    }
+}

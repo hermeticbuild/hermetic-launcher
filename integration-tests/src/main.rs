@@ -1661,6 +1661,37 @@ fn test_no_transformed_arguments(config: &TestConfig) -> Result<(), String> {
         "no-transform non-exporting stub",
     )?;
 
+    #[cfg(windows)]
+    {
+        let command_name = "literal-entrypoint";
+        let path_dir = test_dir.join("path");
+        fs::create_dir_all(&path_dir)
+            .map_err(|e| format!("Failed to create {}: {}", path_dir.display(), e))?;
+        fs::copy(
+            Path::new(print_env_binary.as_ref()),
+            path_dir.join(format!("{command_name}.exe")),
+        )
+        .map_err(|e| format!("Failed to create PATH executable: {e}"))?;
+
+        let path_search_stub = test_dir.join("path-search.exe");
+        finalize_stub_with_fallbacks(
+            config,
+            &path_search_stub,
+            &[command_name],
+            &[],
+            &[],
+            false,
+        )?;
+        let mut command = Command::new(&path_search_stub);
+        command.env("PATH", &path_dir);
+        let stdout = run_successful_stub(&mut command, "literal argv[0] found through PATH")?;
+        assert_argv0(
+            &stdout,
+            command_name,
+            "literal argv[0] found through PATH",
+        )?;
+    }
+
     println!("    PASS");
     Ok(())
 }
