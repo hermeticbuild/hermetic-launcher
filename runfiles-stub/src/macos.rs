@@ -418,10 +418,10 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> (Vec<u8>, Vec<*const u
     };
 
     if let Some(rf) = runfiles {
-        if let Some(ref path) = rf.manifest_path {
+        if let Some(path) = rf.manifest_path() {
             add_env_var(&mut env_data, &mut env_ptrs, b"RUNFILES_MANIFEST_FILE", path);
         }
-        if let Some(ref path) = rf.dir_path {
+        if let Some(path) = rf.dir_path() {
             add_env_var(&mut env_data, &mut env_ptrs, b"RUNFILES_DIR", path);
             add_env_var(&mut env_data, &mut env_ptrs, b"JAVA_RUNFILES", path);
         }

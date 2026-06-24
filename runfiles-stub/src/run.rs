@@ -137,23 +137,19 @@ pub fn main(rt: platform::RuntimeArgs) -> ! {
         resolved.push(bytes);
     }
 
-    // Preserve argv[0] as a runfiles-relative path so tools that walk argv[0]'s
-    // parent symlinks (e.g. aspect_rules_py's venv_shim) can locate .runfiles. The
-    // fully-resolved path is still used as the program to execute.
+    // Preserve argv[0] as a logical runfiles path so tools that walk its parent
+    // can locate .runfiles. A manifest can supply that identity even when its
+    // sibling directory is absent; the resolved path still selects the program.
     let argv0_override: Option<Vec<u8>> = runfiles
         .as_ref()
-        .and_then(|rf| rf.dir_path.as_ref())
-        .and_then(|dir| {
+        .and_then(|rf| {
             let arg0 = placeholders::arg(0);
             let arg0_len = cstr_len(arg0);
             if arg0_len == 0 {
                 return None;
             }
-            let mut path = Vec::from(dir.as_bytes());
-            if !dir.ends_with('/') {
-                path.push(b'/');
-            }
-            path.extend_from_slice(&arg0[..arg0_len]);
+            let arg0 = core::str::from_utf8(&arg0[..arg0_len]).ok()?;
+            let mut path = Vec::from(rf.argv0_rlocation(arg0)?.as_bytes());
             path.push(0);
             Some(path)
         });

@@ -66,6 +66,14 @@ fn resolve_runfile_path(runfiles: &Runfiles, path: PathBuf) -> PathBuf {
     rlocation!(runfiles, runfiles_key.as_str()).unwrap_or(path)
 }
 
+fn environment_path<'a>(stdout: &'a str, name: &str) -> Option<&'a Path> {
+    let prefix = format!("ENV:{}=", name);
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .map(Path::new)
+}
+
 impl TestConfig {
     fn from_args() -> Result<Self, String> {
         let args: Vec<String> = env::args().collect();
@@ -149,7 +157,9 @@ impl RunfilesSetup {
     /// Create a new runfiles setup in the given directory
     fn new(base_dir: &Path, name: &str) -> std::io::Result<Self> {
         let runfiles_dir = base_dir.join(format!("{}.runfiles", name));
-        let manifest_path = base_dir.join(format!("{}.runfiles_manifest", name));
+        // Keep manifest-mode tests independent from adjacent discovery. Tests
+        // that exercise conventional sibling sources opt in explicitly.
+        let manifest_path = base_dir.join(format!("{}.manifest", name));
 
         fs::create_dir_all(&runfiles_dir)?;
 
@@ -427,6 +437,200 @@ fn test_add_numbers_runtime_args(config: &TestConfig) -> Result<(), String> {
 
     println!("    PASS");
 
+    Ok(())
+}
+
+/// Test: runfiles source selection respects provenance, then prefers directories.
+fn test_runfiles_source_precedence(config: &TestConfig) -> Result<(), String> {
+    println!("  Running test: runfiles_source_precedence");
+
+    let test_dir = config.work_dir.join("test_runfiles_source_precedence");
+    fs::create_dir_all(&test_dir).map_err(|e| format!("Failed to create test dir: {}", e))?;
+
+    let stub_name = format!("precedence_stub{}", EXE_EXT);
+    let mut runfiles = RunfilesSetup::new(&test_dir, &stub_name)
+        .map_err(|e| format!("Failed to create runfiles: {}", e))?;
+    runfiles.manifest_path = test_dir.join(format!("{}.runfiles_manifest", stub_name));
+    let executable_rlocation = format!("{}/bin/tool{}", WORKSPACE_NAME, EXE_EXT);
+    let print_env_binary = config.test_binaries_dir.join(format!("print-env{}", EXE_EXT));
+    runfiles
+        .add_file(&executable_rlocation, &print_env_binary)
+        .map_err(|e| format!("Failed to add directory executable: {}", e))?;
+
+    let add_binary = config.test_binaries_dir.join(format!("add-numbers{}", EXE_EXT));
+    let manifest_target = add_binary.to_string_lossy();
+    #[cfg(windows)]
+    let manifest_target = manifest_target.replace('\\', "/");
+    fs::write(
+        &runfiles.manifest_path,
+        format!("{} {}\n", executable_rlocation, manifest_target),
+    )
+    .map_err(|e| format!("Failed to write conflicting manifest: {}", e))?;
+
+    let stub_path = test_dir.join(&stub_name);
+    finalize_stub(
+        config,
+        &stub_path,
+        &[&executable_rlocation, "7", "8"],
+        &[0],
+    )?;
+
+    // Both environment sources have the same precedence, so the directory owns
+    // both resolution and the environment exported to the child.
+    let mut command = Command::new(&stub_path);
+    command
+        .env("RUNFILES_DIR", &runfiles.runfiles_dir)
+        .env("RUNFILES_MANIFEST_FILE", &runfiles.manifest_path)
+        .env_remove("JAVA_RUNFILES");
+    let output = command
+        .output()
+        .map_err(|e| format!("Failed to run stub with both runfiles variables: {}", e))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success()
+        || !stdout.contains("ARGC:3")
+        || environment_path(&stdout, "RUNFILES_DIR") != Some(runfiles.runfiles_dir.as_path())
+        || environment_path(&stdout, "JAVA_RUNFILES") != Some(runfiles.runfiles_dir.as_path())
+        || !stdout.contains("ENV:RUNFILES_MANIFEST_FILE=<unset>")
+    {
+        return Err(format!(
+            "Directory environment source did not win the tie.\nstdout: {}\nstderr: {}",
+            stdout, stderr
+        ));
+    }
+
+    // An environment manifest outranks an adjacent directory, so the manifest's
+    // conflicting add-numbers entry must be selected as the sole source.
+    let mut command = Command::new(&stub_path);
+    command
+        .env_remove("RUNFILES_DIR")
+        .env_remove("JAVA_RUNFILES")
+        .env("RUNFILES_MANIFEST_FILE", &runfiles.manifest_path);
+    let output = command
+        .output()
+        .map_err(|e| format!("Failed to run stub with environment manifest: {}", e))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() || !stdout.contains("SUM:15") {
+        return Err(format!(
+            "Environment manifest did not outrank adjacent directory.\nstdout: {}\nstderr: {}",
+            stdout, stderr
+        ));
+    }
+
+    // An invalid environment directory is not a source. Select the environment
+    // manifest and scrub stale directory variables from the child.
+    let manifest_export_path = test_dir.join("manifest_export.manifest");
+    let print_env_target = print_env_binary.to_string_lossy();
+    #[cfg(windows)]
+    let print_env_target = print_env_target.replace('\\', "/");
+    fs::write(
+        &manifest_export_path,
+        format!("{} {}\n", executable_rlocation, print_env_target),
+    )
+    .map_err(|e| format!("Failed to write manifest export fixture: {}", e))?;
+    let invalid_dir = test_dir.join("not_a_directory");
+    fs::write(&invalid_dir, b"not a directory")
+        .map_err(|e| format!("Failed to write invalid directory fixture: {}", e))?;
+    let mut command = Command::new(&stub_path);
+    #[cfg(not(windows))]
+    command
+        .env("RUNFILES_DIR", &invalid_dir)
+        .env("JAVA_RUNFILES", "stale")
+        .env("RUNFILES_MANIFEST_FILE", &manifest_export_path);
+    #[cfg(windows)]
+    command
+        .env("Runfiles_Dir", &invalid_dir)
+        .env("Java_Runfiles", "stale")
+        .env("Runfiles_Manifest_File", &manifest_export_path);
+    let output = command
+        .output()
+        .map_err(|e| format!("Failed to inspect manifest-selected environment: {}", e))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success()
+        || environment_path(&stdout, "RUNFILES_MANIFEST_FILE")
+            != Some(manifest_export_path.as_path())
+        || !stdout.contains("ENV:RUNFILES_DIR=<unset>")
+        || !stdout.contains("ENV:JAVA_RUNFILES=<unset>")
+    {
+        return Err(format!(
+            "Manifest selection did not scrub stale directory state.\nstdout: {}\nstderr: {}",
+            stdout, stderr
+        ));
+    }
+
+    // With no environment source, the adjacent directory and manifest have equal
+    // precedence, so the directory wins and is exported consistently.
+    let mut command = Command::new(&stub_path);
+    command
+        .env_remove("RUNFILES_DIR")
+        .env_remove("RUNFILES_MANIFEST_FILE")
+        .env_remove("JAVA_RUNFILES");
+    let output = command
+        .output()
+        .map_err(|e| format!("Failed to run stub with adjacent sources: {}", e))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success()
+        || !stdout.contains("ARGC:3")
+        || environment_path(&stdout, "RUNFILES_DIR") != Some(runfiles.runfiles_dir.as_path())
+        || environment_path(&stdout, "JAVA_RUNFILES") != Some(runfiles.runfiles_dir.as_path())
+        || !stdout.contains("ENV:RUNFILES_MANIFEST_FILE=<unset>")
+    {
+        return Err(format!(
+            "Adjacent directory did not win the tie.\nstdout: {}\nstderr: {}",
+            stdout, stderr,
+        ));
+    }
+
+    // Source selection is global, not per key. A missing directory entry must
+    // not fall through to either an environment or adjacent manifest.
+    let missing_rlocation = format!("{}/bin/missing{}", WORKSPACE_NAME, EXE_EXT);
+    let missing_stub_name = format!("missing_stub{}", EXE_EXT);
+    let missing_stub = test_dir.join(&missing_stub_name);
+    let missing_manifest = test_dir.join(format!("{}.runfiles_manifest", missing_stub_name));
+    let add_target = add_binary.to_string_lossy();
+    #[cfg(windows)]
+    let add_target = add_target.replace('\\', "/");
+    fs::write(
+        &missing_manifest,
+        format!("{} {}\n", missing_rlocation, add_target),
+    )
+    .map_err(|e| format!("Failed to write no-fallback fixture: {}", e))?;
+    finalize_stub(
+        config,
+        &missing_stub,
+        &[&missing_rlocation, "7", "8"],
+        &[0],
+    )?;
+    for (case, manifest_env) in [
+        ("environment manifest", Some(&missing_manifest)),
+        ("adjacent manifest", None),
+    ] {
+        let mut command = Command::new(&missing_stub);
+        command
+            .env("RUNFILES_DIR", &runfiles.runfiles_dir)
+            .env_remove("JAVA_RUNFILES");
+        if let Some(manifest) = manifest_env {
+            command.env("RUNFILES_MANIFEST_FILE", manifest);
+        } else {
+            command.env_remove("RUNFILES_MANIFEST_FILE");
+        }
+        let output = command
+            .output()
+            .map_err(|e| format!("Failed to test no-fallback {}: {}", case, e))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.success() || stdout.contains("SUM:15") {
+            return Err(format!(
+                "Directory selection fell through to {}.\nstdout: {}\nstderr: {}",
+                case, stdout, stderr
+            ));
+        }
+    }
+
+    println!("    PASS (environment precedence, then directory preference)");
     Ok(())
 }
 
@@ -715,33 +919,24 @@ fn test_fallback_runfiles_manifest(config: &TestConfig) -> Result<(), String> {
     let test_dir = config.work_dir.join("test_fallback_manifest");
     fs::create_dir_all(&test_dir).map_err(|e| format!("Failed to create test dir: {}", e))?;
 
-    // Create a stub with a .runfiles_manifest file next to it (not a directory)
+    // Create a stub with only a .runfiles_manifest file next to it.
     let stub_path = test_dir.join(format!("manifest_stub{}", EXE_EXT));
     let manifest_path = test_dir.join(format!("manifest_stub{}.runfiles_manifest", EXE_EXT));
 
-    // Create the runfiles directory structure for the files
+    // The logical sibling tree intentionally does not exist. The manifest maps
+    // execution elsewhere, while argv[0] retains the logical runfiles identity.
     let runfiles_dir = test_dir.join(format!("manifest_stub{}.runfiles", EXE_EXT));
-    let binary_dir = runfiles_dir.join(WORKSPACE_NAME).join("bin");
-    fs::create_dir_all(&binary_dir).map_err(|e| format!("Failed to create binary dir: {}", e))?;
-
-    let add_binary = config.test_binaries_dir.join(format!("add-numbers{}", EXE_EXT));
-    let dest_binary = binary_dir.join(format!("add-numbers{}", EXE_EXT));
-    fs::copy(&add_binary, &dest_binary).map_err(|e| format!("Failed to copy binary: {}", e))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&dest_binary)
-            .map_err(|e| format!("Failed to get permissions: {}", e))?
-            .permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&dest_binary, perms)
-            .map_err(|e| format!("Failed to set permissions: {}", e))?;
-    }
+    let print_env_binary = config
+        .test_binaries_dir
+        .join(format!("print-env{}", EXE_EXT));
 
     // Write the manifest file (key value pairs separated by space)
-    let add_rlocation = format!("{}/bin/add-numbers{}", WORKSPACE_NAME, EXE_EXT);
-    let manifest_content = format!("{} {}\n", add_rlocation, dest_binary.display());
+    let print_env_rlocation = format!("{}/bin/print-env{}", WORKSPACE_NAME, EXE_EXT);
+    let manifest_content = format!(
+        "{} {}\n",
+        print_env_rlocation,
+        print_env_binary.display()
+    );
     fs::write(&manifest_path, manifest_content)
         .map_err(|e| format!("Failed to write manifest: {}", e))?;
 
@@ -749,7 +944,7 @@ fn test_fallback_runfiles_manifest(config: &TestConfig) -> Result<(), String> {
     finalize_stub(
         config,
         &stub_path,
-        &[&add_rlocation, "7", "8"],
+        &[&print_env_rlocation],
         &[0],
     )?;
 
@@ -757,6 +952,7 @@ fn test_fallback_runfiles_manifest(config: &TestConfig) -> Result<(), String> {
     let mut cmd = Command::new(&stub_path);
     cmd.env_remove("RUNFILES_DIR");
     cmd.env_remove("RUNFILES_MANIFEST_FILE");
+    cmd.env_remove("JAVA_RUNFILES");
 
     let output = cmd.output().map_err(|e| format!("Failed to run stub: {}", e))?;
 
@@ -770,9 +966,31 @@ fn test_fallback_runfiles_manifest(config: &TestConfig) -> Result<(), String> {
             exit_code, stdout, stderr
         ));
     }
+    if environment_path(&stdout, "RUNFILES_MANIFEST_FILE") != Some(manifest_path.as_path())
+        || !stdout.contains("ENV:RUNFILES_DIR=<unset>")
+        || !stdout.contains("ENV:JAVA_RUNFILES=<unset>")
+    {
+        return Err(format!(
+            "Adjacent manifest was not exported as the sole runfiles source.\nstdout: {}",
+            stdout
+        ));
+    }
 
-    if !stdout.contains("SUM:15") {
-        return Err(format!("Unexpected output: {}. Expected 'SUM:15'", stdout));
+    #[cfg(unix)]
+    {
+        let expected = runfiles_dir.join(&print_env_rlocation);
+        let actual = stdout
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("ARGS:"))
+            .and_then(|args| args.split('|').next());
+        if actual != Some(expected.to_string_lossy().as_ref()) {
+            return Err(format!(
+                "Adjacent manifest did not preserve logical argv[0].\nexpected: {}\nstdout: {}",
+                expected.display(),
+                stdout
+            ));
+        }
     }
 
     println!("    PASS");
@@ -1010,6 +1228,25 @@ fn test_print_env(config: &TestConfig) -> Result<(), String> {
         return Err(format!("Stub failed with exit code {}: {}", exit_code, stderr));
     }
 
+    #[cfg(unix)]
+    {
+        let expected = runfiles
+            .get_path(&print_env_rlocation)
+            .ok_or_else(|| format!("Missing manifest entry for {}", print_env_rlocation))?;
+        let actual = stdout
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("ARGS:"))
+            .and_then(|args| args.split('|').next());
+        if actual != Some(expected.to_string_lossy().as_ref()) {
+            return Err(format!(
+                "Environment manifest changed argv[0].\nexpected: {}\nstdout: {}",
+                expected.display(),
+                stdout
+            ));
+        }
+    }
+
     // Verify embedded arguments are passed
     if !stdout.contains("--embedded-flag") {
         return Err(format!("Missing embedded flag in output: {}", stdout));
@@ -1173,6 +1410,7 @@ fn main() -> ExitCode {
     let tests: Vec<(&str, fn(&TestConfig) -> Result<(), String>)> = vec![
         ("hash_file", test_hash_file),
         ("add_numbers_runtime_args", test_add_numbers_runtime_args),
+        ("runfiles_source_precedence", test_runfiles_source_precedence),
         ("merge_json", test_merge_json),
         ("orchestrator_env_propagation", test_orchestrator_env_propagation),
         ("mixed_arguments", test_mixed_arguments),

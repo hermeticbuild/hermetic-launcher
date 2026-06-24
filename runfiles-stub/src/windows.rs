@@ -28,6 +28,8 @@ const CREATE_UNICODE_ENVIRONMENT: DWORD = 0x00000400;
 
 // File sharing and memory-mapping parameters (for the runfiles manifest)
 const FILE_SHARE_READ: DWORD = 0x00000001;
+const FILE_SHARE_WRITE: DWORD = 0x00000002;
+const FILE_SHARE_DELETE: DWORD = 0x00000004;
 const PAGE_READONLY: DWORD = 0x02;
 const FILE_MAP_READ: DWORD = 0x04;
 
@@ -160,10 +162,13 @@ pub fn exit(code: i32) -> ! {
 pub fn path_exists(path: &[u8]) -> bool {
     const FILE_FLAG_BACKUP_SEMANTICS: DWORD = 0x02000000;
     unsafe {
+        // Request no access and allow ordinary sharing: an existence probe
+        // should not fail merely because another process has the path open.
+        // https://learn.microsoft.com/windows/win32/api/fileapi/nf-fileapi-createfilea
         let handle = CreateFileA(
             path.as_ptr(),
-            GENERIC_READ,
             0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             core::ptr::null_mut(),
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS,
@@ -302,11 +307,11 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> Vec<u16> {
         if env_block.is_null() {
             // No parent environment: add runfiles vars in sorted order.
             if let Some(rf) = runfiles {
-                if let Some(ref path) = rf.dir_path {
+                if let Some(path) = rf.dir_path() {
                     push_var(&mut buf, b"JAVA_RUNFILES", path);
                     push_var(&mut buf, b"RUNFILES_DIR", path);
                 }
-                if let Some(ref path) = rf.manifest_path {
+                if let Some(path) = rf.manifest_path() {
                     push_var(&mut buf, b"RUNFILES_MANIFEST_FILE", path);
                 }
             }
@@ -327,22 +332,31 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> Vec<u16> {
                 }
                 let entry_ptr = env_block.add(entry_start);
 
-                // Skip existing runfiles vars (we re-insert our own).
-                let prefixed = |needle: &[u8]| -> bool {
-                    entry_len > needle.len()
-                        && (0..needle.len()).all(|i| *entry_ptr.add(i) == needle[i] as u16)
+                // Remove inherited runfiles variables before optionally inserting
+                // the values selected for this launch.
+                let ascii_upper = |unit: u16| {
+                    if (b'a' as u16..=b'z' as u16).contains(&unit) {
+                        unit - 32
+                    } else {
+                        unit
+                    }
                 };
-                let should_skip = prefixed(b"RUNFILES_MANIFEST_FILE=")
-                    || prefixed(b"RUNFILES_DIR=")
-                    || prefixed(b"JAVA_RUNFILES=");
+                let prefixed_case_insensitive = |needle: &[u8]| -> bool {
+                    entry_len >= needle.len()
+                        && (0..needle.len()).all(|i| {
+                            ascii_upper(*entry_ptr.add(i)) == ascii_upper(needle[i] as u16)
+                        })
+                };
+                let should_skip = prefixed_case_insensitive(b"RUNFILES_MANIFEST_FILE=")
+                    || prefixed_case_insensitive(b"RUNFILES_DIR=")
+                    || prefixed_case_insensitive(b"JAVA_RUNFILES=");
 
                 if !should_skip {
                     // Case-insensitive "does this entry sort after `target`?"
                     let var_comes_after = |target: &[u8]| -> bool {
-                        let upper = |c: u16| if (b'a' as u16..=b'z' as u16).contains(&c) { c - 32 } else { c };
                         for i in 0..target.len().min(entry_len) {
-                            let e = upper(*entry_ptr.add(i));
-                            let t = upper(target[i] as u16);
+                            let e = ascii_upper(*entry_ptr.add(i));
+                            let t = ascii_upper(target[i] as u16);
                             if e != t {
                                 return e > t;
                             }
@@ -352,7 +366,7 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> Vec<u16> {
 
                     if !java_inserted && var_comes_after(b"JAVA_RUNFILES") {
                         if let Some(rf) = runfiles {
-                            if let Some(ref path) = rf.dir_path {
+                            if let Some(path) = rf.dir_path() {
                                 push_var(&mut buf, b"JAVA_RUNFILES", path);
                             }
                         }
@@ -360,7 +374,7 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> Vec<u16> {
                     }
                     if !dir_inserted && var_comes_after(b"RUNFILES_DIR") {
                         if let Some(rf) = runfiles {
-                            if let Some(ref path) = rf.dir_path {
+                            if let Some(path) = rf.dir_path() {
                                 push_var(&mut buf, b"RUNFILES_DIR", path);
                             }
                         }
@@ -368,7 +382,7 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> Vec<u16> {
                     }
                     if !manifest_inserted && var_comes_after(b"RUNFILES_MANIFEST_FILE") {
                         if let Some(rf) = runfiles {
-                            if let Some(ref path) = rf.manifest_path {
+                            if let Some(path) = rf.manifest_path() {
                                 push_var(&mut buf, b"RUNFILES_MANIFEST_FILE", path);
                             }
                         }
@@ -388,17 +402,17 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> Vec<u16> {
             // Append any runfiles vars that sort after every existing entry.
             if let Some(rf) = runfiles {
                 if !java_inserted {
-                    if let Some(ref path) = rf.dir_path {
+                    if let Some(path) = rf.dir_path() {
                         push_var(&mut buf, b"JAVA_RUNFILES", path);
                     }
                 }
                 if !dir_inserted {
-                    if let Some(ref path) = rf.dir_path {
+                    if let Some(path) = rf.dir_path() {
                         push_var(&mut buf, b"RUNFILES_DIR", path);
                     }
                 }
                 if !manifest_inserted {
-                    if let Some(ref path) = rf.manifest_path {
+                    if let Some(path) = rf.manifest_path() {
                         push_var(&mut buf, b"RUNFILES_MANIFEST_FILE", path);
                     }
                 }
