@@ -444,6 +444,11 @@ fn test_add_numbers_runtime_args(config: &TestConfig) -> Result<(), String> {
 fn test_runfiles_source_precedence(config: &TestConfig) -> Result<(), String> {
     println!("  Running test: runfiles_source_precedence");
 
+    // The launcher prefers a directory at equal precedence where Bazel
+    // materializes the runfiles tree; on Windows the tree is sparse, so the
+    // manifest wins. Mirror that choice when asserting the selected source.
+    let prefer_directory = !cfg!(windows);
+
     let test_dir = config.work_dir.join("test_runfiles_source_precedence");
     fs::create_dir_all(&test_dir).map_err(|e| format!("Failed to create test dir: {}", e))?;
 
@@ -475,8 +480,9 @@ fn test_runfiles_source_precedence(config: &TestConfig) -> Result<(), String> {
         &[0],
     )?;
 
-    // Both environment sources have the same precedence, so the directory owns
-    // both resolution and the environment exported to the child.
+    // Both environment sources have the same precedence. Where the runfiles tree
+    // is materialized the directory owns both resolution and the exported
+    // environment; on Windows the tree is sparse, so the manifest wins.
     let mut command = Command::new(&stub_path);
     command
         .env("RUNFILES_DIR", &runfiles.runfiles_dir)
@@ -487,14 +493,21 @@ fn test_runfiles_source_precedence(config: &TestConfig) -> Result<(), String> {
         .map_err(|e| format!("Failed to run stub with both runfiles variables: {}", e))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if !output.status.success()
-        || !stdout.contains("ARGC:3")
-        || environment_path(&stdout, "RUNFILES_DIR") != Some(runfiles.runfiles_dir.as_path())
-        || environment_path(&stdout, "JAVA_RUNFILES") != Some(runfiles.runfiles_dir.as_path())
-        || !stdout.contains("ENV:RUNFILES_MANIFEST_FILE=<unset>")
-    {
+    // The directory maps `tool` to print-env (prints ARGC/ENV), the manifest to
+    // add-numbers (prints SUM), so the output identifies which source was chosen.
+    let selected_expected = if prefer_directory {
+        output.status.success()
+            && stdout.contains("ARGC:3")
+            && environment_path(&stdout, "RUNFILES_DIR") == Some(runfiles.runfiles_dir.as_path())
+            && environment_path(&stdout, "JAVA_RUNFILES") == Some(runfiles.runfiles_dir.as_path())
+            && stdout.contains("ENV:RUNFILES_MANIFEST_FILE=<unset>")
+    } else {
+        output.status.success() && stdout.contains("SUM:15") && !stdout.contains("ARGC:3")
+    };
+    if !selected_expected {
         return Err(format!(
-            "Directory environment source did not win the tie.\nstdout: {}\nstderr: {}",
+            "Same-precedence environment sources did not select the {} source.\nstdout: {}\nstderr: {}",
+            if prefer_directory { "directory" } else { "manifest" },
             stdout, stderr
         ));
     }
@@ -561,7 +574,8 @@ fn test_runfiles_source_precedence(config: &TestConfig) -> Result<(), String> {
     }
 
     // With no environment source, the adjacent directory and manifest have equal
-    // precedence, so the directory wins and is exported consistently.
+    // precedence: the directory wins where the tree is materialized, the manifest
+    // on Windows, and the winner is exported consistently.
     let mut command = Command::new(&stub_path);
     command
         .env_remove("RUNFILES_DIR")
@@ -572,65 +586,112 @@ fn test_runfiles_source_precedence(config: &TestConfig) -> Result<(), String> {
         .map_err(|e| format!("Failed to run stub with adjacent sources: {}", e))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if !output.status.success()
-        || !stdout.contains("ARGC:3")
-        || environment_path(&stdout, "RUNFILES_DIR") != Some(runfiles.runfiles_dir.as_path())
-        || environment_path(&stdout, "JAVA_RUNFILES") != Some(runfiles.runfiles_dir.as_path())
-        || !stdout.contains("ENV:RUNFILES_MANIFEST_FILE=<unset>")
-    {
+    let selected_expected = if prefer_directory {
+        output.status.success()
+            && stdout.contains("ARGC:3")
+            && environment_path(&stdout, "RUNFILES_DIR") == Some(runfiles.runfiles_dir.as_path())
+            && environment_path(&stdout, "JAVA_RUNFILES") == Some(runfiles.runfiles_dir.as_path())
+            && stdout.contains("ENV:RUNFILES_MANIFEST_FILE=<unset>")
+    } else {
+        output.status.success() && stdout.contains("SUM:15") && !stdout.contains("ARGC:3")
+    };
+    if !selected_expected {
         return Err(format!(
-            "Adjacent directory did not win the tie.\nstdout: {}\nstderr: {}",
+            "Adjacent {} source did not win the tie.\nstdout: {}\nstderr: {}",
+            if prefer_directory { "directory" } else { "manifest" },
             stdout, stderr,
         ));
     }
 
-    // Source selection is global, not per key. A missing directory entry must
-    // not fall through to either an environment or adjacent manifest.
-    let missing_rlocation = format!("{}/bin/missing{}", WORKSPACE_NAME, EXE_EXT);
-    let missing_stub_name = format!("missing_stub{}", EXE_EXT);
-    let missing_stub = test_dir.join(&missing_stub_name);
-    let missing_manifest = test_dir.join(format!("{}.runfiles_manifest", missing_stub_name));
-    let add_target = add_binary.to_string_lossy();
-    #[cfg(windows)]
-    let add_target = add_target.replace('\\', "/");
-    fs::write(
-        &missing_manifest,
-        format!("{} {}\n", missing_rlocation, add_target),
-    )
-    .map_err(|e| format!("Failed to write no-fallback fixture: {}", e))?;
-    finalize_stub(
-        config,
-        &missing_stub,
-        &[&missing_rlocation, "7", "8"],
-        &[0],
-    )?;
-    for (case, manifest_env) in [
-        ("environment manifest", Some(&missing_manifest)),
-        ("adjacent manifest", None),
-    ] {
-        let mut command = Command::new(&missing_stub);
+    // Source selection is global, not per key: a key that only the NON-selected
+    // source can resolve must not fall through to it.
+    //
+    // Case A: both sources come from the environment, so the platform preference
+    // picks the winner. Embed a key that lives ONLY in the loser — any
+    // fall-through would resolve it and betray the mixing.
+    {
+        let a_stub_name = format!("no_fallthrough_env_stub{}", EXE_EXT);
+        let a_stub = test_dir.join(&a_stub_name);
+        let a_manifest = test_dir.join("no_fallthrough_env.runfiles_manifest");
+        // Manifest RHS values use forward slashes (Bazel's Windows convention);
+        // harmless on Unix, where paths carry no backslashes.
+        let add_target = add_binary.to_string_lossy().replace('\\', "/");
+
+        let embedded_key = if prefer_directory {
+            // Directory wins; put the embedded key only in the manifest.
+            let key = format!("{}/bin/only_in_manifest{}", WORKSPACE_NAME, EXE_EXT);
+            fs::write(&a_manifest, format!("{} {}\n", key, add_target))
+                .map_err(|e| format!("Failed to write no-fallthrough manifest: {}", e))?;
+            key
+        } else {
+            // Manifest wins; reuse `tool` (present only in the directory, as
+            // print-env) and give the manifest an unrelated entry so it loads but
+            // cannot resolve the key.
+            let decoy = format!("{}/bin/decoy{}", WORKSPACE_NAME, EXE_EXT);
+            fs::write(&a_manifest, format!("{} {}\n", decoy, add_target))
+                .map_err(|e| format!("Failed to write no-fallthrough manifest: {}", e))?;
+            executable_rlocation.clone()
+        };
+        finalize_stub(config, &a_stub, &[&embedded_key, "7", "8"], &[0])?;
+
+        let mut command = Command::new(&a_stub);
         command
             .env("RUNFILES_DIR", &runfiles.runfiles_dir)
+            .env("RUNFILES_MANIFEST_FILE", &a_manifest)
             .env_remove("JAVA_RUNFILES");
-        if let Some(manifest) = manifest_env {
-            command.env("RUNFILES_MANIFEST_FILE", manifest);
-        } else {
-            command.env_remove("RUNFILES_MANIFEST_FILE");
-        }
         let output = command
             .output()
-            .map_err(|e| format!("Failed to test no-fallback {}: {}", case, e))?;
+            .map_err(|e| format!("Failed to test no-fallthrough environment sources: {}", e))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if output.status.success() || stdout.contains("SUM:15") {
+        // The loser's happy-path signature must never appear: SUM from the
+        // manifest's add-numbers, or ARGC from the directory's print-env.
+        let loser_ran = if prefer_directory {
+            stdout.contains("SUM:15")
+        } else {
+            stdout.contains("ARGC")
+        };
+        if output.status.success() || loser_ran {
             return Err(format!(
-                "Directory selection fell through to {}.\nstdout: {}\nstderr: {}",
-                case, stdout, stderr
+                "Selected source fell through to the other (environment sources).\nstdout: {}\nstderr: {}",
+                stdout, stderr
             ));
         }
     }
 
-    println!("    PASS (environment precedence, then directory preference)");
+    // Case B: RUNFILES_DIR is the only environment source (the manifest is merely
+    // adjacent), so the environment directory wins on every platform; a key only
+    // the adjacent manifest holds must not fall through to it.
+    {
+        let missing_rlocation = format!("{}/bin/missing{}", WORKSPACE_NAME, EXE_EXT);
+        let missing_stub_name = format!("missing_stub{}", EXE_EXT);
+        let missing_stub = test_dir.join(&missing_stub_name);
+        let missing_manifest =
+            test_dir.join(format!("{}.runfiles_manifest", missing_stub_name));
+        let add_target = add_binary.to_string_lossy().replace('\\', "/");
+        fs::write(&missing_manifest, format!("{} {}\n", missing_rlocation, add_target))
+            .map_err(|e| format!("Failed to write no-fallthrough adjacent fixture: {}", e))?;
+        finalize_stub(config, &missing_stub, &[&missing_rlocation, "7", "8"], &[0])?;
+
+        let mut command = Command::new(&missing_stub);
+        command
+            .env("RUNFILES_DIR", &runfiles.runfiles_dir)
+            .env_remove("RUNFILES_MANIFEST_FILE")
+            .env_remove("JAVA_RUNFILES");
+        let output = command
+            .output()
+            .map_err(|e| format!("Failed to test no-fallthrough adjacent manifest: {}", e))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.success() || stdout.contains("SUM:15") {
+            return Err(format!(
+                "Environment directory fell through to the adjacent manifest.\nstdout: {}\nstderr: {}",
+                stdout, stderr
+            ));
+        }
+    }
+
+    println!("    PASS (environment precedence, then platform source preference)");
     Ok(())
 }
 

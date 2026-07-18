@@ -152,7 +152,9 @@ At startup the finalized launcher selects one runfiles source from:
 2. `<executable>.runfiles/` and `<executable>.runfiles_manifest`
 
 Valid environment-provided sources take precedence over adjacent sources. When both
-sources exist at the same precedence, the runfiles directory wins. Every argument
+sources exist at the same precedence, the runfiles directory wins on platforms that
+materialize the runfiles tree (Linux, macOS); on Windows the tree is not materialized
+by default and the directory is sparse, so the manifest wins there. Every argument
 marked `--transform` resolves only through the selected source (manifest lookup or
 directory join; tree-artifact prefixes supported), and only that source is exported to
 the child. Absolute paths (leading `/`) pass through unchanged. The launcher then
