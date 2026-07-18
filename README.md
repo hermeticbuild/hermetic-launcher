@@ -205,8 +205,16 @@ bash tools/build-release-binaries.sh artifacts
 
 # Tests
 bazel test //integration-tests:integration_test   # finalize + run on the host platform
+bazel test //e2e:all                               # launcher_binary chain vs. BOTH stub sources
 (cd e2e/bzlmod && bazel test //...)                # launcher_binary wrapping cc/go/py/sh
 ```
+
+`//e2e:all` runs the same launcher chain twice — `e2e_chain_prebuilt` against the
+prebuilt stubs downloaded from the release, and `e2e_chain_source_built` against the
+stubs freshly built from this checkout (a per-target transition flips
+`//launcher/private:stub_source`; add `--config=release` to build them exactly as they
+ship). `e2e/bzlmod` is the downstream/BCR test module: it consumes the published
+launcher as an external Bazel module, so it only exercises the prebuilt stubs.
 
 `flake.nix` provides a dev shell (Rust, Wine for Windows testing, gdb).
 

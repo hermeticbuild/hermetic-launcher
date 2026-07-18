@@ -1,4 +1,40 @@
 load("@bazel_skylib//:bzl_library.bzl", "bzl_library")
+load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
+
+# Selects which set of launcher stub binaries the launcher toolchains provide:
+#
+#   "prebuilt"     - the templates/finalizers downloaded from the GitHub release
+#                    (see //launcher/private:extensions.bzl). This is the default
+#                    and the only source visible to downstream modules.
+#   "source_built" - the templates/finalizers built from source in this repo
+#                    (//runfiles-stub, //finalize-stub). Only registered when
+#                    hermetic_launcher is the root module (see MODULE.bazel), so
+#                    downstream consumers never need the Rust build tooling.
+#
+# The prebuilt and source_built toolchains carry matching `target_settings`, so
+# exactly one set matches for a given value of this flag. The in-repo e2e tests
+# flip it per-target with a transition to run against both (see //e2e).
+string_flag(
+    name = "stub_source",
+    build_setting_default = "prebuilt",
+    values = [
+        "prebuilt",
+        "source_built",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "stub_source_prebuilt",
+    flag_values = {":stub_source": "prebuilt"},
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "stub_source_source_built",
+    flag_values = {":stub_source": "source_built"},
+    visibility = ["//visibility:public"],
+)
 
 bzl_library(
     name = "extensions_bzl",
@@ -19,4 +55,14 @@ bzl_library(
     srcs = ["stub_template_toolchain.bzl"],
     visibility = ["//visibility:public"],
     deps = ["//launcher/private/providers:stub_template_toolchain_info_bzl"],
+)
+
+bzl_library(
+    name = "toolchains_bzl",
+    srcs = ["toolchains.bzl"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":stub_finalizer_toolchain_bzl",
+        ":stub_template_toolchain_bzl",
+    ],
 )

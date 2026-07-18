@@ -153,6 +153,12 @@ jobs:
       - env:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         run: bazel test ${BUILDBUDDY_API_KEY:+--config=remote} --config=release //integration-tests:integration_test
+      # End-to-end launcher_binary tests, run against BOTH the prebuilt (downloaded)
+      # and the source-built stubs (see //e2e). --config=release builds the
+      # source-built stubs exactly as they ship.
+      - env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+        run: bazel test ${BUILDBUDDY_API_KEY:+--config=cache} --config=release //e2e:all
       - env:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         run: bazel test ${BUILDBUDDY_API_KEY:+--config=cache} //...
@@ -180,6 +186,12 @@ jobs:
       - env:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         run: bazel test ${BUILDBUDDY_API_KEY:+--config=cache} --config=release //integration-tests:integration_test
+      # End-to-end launcher_binary tests, run against BOTH the prebuilt (downloaded)
+      # and the source-built stubs (see //e2e). --config=release builds the
+      # source-built stubs exactly as they ship.
+      - env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+        run: bazel test ${BUILDBUDDY_API_KEY:+--config=cache} --config=release //e2e:all
       - env:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         run: bazel test ${BUILDBUDDY_API_KEY:+--config=cache} //...
@@ -210,6 +222,14 @@ jobs:
         run: |
           $config = if ($env:BUILDBUDDY_API_KEY) { "--config=cache" } else { $null }
           bazel --output_user_root=C:/b test $config --config=release --test_output=errors //integration-tests:integration_test
+      # End-to-end launcher_binary tests, run against BOTH the prebuilt (downloaded)
+      # and the source-built stubs (see //e2e). --config=release builds the
+      # source-built stubs exactly as they ship.
+      - env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+        run: |
+          $config = if ($env:BUILDBUDDY_API_KEY) { "--config=cache" } else { $null }
+          bazel --output_user_root=C:/b test $config --config=release --test_output=errors //e2e:all
       - env:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         run: |
