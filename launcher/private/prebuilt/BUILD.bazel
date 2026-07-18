@@ -1,204 +1,25 @@
-load("//launcher/private:stub_template_toolchain.bzl", "stub_template_toolchain")
-load("//launcher/private:stub_finalizer_toolchain.bzl", "stub_finalizer_toolchain")
+load("//launcher/private:toolchains.bzl", "launcher_stub_toolchains")
 
 package(default_visibility = ["//visibility:public"])
 
-stub_template_toolchain(
-    name = "template_aarch64_linux",
-    template_exe = "@runfiles_stub_aarch64_linux//file",
-)
-
-toolchain(
-    name = "template_aarch64_linux_toolchain",
-    target_compatible_with = [
-        "@platforms//cpu:aarch64",
-        "@platforms//os:linux",
-    ],
-    toolchain = ":template_aarch64_linux",
-    toolchain_type = "//launcher:template_toolchain_type",
-)
-
-toolchain(
-    name = "template_aarch64_linux_exec_toolchain",
-    exec_compatible_with = [
-        "@platforms//cpu:aarch64",
-        "@platforms//os:linux",
-    ],
-    toolchain = ":template_aarch64_linux",
-    toolchain_type = "//launcher:template_exec_toolchain_type",
-)
-
-stub_template_toolchain(
-    name = "template_aarch64_macos",
-    template_exe = "@runfiles_stub_aarch64_macos//file",
-)
-
-toolchain(
-    name = "template_aarch64_macos_toolchain",
-    target_compatible_with = [
-        "@platforms//cpu:aarch64",
-        "@platforms//os:macos",
-    ],
-    toolchain = ":template_aarch64_macos",
-    toolchain_type = "//launcher:template_toolchain_type",
-)
-
-toolchain(
-    name = "template_aarch64_macos_exec_toolchain",
-    exec_compatible_with = [
-        "@platforms//cpu:aarch64",
-        "@platforms//os:macos",
-    ],
-    toolchain = ":template_aarch64_macos",
-    toolchain_type = "//launcher:template_exec_toolchain_type",
-)
-
-stub_template_toolchain(
-    name = "template_x86_64_linux",
-    template_exe = "@runfiles_stub_x86_64_linux//file",
-)
-
-toolchain(
-    name = "template_x86_64_linux_toolchain",
-    target_compatible_with = [
-        "@platforms//cpu:x86_64",
-        "@platforms//os:linux",
-    ],
-    toolchain = ":template_x86_64_linux",
-    toolchain_type = "//launcher:template_toolchain_type",
-)
-
-toolchain(
-    name = "template_x86_64_linux_exec_toolchain",
-    exec_compatible_with = [
-        "@platforms//cpu:x86_64",
-        "@platforms//os:linux",
-    ],
-    toolchain = ":template_x86_64_linux",
-    toolchain_type = "//launcher:template_exec_toolchain_type",
-)
-
-stub_template_toolchain(
-    name = "template_x86_64_macos",
-    template_exe = "@runfiles_stub_x86_64_macos//file",
-)
-
-toolchain(
-    name = "template_x86_64_macos_toolchain",
-    target_compatible_with = [
-        "@platforms//cpu:x86_64",
-        "@platforms//os:macos",
-    ],
-    toolchain = ":template_x86_64_macos",
-    toolchain_type = "//launcher:template_toolchain_type",
-)
-
-toolchain(
-    name = "template_x86_64_macos_exec_toolchain",
-    exec_compatible_with = [
-        "@platforms//cpu:x86_64",
-        "@platforms//os:macos",
-    ],
-    toolchain = ":template_x86_64_macos",
-    toolchain_type = "//launcher:template_exec_toolchain_type",
-)
-
-stub_template_toolchain(
-    name = "template_x86_64_windows",
-    template_exe = "@runfiles_stub_x86_64_windows//file",
-)
-
-toolchain(
-    name = "template_x86_64_windows_toolchain",
-    target_compatible_with = [
-        "@platforms//cpu:x86_64",
-        "@platforms//os:windows",
-    ],
-    toolchain = ":template_x86_64_windows",
-    toolchain_type = "//launcher:template_toolchain_type",
-)
-
-toolchain(
-    name = "template_x86_64_windows_exec_toolchain",
-    exec_compatible_with = [
-        "@platforms//cpu:x86_64",
-        "@platforms//os:windows",
-    ],
-    toolchain = ":template_x86_64_windows",
-    toolchain_type = "//launcher:template_exec_toolchain_type",
-)
-
-stub_finalizer_toolchain(
-    name = "finalizer_aarch64_linux",
-    finalizer = "@finalize_stub_aarch64_linux//file",
-)
-
-toolchain(
-    name = "finalizer_aarch64_linux_toolchain",
-    exec_compatible_with = [
-        "@platforms//cpu:aarch64",
-        "@platforms//os:linux",
-    ],
-    toolchain = ":finalizer_aarch64_linux",
-    toolchain_type = "//launcher:finalizer_toolchain_type",
-)
-
-stub_finalizer_toolchain(
-    name = "finalizer_aarch64_macos",
-    finalizer = "@finalize_stub_aarch64_macos//file",
-)
-
-toolchain(
-    name = "finalizer_aarch64_macos_toolchain",
-    exec_compatible_with = [
-        "@platforms//cpu:aarch64",
-        "@platforms//os:macos",
-    ],
-    toolchain = ":finalizer_aarch64_macos",
-    toolchain_type = "//launcher:finalizer_toolchain_type",
-)
-
-stub_finalizer_toolchain(
-    name = "finalizer_x86_64_linux",
-    finalizer = "@finalize_stub_x86_64_linux//file",
-)
-
-toolchain(
-    name = "finalizer_x86_64_linux_toolchain",
-    exec_compatible_with = [
-        "@platforms//cpu:x86_64",
-        "@platforms//os:linux",
-    ],
-    toolchain = ":finalizer_x86_64_linux",
-    toolchain_type = "//launcher:finalizer_toolchain_type",
-)
-
-stub_finalizer_toolchain(
-    name = "finalizer_x86_64_macos",
-    finalizer = "@finalize_stub_x86_64_macos//file",
-)
-
-toolchain(
-    name = "finalizer_x86_64_macos_toolchain",
-    exec_compatible_with = [
-        "@platforms//cpu:x86_64",
-        "@platforms//os:macos",
-    ],
-    toolchain = ":finalizer_x86_64_macos",
-    toolchain_type = "//launcher:finalizer_toolchain_type",
-)
-
-stub_finalizer_toolchain(
-    name = "finalizer_x86_64_windows",
-    finalizer = "@finalize_stub_x86_64_windows//file",
-)
-
-toolchain(
-    name = "finalizer_x86_64_windows_toolchain",
-    exec_compatible_with = [
-        "@platforms//cpu:x86_64",
-        "@platforms//os:windows",
-    ],
-    toolchain = ":finalizer_x86_64_windows",
-    toolchain_type = "//launcher:finalizer_toolchain_type",
+# Toolchains backed by the prebuilt templates/finalizers downloaded from the
+# GitHub release (see //launcher/private:extensions.bzl). These are registered for
+# every module (root and downstream) via //launcher/private/prebuilt:all, and are
+# the default: they resolve when //launcher/private:stub_source is "prebuilt".
+launcher_stub_toolchains(
+    name = "prebuilt",
+    finalizers = {
+        "aarch64_linux": "@finalize_stub_aarch64_linux//file",
+        "aarch64_macos": "@finalize_stub_aarch64_macos//file",
+        "x86_64_linux": "@finalize_stub_x86_64_linux//file",
+        "x86_64_macos": "@finalize_stub_x86_64_macos//file",
+        "x86_64_windows": "@finalize_stub_x86_64_windows//file",
+    },
+    templates = {
+        "aarch64_linux": "@runfiles_stub_aarch64_linux//file",
+        "aarch64_macos": "@runfiles_stub_aarch64_macos//file",
+        "x86_64_linux": "@runfiles_stub_x86_64_linux//file",
+        "x86_64_macos": "@runfiles_stub_x86_64_macos//file",
+        "x86_64_windows": "@runfiles_stub_x86_64_windows//file",
+    },
 )

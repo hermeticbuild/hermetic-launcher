@@ -1,0 +1,32 @@
+load("//launcher/private:toolchains.bzl", "launcher_stub_toolchains")
+
+package(default_visibility = ["//visibility:public"])
+
+# Toolchains backed by the templates/finalizers built from source in this repo
+# (//runfiles-stub, //finalize-stub), platform-transitioned to each target triple
+# and run through the release optimization pipeline — the same artifacts that ship
+# in a release (see //integration-tests:release-template).
+#
+# These are registered ONLY when hermetic_launcher is the root module (see
+# MODULE.bazel: `dev_dependency = True`), because building them needs the Rust
+# toolchains/crates that are dev dependencies. They resolve when
+# //launcher/private:stub_source is "source_built"; the in-repo e2e tests flip that
+# flag per-target with a transition so one `bazel test //e2e:all` covers both the
+# downloaded and the freshly-built launcher (see //e2e).
+launcher_stub_toolchains(
+    name = "source_built",
+    finalizers = {
+        "aarch64_linux": "//finalize-stub:finalize-stub_aarch64-unknown-linux-musl",
+        "aarch64_macos": "//finalize-stub:finalize-stub_aarch64-apple-darwin",
+        "x86_64_linux": "//finalize-stub:finalize-stub_x86_64-unknown-linux-musl",
+        "x86_64_macos": "//finalize-stub:finalize-stub_x86_64-apple-darwin",
+        "x86_64_windows": "//finalize-stub:finalize-stub_x86_64-pc-windows-gnullvm",
+    },
+    templates = {
+        "aarch64_linux": "//runfiles-stub:runfiles-stub_aarch64-unknown-linux-musl",
+        "aarch64_macos": "//runfiles-stub:runfiles-stub_aarch64-apple-darwin",
+        "x86_64_linux": "//runfiles-stub:runfiles-stub_x86_64-unknown-linux-musl",
+        "x86_64_macos": "//runfiles-stub:runfiles-stub_x86_64-apple-darwin",
+        "x86_64_windows": "//runfiles-stub:runfiles-stub_x86_64-pc-windows-gnullvm",
+    },
+)

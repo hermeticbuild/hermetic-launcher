@@ -1,0 +1,66 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_go//go:def.bzl", "go_binary")
+load("@rules_python//python:py_binary.bzl", "py_binary")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+load("//e2e:defs.bzl", "launcher_e2e_test")
+load("//launcher:launcher_binary.bzl", "launcher_binary")
+
+# The same cc/go/py/sh launcher chain as the downstream BCR test module in
+# e2e/bzlmod, but run against BOTH stub sources (see :defs.bzl). e2e/bzlmod stays a
+# standalone module that consumes the published (prebuilt) launcher exactly as an
+# external user would; this package additionally builds the stubs from source, which
+# needs the root module's Rust dev toolchains. The sources are intentionally kept in
+# sync with e2e/bzlmod's copies.
+
+cc_binary(
+    name = "hello_cc",
+    srcs = ["hello_cc.cc"],
+)
+
+go_binary(
+    name = "hello_go",
+    srcs = ["hello_go.go"],
+    importpath = "example.com/hello_go",
+    # Build without cgo. hello_go is pure Go, but rules_go otherwise compiles the
+    # cgo-enabled Go stdlib, and this (root) workspace's C toolchain is LLVM/clang
+    # (BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=1, no MSVC autodetect). On Windows that
+    # fails building runtime/cgo: clang rejects Go's `-mthreads` under
+    # -Werror,-Wunused-command-line-argument. (e2e/bzlmod avoids this via MSVC.)
+    pure = "on",
+)
+
+py_binary(
+    name = "hello_py",
+    srcs = ["hello_py.py"],
+)
+
+sh_binary(
+    name = "hello_sh",
+    srcs = ["hello_sh.sh"],
+)
+
+# Chain: Go -> Python -> C++ -> Shell
+# Single launcher_binary with Go as entrypoint, passing rlocationpaths
+# for the rest of the chain as embedded args.
+launcher_binary(
+    name = "launch_chain",
+    data = [
+        ":hello_cc",
+        ":hello_py",
+        ":hello_sh",
+    ],
+    embedded_args = [
+        "$(rlocationpath :hello_py)",
+        "$(rlocationpath :hello_cc)",
+        "$(rlocationpath :hello_sh)",
+    ],
+    entrypoint = ":hello_go",
+)
+
+# Emits e2e_chain_prebuilt + e2e_chain_source_built (grouped by the e2e_chain
+# test_suite), so `bazel test //e2e:all` runs the chain against the downloaded
+# stubs and the freshly source-built stubs.
+launcher_e2e_test(
+    name = "e2e_chain",
+    launcher = ":launch_chain",
+)
