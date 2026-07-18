@@ -135,6 +135,13 @@ extern "system" {
 pub const SEP: char = '\\';
 pub const NEWLINE: &[u8] = b"\r\n";
 
+// Windows does not materialize the runfiles symlink tree by default (creating
+// symlinks requires privileges), so a sibling `<exe>.runfiles` / `RUNFILES_DIR`
+// is sparse — only the manifest maps runfiles to real paths. Prefer the manifest
+// at equal precedence; a directory-first choice would resolve to files that do
+// not exist. See runfiles.rs `select_source`.
+pub const PREFER_DIRECTORY_SOURCE: bool = false;
+
 pub fn is_absolute(path: &str) -> bool {
     let b = path.as_bytes();
     b.len() >= 2

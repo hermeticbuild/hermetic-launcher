@@ -24,47 +24,59 @@ pub enum Runfiles {
 impl Runfiles {
     pub fn create(rt: &platform::RuntimeArgs) -> Option<Self> {
         // Environment-provided sources take precedence over sources discovered
-        // next to the executable. At the same precedence, prefer a directory.
-        if let Some(runfiles_dir) = platform::get_env_var(b"RUNFILES_DIR")
-            .filter(|path| !path.is_empty() && dir_exists(path))
-        {
-            return Some(Self::Directory { path: runfiles_dir });
-        }
-        if let Some(manifest_path) = platform::get_env_var(b"RUNFILES_MANIFEST_FILE")
-            .filter(|path| !path.is_empty())
-        {
-            if let Some(manifest) = load_manifest(&manifest_path) {
-                return Some(Self::Manifest {
-                    manifest,
-                    path: manifest_path,
-                    logical_dir: None,
-                });
-            }
+        // next to the executable. Within a tier, `select_source` applies the
+        // platform's directory-vs-manifest preference.
+        if let Some(rf) = select_source(
+            || {
+                platform::get_env_var(b"RUNFILES_DIR")
+                    .filter(|path| !path.is_empty() && dir_exists(path))
+                    .map(|path| Self::Directory { path })
+            },
+            || {
+                platform::get_env_var(b"RUNFILES_MANIFEST_FILE")
+                    .filter(|path| !path.is_empty())
+                    .and_then(|path| {
+                        load_manifest(&path).map(|manifest| Self::Manifest {
+                            manifest,
+                            path,
+                            logical_dir: None,
+                        })
+                    })
+            },
+        ) {
+            return Some(rf);
         }
 
-        // Locate runfiles next to the launching executable:
-        // <executable>.runfiles directory first, then
-        // <executable>.runfiles_manifest file. The executable path comes from the
-        // OS (an absolute, non-symlink-resolved launch path), not from argv[0].
+        // Locate runfiles next to the launching executable: the
+        // <executable>.runfiles directory and the <executable>.runfiles_manifest
+        // file, in the platform's preferred order. The executable path comes from
+        // the OS (an absolute, non-symlink-resolved launch path), not from argv[0].
         if let Some(exe_path) = rt.executable_path() {
             let exe_len = cstr_len(&exe_path);
             if exe_len > 0 {
                 // Convert the executable path to a string (if valid UTF-8).
                 let exe_str = core::str::from_utf8(&exe_path[..exe_len]).ok()?;
                 let runfiles_dir = String::from(exe_str) + ".runfiles";
-                if dir_exists(&runfiles_dir) {
-                    return Some(Self::Directory { path: runfiles_dir });
-                }
-
                 let manifest_path = String::from(exe_str) + ".runfiles_manifest";
-                if let Some(manifest) = load_manifest(&manifest_path) {
-                    return Some(Self::Manifest {
-                        manifest,
-                        path: manifest_path,
-                        // Preserve the logical path even though the sibling tree
-                        // is absent; the manifest selected the actual executable.
-                        logical_dir: Some(runfiles_dir),
-                    });
+
+                if let Some(rf) = select_source(
+                    || {
+                        dir_exists(&runfiles_dir).then(|| Self::Directory {
+                            path: runfiles_dir.clone(),
+                        })
+                    },
+                    || {
+                        load_manifest(&manifest_path).map(|manifest| Self::Manifest {
+                            manifest,
+                            path: manifest_path.clone(),
+                            // Preserve the logical path even though the sibling
+                            // tree is absent; the manifest selected the actual
+                            // executable.
+                            logical_dir: Some(runfiles_dir.clone()),
+                        })
+                    },
+                ) {
+                    return Some(rf);
                 }
             }
         }
@@ -104,6 +116,25 @@ impl Runfiles {
             Self::Manifest { .. } => None,
             Self::Directory { path } => Some(path),
         }
+    }
+}
+
+/// Choose between a directory and a manifest source at equal precedence.
+///
+/// Both are evaluated lazily — we never probe a directory or open a manifest we
+/// do not end up selecting. The directory is preferred where the platform
+/// materializes the runfiles tree; on Windows the tree is not materialized by
+/// default, so the sibling directory is sparse and the manifest must win
+/// (otherwise `rlocation`s resolve to files that do not exist). See
+/// `platform::PREFER_DIRECTORY_SOURCE`.
+fn select_source(
+    directory: impl FnOnce() -> Option<Runfiles>,
+    manifest: impl FnOnce() -> Option<Runfiles>,
+) -> Option<Runfiles> {
+    if platform::PREFER_DIRECTORY_SOURCE {
+        directory().or_else(manifest)
+    } else {
+        manifest().or_else(directory)
     }
 }
 

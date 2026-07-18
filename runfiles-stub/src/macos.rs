@@ -95,6 +95,11 @@ const MAXPATHLEN: usize = 1024;
 pub const SEP: char = '/';
 pub const NEWLINE: &[u8] = b"\n";
 
+// macOS materializes the runfiles symlink tree, so a runfiles directory is fully
+// populated and preferred over an equal-precedence manifest. See runfiles.rs
+// `select_source`.
+pub const PREFER_DIRECTORY_SOURCE: bool = true;
+
 pub fn is_absolute(path: &str) -> bool {
     path.starts_with('/')
 }
