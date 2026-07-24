@@ -58,8 +58,68 @@ def _compile_stub(*, ctx, embedded_args, transformed_args, output_file, cfg = "t
     )
     return output_file
 
+def _runfiles(*, files, self, embedded_args, transformed_args):
+    for file in files:
+        _append_runfile(
+            file = file,
+            embedded_args = embedded_args,
+            transformed_args = transformed_args,
+        )
+    return self
+
+def _embedded_args(*, args, self, embedded_args, transformed_args):
+    for arg in args:
+        _append_embedded_arg(
+            arg = arg,
+            embedded_args = embedded_args,
+            transformed_args = transformed_args,
+        )
+    return self
+
+def _raw_transformed_args(*, args, self, embedded_args, transformed_args):
+    for arg in args:
+        _append_raw_transformed_arg(
+            arg = arg,
+            embedded_args = embedded_args,
+            transformed_args = transformed_args,
+        )
+    return self
+
+# buildifier: disable=uninitialized
+def _entrypoint(executable_file, *, transformed_args = None):
+    mutable_embedded_args = [_to_rlocation_path(executable_file)]
+    mutable_transformed_args = [0]
+    self = struct(
+        embedded_args = lambda *args: _embedded_args(
+            args = args,
+            self = self,
+            embedded_args = mutable_embedded_args,
+            transformed_args = mutable_transformed_args,
+        ),
+        raw_transformed_args = lambda *args: _raw_transformed_args(
+            args = args,
+            self = self,
+            embedded_args = mutable_embedded_args,
+            transformed_args = mutable_transformed_args,
+        ),
+        runfiles = lambda *files: _runfiles(
+            self = self,
+            files = files,
+            embedded_args = mutable_embedded_args,
+            transformed_args = mutable_transformed_args,
+        ),
+        compile = lambda ctx, **kwargs: _compile_stub(
+            ctx = ctx,
+            embedded_args = mutable_embedded_args,
+            transformed_args = mutable_transformed_args,
+            **kwargs
+        ),
+    )
+    return self
+
 launcher = struct(
     to_rlocation_path = _to_rlocation_path,
+    entrypoint = _entrypoint,
     args_from_entrypoint = _args_from_entrypoint,
     append_runfile = _append_runfile,
     append_embedded_arg = _append_embedded_arg,
