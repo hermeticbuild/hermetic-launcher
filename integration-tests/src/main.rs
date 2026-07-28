@@ -1405,6 +1405,61 @@ fn test_sparse_inferred_tree_keeps_physical_argv0(config: &TestConfig) -> Result
     Ok(())
 }
 
+/// Regression test: a relative `RUNFILES_MANIFEST_FILE` names a relative tree, and
+/// a relative argv[0] only holds while the child keeps the launcher's working
+/// directory. The manifest's own targets are absolute, so the physical path is
+/// strictly the safer identity here.
+fn test_relative_env_manifest_keeps_physical_argv0(config: &TestConfig) -> Result<(), String> {
+    println!("  Running test: relative_env_manifest_keeps_physical_argv0");
+
+    let test_dir = config.work_dir.join("test_relative_env_manifest");
+    fs::create_dir_all(&test_dir).map_err(|e| format!("Failed to create test dir: {}", e))?;
+
+    // The tree is fully materialized: only the relative manifest path is at issue.
+    let (runfiles, entry_key) = wrapper_runfiles(config, &test_dir, true)?;
+
+    let stub_path = test_dir.join(format!("relative_manifest_stub{}", EXE_EXT));
+    finalize_stub(config, &stub_path, &[&entry_key], &[0])?;
+
+    // `RUNFILES_MANIFEST_FILE` resolved against the launcher's cwd, as the README's
+    // invocation example writes it.
+    fs::copy(&runfiles.manifest_path, test_dir.join("parent.runfiles_manifest"))
+        .map_err(|e| format!("Failed to place sibling manifest: {}", e))?;
+    let output = Command::new(&stub_path)
+        .current_dir(&test_dir)
+        .env("RUNFILES_MANIFEST_FILE", "parent.runfiles_manifest")
+        .env_remove("RUNFILES_DIR")
+        .output()
+        .map_err(|e| format!("Failed to run stub: {}", e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Stub failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let physical = runfiles
+            .runfiles_dir
+            .join(format!("tool_repo/bin/print-env{}", EXE_EXT).replace('/', &PATH_SEP.to_string()));
+        if reported_argv0(&stdout) != Some(physical.to_string_lossy().as_ref()) {
+            return Err(format!(
+                "argv[0] was overridden from a relative manifest path, so it only \
+                 resolves from the launcher's working directory.\n\
+                 expected the physical path: {}\nstdout: {}",
+                physical.display(),
+                stdout
+            ));
+        }
+    }
+
+    println!("    PASS (relative env manifest left argv[0] physical)");
+
+    Ok(())
+}
+
 /// Test: print-env to verify environment and argument passing
 fn test_print_env(config: &TestConfig) -> Result<(), String> {
     println!("  Running test: print_env");
@@ -1635,6 +1690,10 @@ fn main() -> ExitCode {
         (
             "sparse_inferred_tree_keeps_physical_argv0",
             test_sparse_inferred_tree_keeps_physical_argv0,
+        ),
+        (
+            "relative_env_manifest_keeps_physical_argv0",
+            test_relative_env_manifest_keeps_physical_argv0,
         ),
         ("print_env", test_print_env),
         ("large_manifest", test_large_manifest),

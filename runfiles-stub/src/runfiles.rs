@@ -181,6 +181,12 @@ fn dir_exists(path: &str) -> bool {
 /// `<binary>.runfiles_manifest` or as `MANIFEST` inside the tree. Whether that
 /// tree is materialized is settled per entry, in `argv0_rlocation`.
 fn inferred_runfiles_dir(manifest_path: &str) -> Option<LogicalDir> {
+    // A relative manifest names a relative tree, so the argv[0] built from it
+    // holds only while the child keeps our working directory. Manifest targets
+    // are absolute, making the physical path the safer identity.
+    if !platform::is_absolute(manifest_path) {
+        return None;
+    }
     manifest_path
         .strip_suffix("_manifest")
         .filter(|dir| dir.ends_with(".runfiles"))
