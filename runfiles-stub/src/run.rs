@@ -149,9 +149,26 @@ pub fn main(rt: platform::RuntimeArgs) -> ! {
                 return None;
             }
             let arg0 = core::str::from_utf8(&arg0[..arg0_len]).ok()?;
-            let mut path = Vec::from(rf.argv0_rlocation(arg0)?.as_bytes());
-            path.push(0);
-            Some(path)
+            if let Some(logical) = rf.argv0_rlocation(arg0) {
+                let mut path = Vec::from(logical.as_bytes());
+                path.push(0);
+                return Some(path);
+            }
+            // Launching without that identity strands anything the program derives
+            // from argv[0], silently and far from the cause, so refuse to guess.
+            // A literal argument 0 never claimed a runfiles path, so it loses none.
+            if transform_flags & 1 != 0 && rf.logical_identity_lost(arg0) {
+                eline(b"ERROR: Cannot preserve the program's runfiles path in argv[0].");
+                platform::print(b"  program: ");
+                platform::print(arg0.as_bytes());
+                platform::print(platform::NEWLINE);
+                eline(b"The manifest reaches it through a relative target and its runfiles tree was");
+                eline(b"never built, so anything the program locates from argv[0] would resolve");
+                eline(b"against the wrong directory.");
+                eline(b"Set RUNFILES_DIR to the materialized tree, or build with runfile links.");
+                platform::exit(1);
+            }
+            None
         });
 
     let launch = Launch {

@@ -1460,6 +1460,48 @@ fn test_relative_env_manifest_keeps_physical_argv0(config: &TestConfig) -> Resul
     Ok(())
 }
 
+/// Regression test: under `--nobuild_runfile_links` nothing can name the program's
+/// runfiles path, so a program locating anything from argv[0] would resolve against
+/// the wrong directory — fail instead of launching. `relative_manifest_symlinks`
+/// covers a manifest that names no tree and must still launch.
+/// See https://github.com/aspect-build/rules_py/issues/1378.
+fn test_unrecoverable_logical_argv0(config: &TestConfig) -> Result<(), String> {
+    println!("  Running test: unrecoverable_logical_argv0");
+
+    let test_dir = config.work_dir.join("test_unrecoverable_argv0");
+    fs::create_dir_all(&test_dir).map_err(|e| format!("Failed to create test dir: {}", e))?;
+
+    // The same wrapper tree, reached through a conventionally-named manifest whose
+    // own tree was never built.
+    let (mut runfiles, entry_key) = wrapper_runfiles(config, &test_dir, false)?;
+    let manifest_path = test_dir.join("nolinks.runfiles_manifest");
+    fs::copy(&runfiles.manifest_path, &manifest_path)
+        .map_err(|e| format!("Failed to place manifest: {}", e))?;
+    runfiles.manifest_path = manifest_path;
+
+    let stub_path = test_dir.join(format!("nolinks_stub{}", EXE_EXT));
+    finalize_stub(config, &stub_path, &[&entry_key], &[0])?;
+
+    let (stdout, _stderr, exit_code) = run_stub(&stub_path, &runfiles, &[], true)?;
+
+    if exit_code == 0 {
+        return Err(format!(
+            "Stub launched with an unrecoverable argv[0] instead of failing.\nstdout: {}",
+            stdout
+        ));
+    }
+    if !stdout.contains("Cannot preserve the program's runfiles path in argv[0]") {
+        return Err(format!(
+            "Stub failed without explaining why argv[0] could not be preserved.\nstdout: {}",
+            stdout
+        ));
+    }
+
+    println!("    PASS (refused to launch, diagnosed argv[0])");
+
+    Ok(())
+}
+
 /// Test: print-env to verify environment and argument passing
 fn test_print_env(config: &TestConfig) -> Result<(), String> {
     println!("  Running test: print_env");
@@ -1694,6 +1736,10 @@ fn main() -> ExitCode {
         (
             "relative_env_manifest_keeps_physical_argv0",
             test_relative_env_manifest_keeps_physical_argv0,
+        ),
+        (
+            "unrecoverable_logical_argv0",
+            test_unrecoverable_logical_argv0,
         ),
         ("print_env", test_print_env),
         ("large_manifest", test_large_manifest),
