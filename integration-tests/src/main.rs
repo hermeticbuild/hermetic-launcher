@@ -66,6 +66,16 @@ fn resolve_runfile_path(runfiles: &Runfiles, path: PathBuf) -> PathBuf {
     rlocation!(runfiles, runfiles_key.as_str()).unwrap_or(path)
 }
 
+/// argv[0] as print-env reported it: the first `|`-separated field of `ARGS:`.
+#[cfg(unix)]
+fn reported_argv0(stdout: &str) -> Option<&str> {
+    stdout
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("ARGS:"))
+        .and_then(|args| args.split('|').next())
+}
+
 fn environment_path<'a>(stdout: &'a str, name: &str) -> Option<&'a Path> {
     let prefix = format!("ENV:{}=", name);
     stdout
@@ -1040,12 +1050,7 @@ fn test_fallback_runfiles_manifest(config: &TestConfig) -> Result<(), String> {
     #[cfg(unix)]
     {
         let expected = runfiles_dir.join(&print_env_rlocation);
-        let actual = stdout
-            .lines()
-            .next()
-            .and_then(|line| line.strip_prefix("ARGS:"))
-            .and_then(|args| args.split('|').next());
-        if actual != Some(expected.to_string_lossy().as_ref()) {
+        if reported_argv0(&stdout) != Some(expected.to_string_lossy().as_ref()) {
             return Err(format!(
                 "Adjacent manifest did not preserve logical argv[0].\nexpected: {}\nstdout: {}",
                 expected.display(),
@@ -1306,9 +1311,6 @@ fn test_env_manifest_logical_argv0(config: &TestConfig) -> Result<(), String> {
     finalize_stub(config, &stub_path, &[&entry_key], &[0])?;
 
     let written_manifest = runfiles.manifest_path.clone();
-    let expected_argv0 = runfiles
-        .runfiles_dir
-        .join(entry_key.replace('/', &PATH_SEP.to_string()));
 
     // Both layouts Bazel writes a manifest in name the same tree.
     for (layout, manifest_path) in [
@@ -1333,12 +1335,10 @@ fn test_env_manifest_logical_argv0(config: &TestConfig) -> Result<(), String> {
         // Windows derives argv[0] from the command line; the override is Unix-only.
         #[cfg(unix)]
         {
-            let actual = stdout
-                .lines()
-                .next()
-                .and_then(|line| line.strip_prefix("ARGS:"))
-                .and_then(|args| args.split('|').next());
-            if actual != Some(expected_argv0.to_string_lossy().as_ref()) {
+            let expected_argv0 = runfiles
+                .runfiles_dir
+                .join(entry_key.replace('/', &PATH_SEP.to_string()));
+            if reported_argv0(&stdout) != Some(expected_argv0.to_string_lossy().as_ref()) {
                 return Err(format!(
                     "Environment manifest ({}) did not preserve logical argv[0]; the \
                      child was launched as its physical path.\nexpected: {}\nstdout: {}",
@@ -1390,12 +1390,7 @@ fn test_sparse_inferred_tree_keeps_physical_argv0(config: &TestConfig) -> Result
         let physical = runfiles
             .runfiles_dir
             .join(format!("tool_repo/bin/print-env{}", EXE_EXT).replace('/', &PATH_SEP.to_string()));
-        let actual = stdout
-            .lines()
-            .next()
-            .and_then(|line| line.strip_prefix("ARGS:"))
-            .and_then(|args| args.split('|').next());
-        if actual != Some(physical.to_string_lossy().as_ref()) {
+        if reported_argv0(&stdout) != Some(physical.to_string_lossy().as_ref()) {
             return Err(format!(
                 "argv[0] was overridden from a tree that was never materialized.\n\
                  expected the physical path: {}\nstdout: {}",
@@ -1456,12 +1451,7 @@ fn test_print_env(config: &TestConfig) -> Result<(), String> {
         let expected = runfiles
             .get_path(&print_env_rlocation)
             .ok_or_else(|| format!("Missing manifest entry for {}", print_env_rlocation))?;
-        let actual = stdout
-            .lines()
-            .next()
-            .and_then(|line| line.strip_prefix("ARGS:"))
-            .and_then(|args| args.split('|').next());
-        if actual != Some(expected.to_string_lossy().as_ref()) {
+        if reported_argv0(&stdout) != Some(expected.to_string_lossy().as_ref()) {
             return Err(format!(
                 "Environment manifest changed argv[0].\nexpected: {}\nstdout: {}",
                 expected.display(),

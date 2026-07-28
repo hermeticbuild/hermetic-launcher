@@ -109,6 +109,9 @@ impl Runfiles {
         }
     }
 
+    /// The runfiles path to launch `path` under. Consumed only where the launcher
+    /// controls argv[0]; on Windows argv[0] comes from the command line, so nothing
+    /// here reaches the child.
     pub fn argv0_rlocation(&self, path: &str) -> Option<String> {
         match self {
             Self::Directory { path: dir } => Some(join_runfiles_path(dir, path)),
