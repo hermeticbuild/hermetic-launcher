@@ -1,0 +1,14 @@
+load("@bazel_skylib//:bzl_library.bzl", "bzl_library")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+load(":entrypoint_api_test.bzl", "entrypoint_api_test_suite")
+
+package(default_testonly = True)
+
+# Fixtures used by entrypoint_api_test.bzl. They're never executed; they only need to be real
+# targets so ctx.executable.entrypoint / ctx.files.data resolve to real Files.
+sh_binary(
+    name = "fake_entrypoint",
+    srcs = ["fake_entrypoint.sh"],
+)
+
+entrypoint_api_test_suite(name = "entrypoint_api_test", seed = 564789247)
