@@ -65,8 +65,7 @@ process so it can use Bazel's runfiles libraries.
 ### Low-level rule API
 
 For custom rules that need to build launchers programmatically, use `launcher.entrypoint`
-to build up the launcher's arguments fluently, then `.compile()` to emit the binary.
-This is the idiomatic way to use the low-level API:
+to build up the launcher's arguments, then `.compile()` to emit the binary.
 
 ```python
 load("@hermetic_launcher//launcher:lib.bzl", "launcher")
