@@ -1,0 +1,1 @@
+fake main fixture for launcher.entrypoint() analysis tests
