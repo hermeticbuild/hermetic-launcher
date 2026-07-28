@@ -14,11 +14,22 @@ pub enum Runfiles {
     Manifest {
         manifest: Manifest,
         path: String,
-        logical_dir: Option<String>,
+        logical_dir: Option<LogicalDir>,
     },
     Directory {
         path: String,
     },
+}
+
+/// The tree used to give argv[0] a runfiles path when a manifest is the source.
+pub enum LogicalDir {
+    /// Named by the executable's own location, so correct whether or not it was
+    /// materialized.
+    Adjacent(String),
+    /// Inferred from the manifest's path, which proves nothing about the tree:
+    /// for `<tree>/MANIFEST` it is just the file's own parent. Usable only where
+    /// the entry it would name is materialized.
+    Inferred(String),
 }
 
 impl Runfiles {
@@ -40,7 +51,7 @@ impl Runfiles {
                             manifest,
                             // A manifest source does not imply the tree is
                             // absent; recover it so argv[0] stays logical.
-                            logical_dir: sibling_runfiles_dir(&path),
+                            logical_dir: inferred_runfiles_dir(&path),
                             path,
                         })
                     })
@@ -74,7 +85,7 @@ impl Runfiles {
                             // Preserve the logical path even though the sibling
                             // tree is absent; the manifest selected the actual
                             // executable.
-                            logical_dir: Some(runfiles_dir.clone()),
+                            logical_dir: Some(LogicalDir::Adjacent(runfiles_dir.clone())),
                         })
                     },
                 ) {
@@ -99,11 +110,18 @@ impl Runfiles {
     }
 
     pub fn argv0_rlocation(&self, path: &str) -> Option<String> {
-        let dir = match self {
-            Self::Directory { path } => path,
-            Self::Manifest { logical_dir, .. } => logical_dir.as_ref()?,
-        };
-        Some(join_runfiles_path(dir, path))
+        match self {
+            Self::Directory { path: dir } => Some(join_runfiles_path(dir, path)),
+            Self::Manifest { logical_dir, .. } => match logical_dir.as_ref()? {
+                LogicalDir::Adjacent(dir) => Some(join_runfiles_path(dir, path)),
+                // Only an entry that is really there can stand in for argv[0];
+                // a sparse or unbuilt tree would name a path that does not exist.
+                LogicalDir::Inferred(dir) => {
+                    let entry = join_runfiles_path(dir, path);
+                    exists(&entry).then_some(entry)
+                }
+            },
+        }
     }
 
     pub fn manifest_path(&self) -> Option<&str> {
@@ -140,6 +158,12 @@ fn select_source(
     }
 }
 
+fn exists(path: &str) -> bool {
+    let mut path_with_null = Vec::from(path.as_bytes());
+    path_with_null.push(0);
+    platform::path_exists(&path_with_null)
+}
+
 fn dir_exists(path: &str) -> bool {
     // A trailing separator makes the existing-path probe directory-specific on
     // Unix and Windows: regular files cannot be traversed as directories.
@@ -147,19 +171,18 @@ fn dir_exists(path: &str) -> bool {
     if !path.ends_with('/') && !path.ends_with(platform::SEP) {
         path_with_separator.push(platform::SEP);
     }
-    let mut path_with_null = Vec::from(path_with_separator.as_bytes());
-    path_with_null.push(0);
-    platform::path_exists(&path_with_null)
+    exists(&path_with_separator)
 }
 
-/// The runfiles tree a manifest path names, if materialized. Bazel writes the
-/// manifest as `<binary>.runfiles_manifest` or as `MANIFEST` inside the tree.
-fn sibling_runfiles_dir(manifest_path: &str) -> Option<String> {
-    let dir = manifest_path
+/// The runfiles tree a manifest path names. Bazel writes the manifest as
+/// `<binary>.runfiles_manifest` or as `MANIFEST` inside the tree. Whether that
+/// tree is materialized is settled per entry, in `argv0_rlocation`.
+fn inferred_runfiles_dir(manifest_path: &str) -> Option<LogicalDir> {
+    manifest_path
         .strip_suffix("_manifest")
         .filter(|dir| dir.ends_with(".runfiles"))
-        .or_else(|| manifest_dir(manifest_path))?;
-    dir_exists(dir).then(|| String::from(dir))
+        .or_else(|| manifest_dir(manifest_path))
+        .map(|dir| LogicalDir::Inferred(String::from(dir)))
 }
 
 /// The directory holding a `MANIFEST` file, for either path separator.
