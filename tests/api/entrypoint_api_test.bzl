@@ -13,11 +13,11 @@ These tests don't exercise a "real" rule; they exercise the library functions in
 load("@rules_testing//lib:analysis_test.bzl", "analysis_test", "test_suite")
 load("//launcher/private/rules:lib.bzl", "launcher")
 
-_FAKE_ENTRYPOINT = "//launcher/private/rules/tests:fake_entrypoint"
+_FAKE_ENTRYPOINT = "//tests/api:fake_entrypoint"
 _FAKE_DATA = [
-    "//launcher/private/rules/tests:fake_env_config.txt",
-    "//launcher/private/rules/tests:fake_config.txt",
-    "//launcher/private/rules/tests:fake_main.txt",
+    "//tests/api:fake_env_config.txt",
+    "//tests/api:fake_config.txt",
+    "//tests/api:fake_main.txt",
 ]
 _COMMON_OPS = {
     "embedded_args-1": "--config=foo",
