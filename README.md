@@ -64,13 +64,34 @@ process so it can use Bazel's runfiles libraries.
 
 ### Low-level rule API
 
-For custom rules that need to build launchers programmatically, use the `launcher`
-struct (e.g. to compute args dynamically, or build with `cfg = "exec"` for build-time
-tools):
+For custom rules that need to build launchers programmatically, use `launcher.entrypoint`
+to build up the launcher's arguments fluently, then `.compile()` to emit the binary.
+This is the idiomatic way to use the low-level API:
 
 ```python
 load("@hermetic_launcher//launcher:lib.bzl", "launcher")
 
+def _impl(ctx):
+    exe = ctx.actions.declare_file(ctx.label.name)
+    (launcher.entrypoint(ctx.executable.tool)
+        .runfiles(ctx.file.config)
+        .embedded_args("--verbose")
+        .compile(ctx, output_file = exe))  # cfg = "target" by default, or cfg = "exec"
+    ...
+```
+
+| Method | Purpose |
+|--------|---------|
+| `entrypoint(executable_file)` | Start a builder seeded with the entrypoint at index 0. |
+| `.runfiles(*files)` | Append `File`s, each marked for runfiles resolution. |
+| `.embedded_args(*args)` | Append literal string arguments. |
+| `.raw_transformed_args(*args)` | Append string arguments marked for runfiles resolution (for paths not backed by a `File`). |
+| `.compile(ctx, output_file, cfg, template_exec_group, template_file)` | Run the finalizer and emit the launcher. `cfg` is `"target"` (default) or `"exec"`. |
+
+The builder is a thin wrapper over a set of functional helpers, which remain available
+for cases that need direct control over the `(embedded_args, transformed_args)` lists:
+
+```python
 def _impl(ctx):
     exe = ctx.actions.declare_file(ctx.label.name)
     embedded, transformed = launcher.args_from_entrypoint(ctx.executable.tool)
@@ -110,9 +131,9 @@ toolchains = [
 The launcher is two binaries per platform, downloadable from
 [GitHub releases](https://github.com/hermeticbuild/hermetic-launcher/releases):
 
-- **`runfiles-stub-<arch>-<os>`** — the *template*: a complete stub with placeholder
+- **`runfiles-stub-<arch>-<os>`** — the _template_: a complete stub with placeholder
   bytes where the arguments go.
-- **`finalize-stub-<arch>-<os>`** — the *finalizer*: patches a template's placeholders
+- **`finalize-stub-<arch>-<os>`** — the _finalizer_: patches a template's placeholders
   with concrete arguments and writes a ready-to-run launcher. It is pure byte patching,
   so it runs on any host and targets any platform.
 
@@ -177,11 +198,11 @@ overwrites them in place — argument count, a bitmask of which args to resolve,
 export-env flag, and the argument strings. Output size equals input size, and the
 result is identical regardless of which host produced it.
 
-| OS | Arches | Entry | Syscall layer | Process exec | Notes |
-|----|--------|-------|---------------|--------------|-------|
-| Linux | x86_64, aarch64, s390x | custom `_start` | raw syscalls, no libc | `execve` | fully static (musl), zero deps |
-| macOS | x86_64, aarch64 | `main` | libSystem | `execve` | finalizer re-signs ad-hoc (patching invalidates the Mach-O signature) |
-| Windows | x86_64, aarch64 | `main` | Win32 (UTF-16) | `CreateProcessW` + wait | converts `/` → `\` |
+| OS      | Arches                 | Entry           | Syscall layer         | Process exec            | Notes                                                                 |
+| ------- | ---------------------- | --------------- | --------------------- | ----------------------- | --------------------------------------------------------------------- |
+| Linux   | x86_64, aarch64, s390x | custom `_start` | raw syscalls, no libc | `execve`                | fully static (musl), zero deps                                        |
+| macOS   | x86_64, aarch64        | `main`          | libSystem             | `execve`                | finalizer re-signs ad-hoc (patching invalidates the Mach-O signature) |
+| Windows | x86_64, aarch64        | `main`          | Win32 (UTF-16)        | `CreateProcessW` + wait | converts `/` → `\`                                                    |
 
 The stubs are `no_std` Rust with a static-arena allocator. Patched Mach-O binaries are
 re-signed automatically by the finalizer.
