@@ -1248,6 +1248,90 @@ fn test_relative_manifest_symlinks(config: &TestConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Regression test: an environment manifest whose tree is still on disk must keep
+/// argv[0] logical, or a venv interpreter shim strands CPython outside its venv.
+/// See https://github.com/aspect-build/rules_py/issues/1378.
+fn test_env_manifest_logical_argv0(config: &TestConfig) -> Result<(), String> {
+    println!("  Running test: env_manifest_logical_argv0");
+
+    let test_dir = config.work_dir.join("test_env_manifest_argv0");
+    fs::create_dir_all(&test_dir).map_err(|e| format!("Failed to create test dir: {}", e))?;
+
+    // The tree is the parent's; the stub has none of its own, so the environment is
+    // the only source the launcher can select.
+    let mut runfiles = RunfilesSetup::new(&test_dir, "parent")
+        .map_err(|e| format!("Failed to create runfiles: {}", e))?;
+    let interp_rlocation = format!("interpreter_repo/bin/print-env{}", EXE_EXT);
+    runfiles
+        .add_file(
+            &interp_rlocation,
+            &config.test_binaries_dir.join(format!("print-env{}", EXE_EXT)),
+        )
+        .map_err(|e| format!("Failed to add interpreter: {}", e))?;
+    runfiles
+        .write_manifest()
+        .map_err(|e| format!("Failed to write manifest: {}", e))?;
+
+    // A venv interpreter shim: relative for manifest portability, and landing
+    // outside the venv so the physical and logical paths differ.
+    let entry_key = format!("{}/venv/bin/python", WORKSPACE_NAME);
+    runfiles
+        .append_manifest_lines(&[(&entry_key, &format!("../../../{}", interp_rlocation))])
+        .map_err(|e| format!("Failed to append relative entry: {}", e))?;
+
+    let stub_path = test_dir.join(format!("child_stub{}", EXE_EXT));
+    finalize_stub(config, &stub_path, &[&entry_key], &[0])?;
+
+    let written_manifest = runfiles.manifest_path.clone();
+    let expected_argv0 = runfiles
+        .runfiles_dir
+        .join(entry_key.replace('/', &PATH_SEP.to_string()));
+
+    // Both layouts Bazel writes a manifest in name the same tree.
+    for (layout, manifest_path) in [
+        (
+            "<binary>.runfiles_manifest",
+            runfiles.runfiles_dir.with_extension("runfiles_manifest"),
+        ),
+        ("<tree>/MANIFEST", runfiles.runfiles_dir.join("MANIFEST")),
+    ] {
+        fs::copy(&written_manifest, &manifest_path)
+            .map_err(|e| format!("Failed to place {} manifest: {}", layout, e))?;
+        runfiles.manifest_path = manifest_path;
+
+        let (stdout, stderr, exit_code) = run_stub(&stub_path, &runfiles, &[], true)?;
+        if exit_code != 0 {
+            return Err(format!(
+                "Stub failed with exit code {} for {}.\nstdout: {}\nstderr: {}",
+                exit_code, layout, stdout, stderr
+            ));
+        }
+
+        // Windows derives argv[0] from the command line; the override is Unix-only.
+        #[cfg(unix)]
+        {
+            let actual = stdout
+                .lines()
+                .next()
+                .and_then(|line| line.strip_prefix("ARGS:"))
+                .and_then(|args| args.split('|').next());
+            if actual != Some(expected_argv0.to_string_lossy().as_ref()) {
+                return Err(format!(
+                    "Environment manifest ({}) did not preserve logical argv[0]; the \
+                     child was launched as the physical interpreter.\nexpected: {}\nstdout: {}",
+                    layout,
+                    expected_argv0.display(),
+                    stdout
+                ));
+            }
+        }
+    }
+
+    println!("    PASS (logical argv[0] preserved for both manifest layouts)");
+
+    Ok(())
+}
+
 /// Test: print-env to verify environment and argument passing
 fn test_print_env(config: &TestConfig) -> Result<(), String> {
     println!("  Running test: print_env");
@@ -1479,6 +1563,7 @@ fn main() -> ExitCode {
         ("fallback_runfiles_manifest", test_fallback_runfiles_manifest),
         ("run_runfiles_discovery", test_run_runfiles_discovery),
         ("relative_manifest_symlinks", test_relative_manifest_symlinks),
+        ("env_manifest_logical_argv0", test_env_manifest_logical_argv0),
         ("print_env", test_print_env),
         ("large_manifest", test_large_manifest),
     ];

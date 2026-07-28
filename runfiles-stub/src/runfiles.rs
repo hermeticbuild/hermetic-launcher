@@ -38,8 +38,10 @@ impl Runfiles {
                     .and_then(|path| {
                         load_manifest(&path).map(|manifest| Self::Manifest {
                             manifest,
+                            // A manifest source does not imply the tree is
+                            // absent; recover it so argv[0] stays logical.
+                            logical_dir: sibling_runfiles_dir(&path),
                             path,
-                            logical_dir: None,
                         })
                     })
             },
@@ -148,6 +150,25 @@ fn dir_exists(path: &str) -> bool {
     let mut path_with_null = Vec::from(path_with_separator.as_bytes());
     path_with_null.push(0);
     platform::path_exists(&path_with_null)
+}
+
+/// The runfiles tree a manifest path names, if materialized. Bazel writes the
+/// manifest as `<binary>.runfiles_manifest` or as `MANIFEST` inside the tree.
+fn sibling_runfiles_dir(manifest_path: &str) -> Option<String> {
+    let dir = manifest_path
+        .strip_suffix("_manifest")
+        .filter(|dir| dir.ends_with(".runfiles"))
+        .or_else(|| manifest_dir(manifest_path))?;
+    dir_exists(dir).then(|| String::from(dir))
+}
+
+/// The directory holding a `MANIFEST` file, for either path separator.
+fn manifest_dir(path: &str) -> Option<&str> {
+    let parent = path.strip_suffix("MANIFEST")?;
+    let parent = parent
+        .strip_suffix('/')
+        .or_else(|| parent.strip_suffix(platform::SEP))?;
+    (!parent.is_empty()).then_some(parent)
 }
 
 fn load_manifest(path: &str) -> Option<Manifest> {
