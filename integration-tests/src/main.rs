@@ -66,6 +66,16 @@ fn resolve_runfile_path(runfiles: &Runfiles, path: PathBuf) -> PathBuf {
     rlocation!(runfiles, runfiles_key.as_str()).unwrap_or(path)
 }
 
+/// argv[0] as print-env reported it: the first `|`-separated field of `ARGS:`.
+#[cfg(unix)]
+fn reported_argv0(stdout: &str) -> Option<&str> {
+    stdout
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("ARGS:"))
+        .and_then(|args| args.split('|').next())
+}
+
 fn environment_path<'a>(stdout: &'a str, name: &str) -> Option<&'a Path> {
     let prefix = format!("ENV:{}=", name);
     stdout
@@ -1040,12 +1050,7 @@ fn test_fallback_runfiles_manifest(config: &TestConfig) -> Result<(), String> {
     #[cfg(unix)]
     {
         let expected = runfiles_dir.join(&print_env_rlocation);
-        let actual = stdout
-            .lines()
-            .next()
-            .and_then(|line| line.strip_prefix("ARGS:"))
-            .and_then(|args| args.split('|').next());
-        if actual != Some(expected.to_string_lossy().as_ref()) {
+        if reported_argv0(&stdout) != Some(expected.to_string_lossy().as_ref()) {
             return Err(format!(
                 "Adjacent manifest did not preserve logical argv[0].\nexpected: {}\nstdout: {}",
                 expected.display(),
@@ -1248,6 +1253,213 @@ fn test_relative_manifest_symlinks(config: &TestConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Build a tree whose manifest sends `_main/wrapper/bin/tool` out of its own
+/// directory, so the program's physical and logical paths differ. `materialize`
+/// controls whether that logical entry exists in the tree, as it would in a tree
+/// Bazel actually built.
+fn wrapper_runfiles(
+    config: &TestConfig,
+    test_dir: &Path,
+    materialize: bool,
+) -> Result<(RunfilesSetup, String), String> {
+    let mut runfiles = RunfilesSetup::new(test_dir, "parent")
+        .map_err(|e| format!("Failed to create runfiles: {}", e))?;
+    let target_rlocation = format!("tool_repo/bin/print-env{}", EXE_EXT);
+    runfiles
+        .add_file(
+            &target_rlocation,
+            &config.test_binaries_dir.join(format!("print-env{}", EXE_EXT)),
+        )
+        .map_err(|e| format!("Failed to add target: {}", e))?;
+    runfiles
+        .write_manifest()
+        .map_err(|e| format!("Failed to write manifest: {}", e))?;
+
+    // A relative target keeps the manifest portable and still lands outside the
+    // entry's own directory.
+    let entry_key = format!("{}/wrapper/bin/tool", WORKSPACE_NAME);
+    runfiles
+        .append_manifest_lines(&[(&entry_key, &format!("../../../{}", target_rlocation))])
+        .map_err(|e| format!("Failed to append relative entry: {}", e))?;
+
+    if materialize {
+        let entry = runfiles
+            .runfiles_dir
+            .join(entry_key.replace('/', &PATH_SEP.to_string()));
+        fs::create_dir_all(entry.parent().unwrap())
+            .map_err(|e| format!("Failed to create entry dir: {}", e))?;
+        fs::write(&entry, b"").map_err(|e| format!("Failed to materialize entry: {}", e))?;
+    }
+
+    Ok((runfiles, entry_key))
+}
+
+/// Regression test: an environment manifest whose tree is still on disk must keep
+/// argv[0] on the program's runfiles path, not the physical location the manifest
+/// resolved to. See https://github.com/aspect-build/rules_py/issues/1378.
+fn test_env_manifest_logical_argv0(config: &TestConfig) -> Result<(), String> {
+    println!("  Running test: env_manifest_logical_argv0");
+
+    let test_dir = config.work_dir.join("test_env_manifest_argv0");
+    fs::create_dir_all(&test_dir).map_err(|e| format!("Failed to create test dir: {}", e))?;
+
+    // The tree is the parent's; the stub has none of its own, so the environment is
+    // the only source the launcher can select.
+    let (mut runfiles, entry_key) = wrapper_runfiles(config, &test_dir, true)?;
+
+    let stub_path = test_dir.join(format!("child_stub{}", EXE_EXT));
+    finalize_stub(config, &stub_path, &[&entry_key], &[0])?;
+
+    let written_manifest = runfiles.manifest_path.clone();
+
+    // Both layouts Bazel writes a manifest in name the same tree.
+    for (layout, manifest_path) in [
+        (
+            "<binary>.runfiles_manifest",
+            runfiles.runfiles_dir.with_extension("runfiles_manifest"),
+        ),
+        ("<tree>/MANIFEST", runfiles.runfiles_dir.join("MANIFEST")),
+    ] {
+        fs::copy(&written_manifest, &manifest_path)
+            .map_err(|e| format!("Failed to place {} manifest: {}", layout, e))?;
+        runfiles.manifest_path = manifest_path;
+
+        let (stdout, stderr, exit_code) = run_stub(&stub_path, &runfiles, &[], true)?;
+        if exit_code != 0 {
+            return Err(format!(
+                "Stub failed with exit code {} for {}.\nstdout: {}\nstderr: {}",
+                exit_code, layout, stdout, stderr
+            ));
+        }
+
+        // Windows derives argv[0] from the command line; the override is Unix-only.
+        #[cfg(unix)]
+        {
+            let expected_argv0 = runfiles
+                .runfiles_dir
+                .join(entry_key.replace('/', &PATH_SEP.to_string()));
+            if reported_argv0(&stdout) != Some(expected_argv0.to_string_lossy().as_ref()) {
+                return Err(format!(
+                    "Environment manifest ({}) did not preserve logical argv[0]; the \
+                     child was launched as its physical path.\nexpected: {}\nstdout: {}",
+                    layout,
+                    expected_argv0.display(),
+                    stdout
+                ));
+            }
+        }
+    }
+
+    println!("    PASS (logical argv[0] preserved for both manifest layouts)");
+
+    Ok(())
+}
+
+/// Regression test: an inferred tree that was never materialized must not be used
+/// for argv[0]. `<tree>/MANIFEST` is the case that hides this — opening the manifest
+/// already proves its parent directory exists, so probing the directory says nothing
+/// about whether the tree was built. Overriding argv[0] from it would name a path
+/// that does not exist, which is worse than leaving the physical path alone.
+fn test_sparse_inferred_tree_keeps_physical_argv0(config: &TestConfig) -> Result<(), String> {
+    println!("  Running test: sparse_inferred_tree_keeps_physical_argv0");
+
+    let test_dir = config.work_dir.join("test_sparse_inferred_tree");
+    fs::create_dir_all(&test_dir).map_err(|e| format!("Failed to create test dir: {}", e))?;
+
+    // Same tree, except the logical entry is absent — a sparse or unbuilt tree.
+    let (mut runfiles, entry_key) = wrapper_runfiles(config, &test_dir, false)?;
+
+    let stub_path = test_dir.join(format!("sparse_stub{}", EXE_EXT));
+    finalize_stub(config, &stub_path, &[&entry_key], &[0])?;
+
+    let in_tree_manifest = runfiles.runfiles_dir.join("MANIFEST");
+    fs::copy(&runfiles.manifest_path, &in_tree_manifest)
+        .map_err(|e| format!("Failed to place in-tree manifest: {}", e))?;
+    runfiles.manifest_path = in_tree_manifest;
+
+    let (stdout, stderr, exit_code) = run_stub(&stub_path, &runfiles, &[], true)?;
+    if exit_code != 0 {
+        return Err(format!(
+            "Stub failed with exit code {}.\nstdout: {}\nstderr: {}",
+            exit_code, stdout, stderr
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        let physical = runfiles
+            .runfiles_dir
+            .join(format!("tool_repo/bin/print-env{}", EXE_EXT).replace('/', &PATH_SEP.to_string()));
+        if reported_argv0(&stdout) != Some(physical.to_string_lossy().as_ref()) {
+            return Err(format!(
+                "argv[0] was overridden from a tree that was never materialized.\n\
+                 expected the physical path: {}\nstdout: {}",
+                physical.display(),
+                stdout
+            ));
+        }
+    }
+
+    println!("    PASS (sparse inferred tree left argv[0] physical)");
+
+    Ok(())
+}
+
+/// Regression test: a relative `RUNFILES_MANIFEST_FILE` names a relative tree, and
+/// a relative argv[0] only holds while the child keeps the launcher's working
+/// directory. The manifest's own targets are absolute, so the physical path is
+/// strictly the safer identity here.
+fn test_relative_env_manifest_keeps_physical_argv0(config: &TestConfig) -> Result<(), String> {
+    println!("  Running test: relative_env_manifest_keeps_physical_argv0");
+
+    let test_dir = config.work_dir.join("test_relative_env_manifest");
+    fs::create_dir_all(&test_dir).map_err(|e| format!("Failed to create test dir: {}", e))?;
+
+    // The tree is fully materialized: only the relative manifest path is at issue.
+    let (runfiles, entry_key) = wrapper_runfiles(config, &test_dir, true)?;
+
+    let stub_path = test_dir.join(format!("relative_manifest_stub{}", EXE_EXT));
+    finalize_stub(config, &stub_path, &[&entry_key], &[0])?;
+
+    // `RUNFILES_MANIFEST_FILE` resolved against the launcher's cwd, as the README's
+    // invocation example writes it.
+    fs::copy(&runfiles.manifest_path, test_dir.join("parent.runfiles_manifest"))
+        .map_err(|e| format!("Failed to place sibling manifest: {}", e))?;
+    let output = Command::new(&stub_path)
+        .current_dir(&test_dir)
+        .env("RUNFILES_MANIFEST_FILE", "parent.runfiles_manifest")
+        .env_remove("RUNFILES_DIR")
+        .output()
+        .map_err(|e| format!("Failed to run stub: {}", e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Stub failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let physical = runfiles
+            .runfiles_dir
+            .join(format!("tool_repo/bin/print-env{}", EXE_EXT).replace('/', &PATH_SEP.to_string()));
+        if reported_argv0(&stdout) != Some(physical.to_string_lossy().as_ref()) {
+            return Err(format!(
+                "argv[0] was overridden from a relative manifest path, so it only \
+                 resolves from the launcher's working directory.\n\
+                 expected the physical path: {}\nstdout: {}",
+                physical.display(),
+                stdout
+            ));
+        }
+    }
+
+    println!("    PASS (relative env manifest left argv[0] physical)");
+
+    Ok(())
+}
+
 /// Test: print-env to verify environment and argument passing
 fn test_print_env(config: &TestConfig) -> Result<(), String> {
     println!("  Running test: print_env");
@@ -1294,12 +1506,7 @@ fn test_print_env(config: &TestConfig) -> Result<(), String> {
         let expected = runfiles
             .get_path(&print_env_rlocation)
             .ok_or_else(|| format!("Missing manifest entry for {}", print_env_rlocation))?;
-        let actual = stdout
-            .lines()
-            .next()
-            .and_then(|line| line.strip_prefix("ARGS:"))
-            .and_then(|args| args.split('|').next());
-        if actual != Some(expected.to_string_lossy().as_ref()) {
+        if reported_argv0(&stdout) != Some(expected.to_string_lossy().as_ref()) {
             return Err(format!(
                 "Environment manifest changed argv[0].\nexpected: {}\nstdout: {}",
                 expected.display(),
@@ -1479,6 +1686,15 @@ fn main() -> ExitCode {
         ("fallback_runfiles_manifest", test_fallback_runfiles_manifest),
         ("run_runfiles_discovery", test_run_runfiles_discovery),
         ("relative_manifest_symlinks", test_relative_manifest_symlinks),
+        ("env_manifest_logical_argv0", test_env_manifest_logical_argv0),
+        (
+            "sparse_inferred_tree_keeps_physical_argv0",
+            test_sparse_inferred_tree_keeps_physical_argv0,
+        ),
+        (
+            "relative_env_manifest_keeps_physical_argv0",
+            test_relative_env_manifest_keeps_physical_argv0,
+        ),
         ("print_env", test_print_env),
         ("large_manifest", test_large_manifest),
     ];
