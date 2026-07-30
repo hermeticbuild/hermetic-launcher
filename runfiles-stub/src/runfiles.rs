@@ -109,6 +109,25 @@ impl Runfiles {
         }
     }
 
+    /// Whether nothing is left to name `path` for argv[0]: a relative manifest
+    /// target moves it off its runfiles path, and the tree that could still name
+    /// it was never built. A tree on disk is recoverable, not lost.
+    pub fn logical_identity_lost(&self, path: &str) -> bool {
+        match self {
+            Self::Directory { .. } => false,
+            Self::Manifest {
+                manifest,
+                logical_dir,
+                ..
+            } => {
+                matches!(logical_dir, Some(LogicalDir::Inferred(dir)) if !dir_exists(dir))
+                    && manifest
+                        .lookup(path)
+                        .is_some_and(|target| !platform::is_absolute(target))
+            }
+        }
+    }
+
     /// The runfiles path to launch `path` under. Consumed only where the launcher
     /// controls argv[0]; on Windows argv[0] comes from the command line, so nothing
     /// here reaches the child.
