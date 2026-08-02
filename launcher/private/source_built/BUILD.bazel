@@ -18,6 +18,7 @@ launcher_stub_toolchains(
     finalizers = {
         "aarch64_linux": "//finalize-stub:finalize-stub_aarch64-unknown-linux-musl",
         "aarch64_macos": "//finalize-stub:finalize-stub_aarch64-apple-darwin",
+        "s390x_linux": "//finalize-stub:finalize-stub_s390x-unknown-linux-musl",
         "x86_64_linux": "//finalize-stub:finalize-stub_x86_64-unknown-linux-musl",
         "x86_64_macos": "//finalize-stub:finalize-stub_x86_64-apple-darwin",
         "x86_64_windows": "//finalize-stub:finalize-stub_x86_64-pc-windows-gnullvm",
@@ -25,6 +26,7 @@ launcher_stub_toolchains(
     templates = {
         "aarch64_linux": "//runfiles-stub:runfiles-stub_aarch64-unknown-linux-musl",
         "aarch64_macos": "//runfiles-stub:runfiles-stub_aarch64-apple-darwin",
+        "s390x_linux": "//runfiles-stub:runfiles-stub_s390x-unknown-linux-musl",
         "x86_64_linux": "//runfiles-stub:runfiles-stub_x86_64-unknown-linux-musl",
         "x86_64_macos": "//runfiles-stub:runfiles-stub_x86_64-apple-darwin",
         "x86_64_windows": "//runfiles-stub:runfiles-stub_x86_64-pc-windows-gnullvm",
