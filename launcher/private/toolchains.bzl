@@ -22,14 +22,15 @@ _executable_file = rule(
     attrs = {"src": attr.label(mandatory = True)},
 )
 
-# The platforms toolchains are registered for. This is intentionally a subset of
-# the released triples: s390x and Windows/aarch64 ship for standalone use but have
-# no auto-registered Bazel toolchain (see README "Supported platforms").
+# The platforms toolchains are registered for. Windows/aarch64 ships for
+# standalone use but has no auto-registered Bazel toolchain (see README
+# "Supported platforms").
 #
 # (name, cpu, os)
 PLATFORMS = [
     ("aarch64_linux", "aarch64", "linux"),
     ("aarch64_macos", "aarch64", "macos"),
+    ("s390x_linux", "s390x", "linux"),
     ("x86_64_linux", "x86_64", "linux"),
     ("x86_64_macos", "x86_64", "macos"),
     ("x86_64_windows", "x86_64", "windows"),

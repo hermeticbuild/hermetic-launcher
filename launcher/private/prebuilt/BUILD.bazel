@@ -11,6 +11,7 @@ launcher_stub_toolchains(
     finalizers = {
         "aarch64_linux": "@finalize_stub_aarch64_linux//file",
         "aarch64_macos": "@finalize_stub_aarch64_macos//file",
+        "s390x_linux": "@finalize_stub_s390x_linux//file",
         "x86_64_linux": "@finalize_stub_x86_64_linux//file",
         "x86_64_macos": "@finalize_stub_x86_64_macos//file",
         "x86_64_windows": "@finalize_stub_x86_64_windows//file",
@@ -18,6 +19,7 @@ launcher_stub_toolchains(
     templates = {
         "aarch64_linux": "@runfiles_stub_aarch64_linux//file",
         "aarch64_macos": "@runfiles_stub_aarch64_macos//file",
+        "s390x_linux": "@runfiles_stub_s390x_linux//file",
         "x86_64_linux": "@runfiles_stub_x86_64_linux//file",
         "x86_64_macos": "@runfiles_stub_x86_64_macos//file",
         "x86_64_windows": "@runfiles_stub_x86_64_windows//file",
