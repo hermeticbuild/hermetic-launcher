@@ -141,7 +141,7 @@ mod sc {
             core::arch::asm!(
                 "svc #0x80",
                 inout("x16") $nr as i64 => _, inout("x0") $a1 as i64 => _,
-                options(nostack))
+                lateout("x1") _, options(nostack))
         };
     }
     macro_rules! syscall2 {
@@ -194,6 +194,8 @@ mod sc {
 // macOS x86_64: the BSD class selector is OR'd into the number, the `syscall`
 // instruction additionally clobbers rcx and r11, and the 4th argument goes in r10
 // (not rcx). Carry-clear (`jnc`) marks success; failure is negated to `-errno`.
+// The kernel returns a second value in rdx and zeroes it otherwise, so every macro
+// declares rdx written even when it passes no third argument.
 #[cfg(target_arch = "x86_64")]
 mod sc {
     // BSD (unix) syscall class selector OR'd into the call number. Inlined as a plain
@@ -212,7 +214,7 @@ mod sc {
             core::arch::asm!(
                 "syscall",
                 inout("rax") (0x2000000i64 | ($nr as i64)) => _, inout("rdi") $a1 as i64 => _,
-                lateout("rcx") _, lateout("r11") _, options(nostack))
+                lateout("rdx") _, lateout("rcx") _, lateout("r11") _, options(nostack))
         };
     }
     macro_rules! syscall2 {
@@ -225,7 +227,7 @@ mod sc {
                 "3:",
                 inout("rax") (0x2000000i64 | ($nr as i64)) => ret, inout("rdi") $a1 as i64 => _,
                 inout("rsi") $a2 as i64 => _,
-                lateout("rcx") _, lateout("r11") _, options(nostack));
+                lateout("rdx") _, lateout("rcx") _, lateout("r11") _, options(nostack));
             ret as $ty
         }};
     }
