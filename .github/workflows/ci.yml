@@ -186,6 +186,15 @@ jobs:
       - env:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         run: bazel test ${BUILDBUDDY_API_KEY:+--config=cache} --config=release //integration-tests:integration_test
+      # The same suite against the x86_64 stub, which this Apple silicon runner
+      # executes under Rosetta. A register the kernel clobbers is only caught on the
+      # arch whose register allocation parks a live value in it, so the host-arch run
+      # above cannot see it (see integration-tests/BUILD.bazel). Idempotent: exits 0
+      # when Rosetta is already present.
+      - run: sudo softwareupdate --install-rosetta --agree-to-license
+      - env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+        run: bazel test ${BUILDBUDDY_API_KEY:+--config=cache} --config=release //integration-tests:integration_test_x86_64_macos
       # End-to-end launcher_binary tests, run against BOTH the prebuilt (downloaded)
       # and the source-built stubs (see //e2e). --config=release builds the
       # source-built stubs exactly as they ship.
