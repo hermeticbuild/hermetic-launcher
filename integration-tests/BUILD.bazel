@@ -130,3 +130,32 @@ rust_test(
     edition = "2021",
     use_libtest_harness = False,
 )
+
+# The same suite against the released x86_64 macOS stub, which an Apple silicon
+# host runs under Rosetta. The stub reaches the kernel through hand-written
+# `syscall` asm, so a register the kernel clobbers is only caught where that
+# arch's register allocation puts a live value in it — the host-arch suite cannot
+# see it. Optimization decides that allocation, so this needs --config=release.
+# The finalizer runs on the host, so it stays the host-arch one.
+rust_test(
+    name = "integration_test_x86_64_macos",
+    srcs = ["src/main.rs"],
+    args = [
+        "--template",
+        "$(rlocationpath //runfiles-stub:runfiles-stub_x86_64-apple-darwin)",
+        "--finalizer",
+        "$(rlocationpath :release-finalizer)",
+        "--test-binaries",
+        "$(rlocationpath :test-binaries)",
+    ],
+    data = [
+        ":release-finalizer",
+        ":test-binaries",
+        "//runfiles-stub:runfiles-stub_x86_64-apple-darwin",
+    ],
+    deps = ["@rules_rust//rust/runfiles"],
+    edition = "2021",
+    tags = ["requires-rosetta"],
+    target_compatible_with = ["@platforms//os:macos"],
+    use_libtest_harness = False,
+)
