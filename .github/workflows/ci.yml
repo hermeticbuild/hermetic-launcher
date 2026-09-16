@@ -152,7 +152,7 @@ jobs:
           fi
       - env:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
-        run: bazel test ${BUILDBUDDY_API_KEY:+--config=remote} --config=release //integration-tests:integration_test
+        run: bazel test ${BUILDBUDDY_API_KEY:+--config=remote} --config=release //integration-tests:integration_test //finalize-stub:template_test
       # End-to-end launcher_binary tests, run against BOTH the prebuilt (downloaded)
       # and the source-built stubs (see //e2e). --config=release builds the
       # source-built stubs exactly as they ship.
@@ -185,7 +185,7 @@ jobs:
           fi
       - env:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
-        run: bazel test ${BUILDBUDDY_API_KEY:+--config=cache} --config=release //integration-tests:integration_test
+        run: bazel test ${BUILDBUDDY_API_KEY:+--config=cache} --config=release //integration-tests:integration_test //finalize-stub:template_test
       # The same suite against the x86_64 stub, which this Apple silicon runner
       # executes under Rosetta. A register the kernel clobbers is only caught on the
       # arch whose register allocation parks a live value in it, so the host-arch run
@@ -230,7 +230,7 @@ jobs:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         run: |
           $config = if ($env:BUILDBUDDY_API_KEY) { "--config=cache" } else { $null }
-          bazel --output_user_root=C:/b test $config --config=release --test_output=errors //integration-tests:integration_test
+          bazel --output_user_root=C:/b test $config --config=release --test_output=errors //integration-tests:integration_test //finalize-stub:template_test
       # End-to-end launcher_binary tests, run against BOTH the prebuilt (downloaded)
       # and the source-built stubs (see //e2e). --config=release builds the
       # source-built stubs exactly as they ship.

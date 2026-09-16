@@ -50,7 +50,7 @@ _flavored_launcher_test = rule(
     test = True,
 )
 
-def launcher_e2e_test(name, launcher, **kwargs):
+def launcher_e2e_test(name, launcher, stub_sources = ["prebuilt", "source_built"], **kwargs):
     """Runs `launcher` as a test against both the prebuilt and source-built stubs.
 
     Emits `<name>_prebuilt` and `<name>_source_built` test targets plus a
@@ -60,10 +60,11 @@ def launcher_e2e_test(name, launcher, **kwargs):
     Args:
         name: Base name; also the name of the grouping test_suite.
         launcher: A `launcher_binary` target to run as the test.
+        stub_sources: Stub sources to exercise; defaults to both.
         **kwargs: Common attributes (tags, visibility, ...) applied to both tests.
     """
     tests = []
-    for stub_source in ["prebuilt", "source_built"]:
+    for stub_source in stub_sources:
         test_name = "{}_{}".format(name, stub_source)
         tests.append(test_name)
         _flavored_launcher_test(

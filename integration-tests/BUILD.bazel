@@ -57,6 +57,17 @@ alias(
 )
 
 alias(
+    name = "release-template-large",
+    actual = select({
+        ":linux_x86_64": "//runfiles-stub:runfiles-stub-large_x86_64-unknown-linux-musl",
+        ":linux_aarch64": "//runfiles-stub:runfiles-stub-large_aarch64-unknown-linux-musl",
+        ":macos_x86_64": "//runfiles-stub:runfiles-stub-large_x86_64-apple-darwin",
+        ":macos_aarch64": "//runfiles-stub:runfiles-stub-large_aarch64-apple-darwin",
+        ":windows": "//runfiles-stub:runfiles-stub-large_x86_64-pc-windows-gnullvm",
+    }),
+)
+
+alias(
     name = "release-finalizer",
     actual = select({
         ":linux_x86_64": "//finalize-stub:finalize-stub_x86_64-unknown-linux-musl",
@@ -116,6 +127,8 @@ rust_test(
     args = [
         "--template",
         "$(rlocationpath :release-template)",
+        "--large-template",
+        "$(rlocationpath :release-template-large)",
         "--finalizer",
         "$(rlocationpath :release-finalizer)",
         "--test-binaries",
@@ -124,11 +137,12 @@ rust_test(
     data = [
         ":release-finalizer",
         ":release-template",
+        ":release-template-large",
         ":test-binaries",
     ],
-    deps = ["@rules_rust//rust/runfiles"],
     edition = "2021",
     use_libtest_harness = False,
+    deps = ["@rules_rust//rust/runfiles"],
 )
 
 # The same suite against the released x86_64 macOS stub, which an Apple silicon
@@ -143,6 +157,8 @@ rust_test(
     args = [
         "--template",
         "$(rlocationpath //runfiles-stub:runfiles-stub_x86_64-apple-darwin)",
+        "--large-template",
+        "$(rlocationpath //runfiles-stub:runfiles-stub-large_x86_64-apple-darwin)",
         "--finalizer",
         "$(rlocationpath :release-finalizer)",
         "--test-binaries",
@@ -151,11 +167,12 @@ rust_test(
     data = [
         ":release-finalizer",
         ":test-binaries",
+        "//runfiles-stub:runfiles-stub-large_x86_64-apple-darwin",
         "//runfiles-stub:runfiles-stub_x86_64-apple-darwin",
     ],
-    deps = ["@rules_rust//rust/runfiles"],
     edition = "2021",
     tags = ["requires-rosetta"],
     target_compatible_with = ["@platforms//os:macos"],
     use_libtest_harness = False,
+    deps = ["@rules_rust//rust/runfiles"],
 )

@@ -11,7 +11,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use crate::common::cstr_len;
-use crate::placeholders::{self, is_template_placeholder};
+use crate::placeholders::{self, is_template_placeholder, TransformFlags, MAX_ARGS};
 use crate::platform;
 use crate::runfiles::Runfiles;
 
@@ -41,7 +41,7 @@ pub fn main(rt: platform::RuntimeArgs) -> ! {
         platform::exit(1);
     }
 
-    // Parse argc (decimal, 1..=10).
+    // Parse argc (decimal, bounded by this variant's capacity).
     let argc_str = placeholders::argc();
     let argc_len = cstr_len(argc_str);
     if argc_len == 0 {
@@ -57,19 +57,22 @@ pub fn main(rt: platform::RuntimeArgs) -> ! {
             platform::exit(1);
         }
     }
-    if argc == 0 || argc > 10 {
+    if argc == 0 || argc > MAX_ARGS {
+        #[cfg(not(feature = "large"))]
         eline(b"ERROR: Invalid argc (must be 1-10)");
+        #[cfg(feature = "large")]
+        eline(b"ERROR: Invalid argc (must be 1-40)");
         platform::exit(1);
     }
 
     // Parse transform flags (decimal bitmask of which args to resolve).
     let flags_str = placeholders::transform_flags();
     let flags_len = cstr_len(flags_str);
-    let mut transform_flags: u32 = 0;
+    let mut transform_flags: TransformFlags = 0;
     if !is_template_placeholder(flags_str) && flags_len > 0 {
         for &c in &flags_str[..flags_len] {
             if c.is_ascii_digit() {
-                transform_flags = transform_flags * 10 + (c - b'0') as u32;
+                transform_flags = transform_flags * 10 + (c - b'0') as TransformFlags;
             } else {
                 eline(b"ERROR: TRANSFORM_FLAGS contains non-digit characters");
                 platform::exit(1);
@@ -78,7 +81,7 @@ pub fn main(rt: platform::RuntimeArgs) -> ! {
     }
     // If flags are unset, default to transforming all args.
     if flags_len == 0 || is_template_placeholder(flags_str) {
-        transform_flags = 0xFFFFFFFF;
+        transform_flags = TransformFlags::MAX;
     }
 
     // Parse export-runfiles-env flag (defaults to true).
@@ -91,7 +94,11 @@ pub fn main(rt: platform::RuntimeArgs) -> ! {
     };
 
     // Decide whether runfiles are needed at all.
-    let argc_mask = if argc >= 32 { 0xFFFFFFFF } else { (1u32 << argc) - 1 };
+    let argc_mask = if argc >= TransformFlags::BITS as usize {
+        TransformFlags::MAX
+    } else {
+        ((1 as TransformFlags) << argc) - 1
+    };
     let needs_transform = (transform_flags & argc_mask) != 0;
     let needs_runfiles = needs_transform || export_runfiles_env;
 
@@ -115,7 +122,11 @@ pub fn main(rt: platform::RuntimeArgs) -> ! {
         let arg_len = cstr_len(arg_data);
         if arg_len == 0 {
             platform::print(b"ERROR: Argument ");
-            platform::print(&[b'0' + i as u8]);
+            if MAX_ARGS > 10 {
+                crate::common::print_number(i);
+            } else {
+                platform::print(&[b'0' + i as u8]);
+            }
             eline(b" is empty");
             platform::exit(1);
         }

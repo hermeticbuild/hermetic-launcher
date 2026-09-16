@@ -4,6 +4,7 @@ load("@rules_python//python:py_binary.bzl", "py_binary")
 load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 load("//e2e:defs.bzl", "launcher_e2e_test")
 load("//launcher:launcher_binary.bzl", "launcher_binary")
+load("//launcher/private:extensions.bzl", "PREBUILT_TEMPLATES")
 
 # The same cc/go/py/sh launcher chain as the downstream BCR test module in
 # e2e/bzlmod, but run against BOTH stub sources (see :defs.bzl). e2e/bzlmod stays a
@@ -63,4 +64,25 @@ launcher_binary(
 launcher_e2e_test(
     name = "e2e_chain",
     launcher = ":launch_chain",
+)
+
+cc_binary(
+    name = "check_large_args",
+    srcs = ["check_large_args.cc"],
+)
+
+launcher_binary(
+    name = "launch_large_args",
+    data = [":hello_sh"],
+    embedded_args = ["x" * 4096] + ["literal"] * 37 + ["$(rlocationpath :hello_sh)"],
+    entrypoint = ":check_large_args",
+    # Built through the test transition while the default prebuilt release is tiny-only.
+    tags = ["manual"],
+)
+
+launcher_e2e_test(
+    name = "e2e_large_args",
+    launcher = ":launch_large_args",
+    # Include prebuilt coverage as soon as the pinned release has both variants.
+    stub_sources = ["source_built"] + (["prebuilt"] if all([len(v) > 1 for v in PREBUILT_TEMPLATES.values()]) else []),
 )

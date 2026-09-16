@@ -24,11 +24,29 @@ launcher_stub_toolchains(
         "x86_64_windows": "//finalize-stub:finalize-stub_x86_64-pc-windows-gnullvm",
     },
     templates = {
-        "aarch64_linux": "//runfiles-stub:runfiles-stub_aarch64-unknown-linux-musl",
-        "aarch64_macos": "//runfiles-stub:runfiles-stub_aarch64-apple-darwin",
-        "s390x_linux": "//runfiles-stub:runfiles-stub_s390x-unknown-linux-musl",
-        "x86_64_linux": "//runfiles-stub:runfiles-stub_x86_64-unknown-linux-musl",
-        "x86_64_macos": "//runfiles-stub:runfiles-stub_x86_64-apple-darwin",
-        "x86_64_windows": "//runfiles-stub:runfiles-stub_x86_64-pc-windows-gnullvm",
+        "aarch64_linux": [
+            "//runfiles-stub:runfiles-stub_aarch64-unknown-linux-musl",
+            "//runfiles-stub:runfiles-stub-large_aarch64-unknown-linux-musl",
+        ],
+        "aarch64_macos": [
+            "//runfiles-stub:runfiles-stub_aarch64-apple-darwin",
+            "//runfiles-stub:runfiles-stub-large_aarch64-apple-darwin",
+        ],
+        "s390x_linux": [
+            "//runfiles-stub:runfiles-stub_s390x-unknown-linux-musl",
+            "//runfiles-stub:runfiles-stub-large_s390x-unknown-linux-musl",
+        ],
+        "x86_64_linux": [
+            "//runfiles-stub:runfiles-stub_x86_64-unknown-linux-musl",
+            "//runfiles-stub:runfiles-stub-large_x86_64-unknown-linux-musl",
+        ],
+        "x86_64_macos": [
+            "//runfiles-stub:runfiles-stub_x86_64-apple-darwin",
+            "//runfiles-stub:runfiles-stub-large_x86_64-apple-darwin",
+        ],
+        "x86_64_windows": [
+            "//runfiles-stub:runfiles-stub_x86_64-pc-windows-gnullvm",
+            "//runfiles-stub:runfiles-stub-large_x86_64-pc-windows-gnullvm",
+        ],
     },
 )

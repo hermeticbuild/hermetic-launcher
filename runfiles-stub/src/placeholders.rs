@@ -1,13 +1,55 @@
 // Placeholder bytes patched by `finalize-stub`. These MUST keep their exact byte
 // initializers, sizes, `#[used]`, and declaration order: the finalizer locates them
-// by scanning the binary image for these byte patterns (and the nth 256-byte run of
-// '@' for ARG0..ARG9). Only the link section name differs per OS, so the statics are
-// declared once in a macro that is invoked per platform with the right section.
+// by scanning the binary image for these byte patterns and the contiguous argument
+// storage described by the capabilities record. Only the link section name differs
+// per OS, so the statics are declared once in a macro with the right section.
 //
 // They are `static mut` on purpose: that prevents the compiler from const-folding the
 // template bytes into the code, so the patched values are actually read at runtime.
 
+#[cfg(not(feature = "large"))]
 pub const ARG_SIZE: usize = 256;
+#[cfg(feature = "large")]
+pub const ARG_SIZE: usize = 4096;
+#[cfg(not(feature = "large"))]
+pub const MAX_ARGS: usize = 10;
+#[cfg(feature = "large")]
+pub const MAX_ARGS: usize = 40;
+
+// Keep the tiny stub's arithmetic and generated code unchanged.
+#[cfg(not(feature = "large"))]
+pub type TransformFlags = u32;
+#[cfg(feature = "large")]
+pub type TransformFlags = u64;
+
+// Versioned, NUL-padded ASCII metadata, generated from the same compile-time
+// constants as the storage and runtime. No runtime formatting code is linked.
+const fn capabilities() -> [u8; 64] {
+    let mut out = [0; 64];
+    let parts: [&[u8]; 3] = [b"@@RUNFILES_CAPS@@v1;args=", b";size=", b";flags="];
+    let values = [MAX_ARGS, ARG_SIZE, TransformFlags::BITS as usize];
+    let mut pos = 0;
+    let mut part = 0;
+    while part < parts.len() {
+        let mut i = 0;
+        while i < parts[part].len() {
+            out[pos] = parts[part][i];
+            pos += 1;
+            i += 1;
+        }
+        let mut divisor = 1;
+        while values[part] / divisor >= 10 {
+            divisor *= 10;
+        }
+        while divisor > 0 {
+            out[pos] = b'0' + ((values[part] / divisor) % 10) as u8;
+            pos += 1;
+            divisor /= 10;
+        }
+        part += 1;
+    }
+    out
+}
 
 macro_rules! define_placeholders {
     ($section:literal) => {
@@ -23,17 +65,20 @@ macro_rules! define_placeholders {
         #[link_section = $section]
         static mut EXPORT_RUNFILES_ENV: [u8; 32] = *b"@@RUNFILES_EXPORT_ENV@@\0\0\0\0\0\0\0\0\0";
 
-        // The ten argument placeholders as one contiguous 2D array rather than ten
-        // separate statics. `arg()` indexes it with pointer arithmetic, which lowers
+        // Argument placeholders as one contiguous 2D array rather than separate
+        // statics. `arg()` indexes it with pointer arithmetic, which lowers
         // to a single PC-relative `adrp+add`; ten distinct statics made the compiler
         // materialize a table of ten absolute addresses, and under PIE (mandatory on
         // arm64 macOS) that table needs load-time rebasing — which would force a
         // writable, file-backed `__DATA` page back into existence. The bytes on disk
-        // (2560 contiguous '@') are identical either way, so the finalizer's
-        // 256-byte-run scan is unaffected.
+        // for the tiny variant (2560 contiguous '@') remain unchanged.
         #[used]
         #[link_section = $section]
-        static mut ARGS: [[u8; ARG_SIZE]; 10] = [[b'@'; ARG_SIZE]; 10];
+        static mut ARGS: [[u8; ARG_SIZE]; MAX_ARGS] = [[b'@'; ARG_SIZE]; MAX_ARGS];
+
+        #[used]
+        #[link_section = $section]
+        static CAPABILITIES: [u8; 64] = capabilities();
     };
 }
 
@@ -68,7 +113,7 @@ pub fn arg(i: usize) -> &'static [u8] {
     // Clamp to the last slot, matching the previous per-index behaviour. Indexing
     // the single ARGS array lowers to a PC-relative address (no rebased pointer
     // table); see the note on ARGS above.
-    let idx = if i < 10 { i } else { 9 };
+    let idx = if i < MAX_ARGS { i } else { MAX_ARGS - 1 };
     let base = core::ptr::addr_of!(ARGS) as *const u8;
     let ptr = unsafe { base.add(idx * ARG_SIZE) };
     read(ptr, ARG_SIZE)
