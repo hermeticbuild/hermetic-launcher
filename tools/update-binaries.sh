@@ -64,22 +64,39 @@ def main():
     with open(extensions_path) as f:
         content = f.read()
 
-    # Replace the release tag in all download URLs
-    content = re.sub(
-        r"(releases/download/)binaries-\d{8}/",
-        rf"\1{tag}/",
-        content,
-    )
-
-    # Replace each SHA256 hash, matching via the filename on the preceding url line
-    for filename, sha256 in sums.items():
-        content, n = re.subn(
-            rf'("url":\s*"[^"]+/{re.escape(filename)}",\n\s*"sha256":\s*")[a-f0-9]{{64}}(")',
-            rf"\g<1>{sha256}\g<2>",
-            content,
-        )
-        if n == 0:
-            print(f"  warning: {filename} not found in extensions.bzl", file=sys.stderr)
+    # Regenerate the manifest, including newly published stub variants.
+    expected = {
+        f"{kind}-{arch}-{os_name}{suffix}"
+        for kind in ["runfiles-stub", "runfiles-stub-large", "finalize-stub"]
+        for arch, os_name, suffix in [
+            ("aarch64", "linux", ""), ("s390x", "linux", ""),
+            ("x86_64", "linux", ""), ("aarch64", "macos", ""),
+            ("x86_64", "macos", ""), ("aarch64", "windows", ".exe"),
+            ("x86_64", "windows", ".exe"),
+        ]
+    }
+    missing = expected - sums.keys()
+    if missing:
+        sys.exit("error: release is missing binaries: " + ", ".join(sorted(missing)))
+    manifest = {}
+    for filename in sorted(expected):
+        if not re.fullmatch(r"[a-f0-9]{64}", sums[filename]):
+            sys.exit(f"error: invalid SHA256 for {filename}")
+        manifest[filename] = {
+            "name": filename.removesuffix(".exe").replace("-", "_"),
+            "url": f"https://github.com/{REPO}/releases/download/{tag}/{filename}",
+            "sha256": sums[filename],
+        }
+    content = re.sub(r"_download_attrs = \{.*?\n\}",
+                     "_download_attrs = " + json.dumps(manifest, indent=4), content, flags=re.S)
+    module_path = os.path.join(workspace, "MODULE.bazel")
+    with open(module_path) as f:
+        module = f.read()
+    repos = ", ".join(json.dumps(attrs["name"]) for attrs in manifest.values())
+    module = re.sub(r"use_repo\(non_module_dependencies,.*?\)",
+                    "use_repo(non_module_dependencies, " + repos + ")", module, flags=re.S)
+    with open(module_path, "w") as f:
+        f.write(module)
 
     with open(extensions_path, "w") as f:
         f.write(content)

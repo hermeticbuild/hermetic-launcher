@@ -5,8 +5,8 @@ use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::process;
 
-const ARG_SIZE: usize = 256;
-const ARGC_SIZE: usize = 32;
+mod template;
+use template::{prefer, Template};
 
 /// Finalize a runfiles stub template with actual arguments
 #[derive(Parser)]
@@ -22,17 +22,17 @@ const ARGC_SIZE: usize = 32;
     # No transforms (all arguments are literals):\n  \
     finalize-stub --template template --output output -- /absolute/path --flag")]
 struct Cli {
-    /// Path to template runfiles-stub binary
+    /// Template binaries to consider (repeat for automatic smallest-compatible selection)
     #[arg(short, long, required = true)]
-    template: String,
+    template: Vec<String>,
 
     /// Write output to file (default: stdout)
     #[arg(short, long)]
     output: Option<String>,
 
-    /// Argument indices to transform (0-9). Can be specified multiple times or comma-separated.
+    /// Argument indices to transform. Can be specified multiple times or comma-separated.
     /// If not specified, no arguments are transformed by default.
-    #[arg(long, action = ArgAction::Append, value_delimiter = ',', value_parser = clap::value_parser!(u32).range(0..10))]
+    #[arg(long, action = ArgAction::Append, value_delimiter = ',', value_parser = clap::value_parser!(u32).range(0..64))]
     transform: Vec<u32>,
 
     /// Export runfiles environment variables (RUNFILES_DIR, RUNFILES_MANIFEST_FILE, JAVA_RUNFILES) to the executed process
@@ -48,129 +48,65 @@ struct Cli {
     args: Vec<String>,
 }
 
-fn find_pattern(data: &[u8], pattern: &[u8]) -> Option<usize> {
-    data.windows(pattern.len())
-        .position(|window| window == pattern)
-}
-
-fn find_nth_pattern(data: &[u8], pattern: &[u8], n: usize) -> Option<usize> {
-    let mut count = 0;
-    let mut pos = 0;
-
-    while pos < data.len() {
-        if let Some(offset) = find_pattern(&data[pos..], pattern) {
-            if count == n {
-                return Some(pos + offset);
-            }
-            count += 1;
-            // Skip past the entire matched pattern to avoid overlapping matches
-            pos += offset + pattern.len();
-        } else {
-            break;
-        }
-    }
-    None
-}
-
-fn replace_at(data: &mut [u8], offset: usize, new_value: &[u8], fixed_size: usize) -> Result<(), String> {
-    if new_value.len() > fixed_size {
-        return Err(format!(
-            "Value too long: {} bytes > {} bytes max",
-            new_value.len(),
-            fixed_size
-        ));
-    }
-
-    // Zero out the entire region
-    for i in 0..fixed_size {
-        data[offset + i] = 0;
-    }
-
-    // Copy new value
-    data[offset..offset + new_value.len()].copy_from_slice(new_value);
-
-    Ok(())
-}
-
-fn finalize_stub(template_path: &str, output_path: Option<&str>, argv: &[String], transform_flags: u32, export_runfiles_env: bool, verbose: bool) -> Result<(), String> {
+fn finalize_stub(
+    template_paths: &[String],
+    output_path: Option<&str>,
+    argv: &[String],
+    transform_flags: u64,
+    export_runfiles_env: bool,
+    verbose: bool,
+) -> Result<(), String> {
     if argv.is_empty() {
-        return Err("At least one argument (argv[0]) is required".to_string());
+        return Err("At least one argument (argv[0]) is required".into());
     }
-
-    if argv.len() > 10 {
-        return Err("Maximum 10 arguments supported (argv[0] to argv[9])".to_string());
+    if argv.len() < 64 && transform_flags >> argv.len() != 0 {
+        return Err("Transform index must refer to an embedded argument".into());
     }
-
-    // Prevent overwriting the input file
-    if let Some(output) = output_path {
-        let template_canon = fs::canonicalize(template_path)
-            .map_err(|e| format!("Failed to resolve template path: {}", e))?;
-        let output_canon = fs::canonicalize(output).ok();
-
-        if output_canon.as_ref() == Some(&template_canon) {
-            return Err("Output path cannot be the same as template path (would overwrite input)".to_string());
+    let output_canon = output_path.and_then(|p| fs::canonicalize(p).ok());
+    let mut selected: Option<(String, Template)> = None;
+    let mut available = Vec::new();
+    for path in template_paths {
+        let canon = fs::canonicalize(path)
+            .map_err(|e| format!("Failed to resolve template {path}: {e}"))?;
+        if output_canon.as_ref() == Some(&canon) {
+            return Err(
+                "Output path cannot be the same as template path (would overwrite input)".into(),
+            );
+        }
+        let data = fs::read(path).map_err(|e| format!("Failed to read template {path}: {e}"))?;
+        let candidate =
+            Template::parse(data).map_err(|e| format!("Invalid template {path}: {e}"))?;
+        let caps = candidate.capabilities;
+        available.push(format!(
+            "{path}: {} args, {} bytes/arg",
+            caps.max_args, caps.arg_size
+        ));
+        if prefer(
+            &candidate,
+            selected.as_ref().map(|(_, t)| t),
+            argv,
+            transform_flags,
+        ) {
+            selected = Some((path.clone(), candidate));
         }
     }
-
-    // Read template
-    let mut data = fs::read(template_path)
-        .map_err(|e| format!("Failed to read template {}: {}", template_path, e))?;
-
-    // Find and replace ARGC
-    let argc_pattern = b"@@RUNFILES_ARGC@@";
-    let argc_pos = find_pattern(&data, argc_pattern)
-        .ok_or("ARGC placeholder not found in template")?;
-
-    let argc_str = argv.len().to_string();
-    replace_at(&mut data, argc_pos, argc_str.as_bytes(), ARGC_SIZE)?;
-
+    let (path, template) = selected.ok_or_else(|| {
+        format!(
+            "No compatible template for {} arguments (longest: {} bytes). Available: {}",
+            argv.len(),
+            argv.iter().map(|a| a.len()).max().unwrap_or(0),
+            available.join("; ")
+        )
+    })?;
     if verbose {
-        eprintln!("Replaced ARGC with: {}", argc_str);
+        eprintln!(
+            "Selected template {path} ({} bytes; {} args, {} bytes/arg)",
+            template.data.len(),
+            template.capabilities.max_args,
+            template.capabilities.arg_size
+        );
     }
-
-    // Find and replace TRANSFORM_FLAGS
-    let flags_pattern = b"@@RUNFILES_TRANSFORM_FLAGS@@";
-    let flags_pos = find_pattern(&data, flags_pattern)
-        .ok_or("TRANSFORM_FLAGS placeholder not found in template")?;
-
-    let flags_str = transform_flags.to_string();
-    replace_at(&mut data, flags_pos, flags_str.as_bytes(), 32)?;
-
-    if verbose {
-        eprintln!("Replaced TRANSFORM_FLAGS with: {} (0b{:b})", flags_str, transform_flags);
-    }
-
-    // Find and replace EXPORT_RUNFILES_ENV
-    let export_pattern = b"@@RUNFILES_EXPORT_ENV@@";
-    let export_pos = find_pattern(&data, export_pattern)
-        .ok_or("EXPORT_RUNFILES_ENV placeholder not found in template")?;
-
-    let export_str = if export_runfiles_env { "1" } else { "0" };
-    replace_at(&mut data, export_pos, export_str.as_bytes(), 32)?;
-
-    if verbose {
-        eprintln!("Replaced EXPORT_RUNFILES_ENV with: {}", export_str);
-    }
-
-    // Find and replace ARG placeholders
-    let arg_pattern = &[b'@'; ARG_SIZE];
-
-    // Find all placeholder positions FIRST (before any replacements modify the data)
-    let mut arg_positions: Vec<usize> = Vec::new();
-    for i in 0..argv.len() {
-        let arg_pos = find_nth_pattern(&data, arg_pattern, i)
-            .ok_or(format!("ARG{} placeholder not found in template", i))?;
-        arg_positions.push(arg_pos);
-    }
-
-    // Now do the replacements
-    for (i, arg) in argv.iter().enumerate() {
-        let arg_pos = arg_positions[i];
-        replace_at(&mut data, arg_pos, arg.as_bytes(), ARG_SIZE)?;
-        if verbose {
-            eprintln!("Replaced ARG{} with: {}", i, arg);
-        }
-    }
+    let mut data = template.patch(argv, transform_flags, export_runfiles_env)?;
 
     // Post-process the finalized binary (e.g., re-signing)
     data = post_process_binary(data, verbose)?;
@@ -197,7 +133,8 @@ fn finalize_stub(template_path: &str, output_path: Option<&str>, argv: &[String]
         }
     } else {
         // Write to stdout
-        io::stdout().write_all(&data)
+        io::stdout()
+            .write_all(&data)
             .map_err(|e| format!("Failed to write to stdout: {}", e))?;
     }
 
@@ -234,11 +171,12 @@ fn is_macho(data: &[u8]) -> bool {
 
     // Check for Mach-O magic numbers
     let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-    matches!(magic,
+    matches!(
+        magic,
         0xfeedface |  // MH_MAGIC (32-bit)
         0xfeedfacf |  // MH_MAGIC_64 (64-bit)
         0xcefaedfe |  // MH_CIGAM (32-bit, swapped)
-        0xcffaedfe    // MH_CIGAM_64 (64-bit, swapped)
+        0xcffaedfe // MH_CIGAM_64 (64-bit, swapped)
     )
 }
 
@@ -247,8 +185,8 @@ fn resign_macho(data: Vec<u8>, verbose: bool) -> Result<Vec<u8>, String> {
     use apple_codesign::{MachOSigner, SigningSettings};
 
     // Parse the Mach-O binary
-    let signer = MachOSigner::new(&data)
-        .map_err(|e| format!("Failed to parse Mach-O binary: {}", e))?;
+    let signer =
+        MachOSigner::new(&data).map_err(|e| format!("Failed to parse Mach-O binary: {}", e))?;
 
     if verbose {
         eprintln!("Applying ad-hoc signature to Mach-O binary...");
@@ -260,7 +198,8 @@ fn resign_macho(data: Vec<u8>, verbose: bool) -> Result<Vec<u8>, String> {
 
     // Sign the binary
     let mut signed_data = Vec::new();
-    signer.write_signed_binary(&settings, &mut signed_data)
+    signer
+        .write_signed_binary(&settings, &mut signed_data)
         .map_err(|e| format!("Failed to sign Mach-O binary: {}", e))?;
 
     if verbose {
@@ -281,14 +220,21 @@ fn main() {
         0
     } else {
         // Only transform specified indices
-        let mut flags = 0u32;
+        let mut flags = 0u64;
         for idx in cli.transform {
             flags |= 1 << idx;
         }
         flags
     };
 
-    match finalize_stub(&cli.template, cli.output.as_deref(), &cli.args, transform_flags, cli.export_runfiles_env, cli.verbose) {
+    match finalize_stub(
+        &cli.template,
+        cli.output.as_deref(),
+        &cli.args,
+        transform_flags,
+        cli.export_runfiles_env,
+        cli.verbose,
+    ) {
         Ok(()) => {
             if cli.verbose {
                 if let Some(output) = cli.output {

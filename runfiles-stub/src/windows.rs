@@ -1,6 +1,6 @@
 // Windows backend: kernel32 (Win32) primitives, a `main` entry that parses the
 // command line, and a CreateProcessW-based launch (spawn + wait + propagate exit code).
-// Runtime args stay UTF-16; embedded args are widened from UTF-8.
+// Runtime args stay UTF-16; embedded args are decoded from UTF-8.
 
 use alloc::string::String;
 use alloc::vec;
@@ -573,13 +573,20 @@ pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
     unsafe {
         let argc = launch.resolved.len();
 
-        // Build the UTF-16 command line: embedded args (widened) + runtime args (native).
+        // Build the UTF-16 command line: embedded args (decoded) + runtime args (native).
         let mut cmdline_wide: Vec<u16> = Vec::with_capacity(8192);
 
         for (i, arg) in launch.resolved.iter().enumerate() {
-            // Embedded args are NUL-terminated; widen without the trailing NUL.
+            // Embedded args are UTF-8 and NUL-terminated; decode without the trailing NUL.
             let bytes = if arg.last() == Some(&0) { &arg[..arg.len() - 1] } else { &arg[..] };
-            let wide: Vec<u16> = bytes.iter().map(|&b| b as u16).collect();
+            let text = match core::str::from_utf8(bytes) {
+                Ok(text) => text,
+                Err(_) => {
+                    print(b"ERROR: Embedded argument is not valid UTF-8\r\n");
+                    ExitProcess(1);
+                }
+            };
+            let wide: Vec<u16> = text.encode_utf16().collect();
 
             // Quote arg0 always (Bazel launcher.cc convention); others as needed.
             append_arg(&mut cmdline_wide, &wide, i == 0);

@@ -47,6 +47,9 @@ jobs:
           - `runfiles-stub-x86_64-windows.exe`
           - `runfiles-stub-aarch64-windows.exe`
 
+          Large templates are also included as `runfiles-stub-large-<arch>-<os>`
+          (40 arguments, up to 4096 bytes each), for every platform above.
+
           ### Finalizers
           - `finalize-stub-x86_64-linux`
           - `finalize-stub-aarch64-linux`

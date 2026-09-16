@@ -75,6 +75,16 @@ _download_attrs = {
     },
 }
 
+# Derived from the pinned release manifest so all published variants are exposed.
+PREBUILT_TEMPLATES = {
+    platform: [
+        "@" + prefix + platform + "//file"
+        for prefix in ["runfiles_stub_", "runfiles_stub_large_"]
+        if prefix + platform in [attrs["name"] for attrs in _download_attrs.values()]
+    ]
+    for platform in ["aarch64_linux", "aarch64_macos", "s390x_linux", "x86_64_linux", "x86_64_macos", "x86_64_windows"]
+}
+
 def _non_module_dependencies_impl(ctx):
     for filename, attrs in _download_attrs.items():
         http_file(
@@ -89,7 +99,6 @@ def _non_module_dependencies_impl(ctx):
         root_module_direct_dev_deps = [],
         reproducible = True,
     )
-
 
 non_module_dependencies = module_extension(
     implementation = _non_module_dependencies_impl,

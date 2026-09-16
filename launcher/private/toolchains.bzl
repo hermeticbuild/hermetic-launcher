@@ -46,7 +46,7 @@ def launcher_stub_toolchains(name, *, templates, finalizers):
             `target_settings`, so exactly one source's toolchains resolve for a
             given value of the `//launcher/private:stub_source` flag.
         templates: dict mapping each platform name in `PLATFORMS` to the template
-            (runfiles-stub) label for that platform.
+            (runfiles-stub) labels for that platform.
         finalizers: dict mapping each platform name in `PLATFORMS` to the finalizer
             (finalize-stub) label for that platform.
     """
@@ -63,7 +63,7 @@ def launcher_stub_toolchains(name, *, templates, finalizers):
 
         stub_template_toolchain(
             name = "template_%s_%s" % (platform, name),
-            template_exe = templates[platform],
+            template_exes = templates[platform],
         )
         native.toolchain(
             name = "template_%s_%s_toolchain" % (platform, name),

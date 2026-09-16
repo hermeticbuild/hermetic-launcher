@@ -6,7 +6,7 @@
 //! 3. Using the finalizer to create stub binaries
 //! 4. Running the stubs and validating their behavior
 //!
-//! Usage: test-runner --template <path> --finalizer <path> --test-binaries <dir>
+//! Usage: test-runner --template <path> --large-template <path> --finalizer <path> --test-binaries <dir>
 //!
 //! The test runner automatically detects the current platform and creates
 //! appropriate paths (Windows vs Unix style).
@@ -39,6 +39,7 @@ const WORKSPACE_NAME: &str = "_main";
 struct TestConfig {
     /// Path to the runfiles-stub template binary
     template_path: PathBuf,
+    large_template_path: PathBuf,
     /// Path to the finalize-stub binary
     finalizer_path: PathBuf,
     /// Directory containing test binaries (hash-file, add-numbers, etc.)
@@ -89,6 +90,7 @@ impl TestConfig {
         let args: Vec<String> = env::args().collect();
 
         let mut template_path = None;
+        let mut large_template_path = None;
         let mut finalizer_path = None;
         let mut test_binaries_dir = None;
         let mut work_dir = None;
@@ -99,6 +101,10 @@ impl TestConfig {
                 "--template" => {
                     i += 1;
                     template_path = Some(PathBuf::from(&args[i]));
+                }
+                "--large-template" => {
+                    i += 1;
+                    large_template_path = Some(PathBuf::from(&args[i]));
                 }
                 "--finalizer" => {
                     i += 1;
@@ -113,10 +119,11 @@ impl TestConfig {
                     work_dir = Some(PathBuf::from(&args[i]));
                 }
                 "--help" | "-h" => {
-                    println!("Usage: test-runner --template <path> --finalizer <path> --test-binaries <dir> [--work-dir <dir>]");
+                    println!("Usage: test-runner --template <path> --large-template <path> --finalizer <path> --test-binaries <dir> [--work-dir <dir>]");
                     println!();
                     println!("Options:");
                     println!("  --template       Path to runfiles-stub template binary");
+                    println!("  --large-template Path to large runfiles-stub template binary");
                     println!("  --finalizer      Path to finalize-stub binary");
                     println!("  --test-binaries  Directory containing test binaries");
                     println!("  --work-dir       Working directory for test artifacts (default: temp dir)");
@@ -133,6 +140,8 @@ impl TestConfig {
             .map_err(|err| format!("Failed to create runfiles resolver: {err}"))?;
         let template_path =
             resolve_runfile_path(&runfiles, template_path.ok_or("--template is required")?);
+        let large_template_path = resolve_runfile_path(
+            &runfiles, large_template_path.ok_or("--large-template is required")?);
         let finalizer_path =
             resolve_runfile_path(&runfiles, finalizer_path.ok_or("--finalizer is required")?);
         let test_binaries_dir = resolve_runfile_path(
@@ -156,6 +165,7 @@ impl TestConfig {
 
         Ok(Self {
             template_path,
+            large_template_path,
             finalizer_path,
             test_binaries_dir,
             work_dir,
@@ -1686,6 +1696,176 @@ fn test_large_manifest(config: &TestConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Exercise selection, exact byte limits, high transform bits, and actual launches.
+fn test_stub_capacities(config: &TestConfig) -> Result<(), String> {
+    println!("  Running test: stub_capacities");
+    let dir = config.work_dir.join("capacities");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let mut rf = RunfilesSetup::new(&dir, "capacity").map_err(|e| e.to_string())?;
+    let program = format!("_main/bin/print-env{EXE_EXT}");
+    rf.add_file(
+        &program,
+        &config.test_binaries_dir.join(format!("print-env{EXE_EXT}")),
+    )
+    .map_err(|e| e.to_string())?;
+    let key = "_main/data/high-bit";
+    rf.add_file_content(key, b"high transform bit")
+        .map_err(|e| e.to_string())?;
+    rf.write_manifest().map_err(|e| e.to_string())?;
+    let long = "é".repeat(2048); // Exactly 4096 UTF-8 bytes, no spare terminator byte.
+    for (count, length, expect_large) in [
+        (10, 256, false),
+        (11, 1, true),
+        (2, 257, true),
+        (40, 4096, true),
+    ] {
+        let mut args = vec!["literal".to_string(); count];
+        args[0] = program.clone();
+        args[1] = if length == 4096 {
+            long.clone()
+        } else {
+            "é".repeat(length / 2) + &"x".repeat(length % 2)
+        };
+        if count >= 10 {
+            args[2] = "漢😀".into(); // Three-byte UTF-8 and a UTF-16 surrogate pair.
+        }
+        if count == 40 {
+            args[31] = key.into();
+            args[32] = key.into();
+            args[39] = key.into();
+        }
+        for reverse in [false, true] {
+            let output_path = dir.join(format!("stub-{count}-{length}-{reverse}{EXE_EXT}"));
+            let mut templates = [&config.template_path, &config.large_template_path];
+            if reverse {
+                templates.reverse();
+            }
+            let mut cmd = Command::new(&config.finalizer_path);
+            for template in templates {
+                cmd.arg("--template").arg(template);
+            }
+            let output = cmd
+                .arg("--output")
+                .arg(&output_path)
+                .arg("--transform")
+                .arg(if count == 40 { "0,31,32,39" } else { "0" })
+                .arg("--")
+                .args(&args)
+                .output()
+                .map_err(|e| e.to_string())?;
+            if !output.status.success() {
+                return Err(format!(
+                    "Capacity finalization failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            let bytes = fs::read(&output_path).map_err(|e| e.to_string())?;
+            let marker = if expect_large {
+                b"v1;args=40;size=4096;flags=64".as_slice()
+            } else {
+                b"v1;args=10;size=256;flags=32".as_slice()
+            };
+            if !bytes.windows(marker.len()).any(|w| w == marker) {
+                return Err(format!(
+                    "Wrong template selected for {count} args of {length} bytes"
+                ));
+            }
+            for manifest in [true, false] {
+                let (stdout, stderr, code) =
+                    run_stub(&output_path, &rf, &["runtime-tail"], manifest)?;
+                if code != 0 {
+                    return Err(format!("Capacity stub exited {code}: {stderr}"));
+                }
+                let line = stdout
+                    .lines()
+                    .find_map(|l| l.strip_prefix("ARGS:"))
+                    .ok_or("Missing argument report")?;
+                let actual: Vec<_> = line.split('|').collect();
+                if actual.len() != count + 1 || actual[count] != "runtime-tail" {
+                    return Err("Lost embedded or runtime arguments".into());
+                }
+                for i in 1..count {
+                    let expected = if count == 40 && [31, 32, 39].contains(&i) {
+                        rf.get_path(key).unwrap().to_string_lossy().into_owned()
+                    } else {
+                        args[i].clone()
+                    };
+                    // Windows manifest resolution normalizes separators, while directory
+                    // resolution can retain a mixed-separator RUNFILES_DIR prefix.
+                    // Compare transformed paths as paths; literal arguments must be exact.
+                    let matches = if count == 40 && [31, 32, 39].contains(&i) {
+                        Path::new(actual[i]) == Path::new(&expected)
+                    } else {
+                        actual[i] == expected
+                    };
+                    if !matches {
+                        return Err(format!(
+                            "Argument {i} mismatch (count={count}, length={length}, reverse={reverse}, manifest={manifest}): expected {} bytes, got {} bytes; expected prefix {:?}, actual prefix {:?}",
+                            expected.len(), actual[i].len(),
+                            expected.chars().take(80).collect::<String>(),
+                            actual[i].chars().take(80).collect::<String>(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    // Invalid requests must fail before writing any output.
+    for (args, transform, diagnostic) in [
+        (vec![program.clone(); 41], "0", "No compatible template"),
+        (
+            vec![program.clone(), "x".repeat(4097)],
+            "0",
+            "No compatible template",
+        ),
+        (vec![program.clone()], "1", "Transform index"),
+        (vec![program.clone()], "64", "invalid value"),
+    ] {
+        let dest = dir.join("invalid");
+        let result = Command::new(&config.finalizer_path)
+            .arg("--template")
+            .arg(&config.template_path)
+            .arg("--template")
+            .arg(&config.large_template_path)
+            .arg("--output")
+            .arg(&dest)
+            .arg("--transform")
+            .arg(transform)
+            .arg("--")
+            .args(&args)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if result.status.success()
+            || dest.exists()
+            || !String::from_utf8_lossy(&result.stderr).contains(diagnostic)
+        {
+            return Err(format!(
+                "Invalid request was not rejected correctly: {}",
+                String::from_utf8_lossy(&result.stderr)
+            ));
+        }
+    }
+    // Protect every input, including a non-selected template, from being overwritten.
+    let before = fs::read(&config.large_template_path).map_err(|e| e.to_string())?;
+    let result = Command::new(&config.finalizer_path)
+        .arg("--template")
+        .arg(&config.template_path)
+        .arg("--template")
+        .arg(&config.large_template_path)
+        .arg("--output")
+        .arg(&config.large_template_path)
+        .arg("--")
+        .arg(&program)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if result.status.success()
+        || fs::read(&config.large_template_path).map_err(|e| e.to_string())? != before
+    {
+        return Err("Did not protect non-selected input template".into());
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
     println!("=== Runfiles Stub Test Suite ===");
     println!();
@@ -1712,12 +1892,14 @@ fn main() -> ExitCode {
 
     println!("Configuration:");
     println!("  Template:      {}", config.template_path.display());
+    println!("  Large template: {}", config.large_template_path.display());
     println!("  Finalizer:     {}", config.finalizer_path.display());
     println!("  Test binaries: {}", config.test_binaries_dir.display());
     println!("  Work dir:      {}", config.work_dir.display());
     println!();
 
     let tests: Vec<(&str, fn(&TestConfig) -> Result<(), String>)> = vec![
+        ("stub_capacities", test_stub_capacities),
         ("hash_file", test_hash_file),
         ("add_numbers_runtime_args", test_add_numbers_runtime_args),
         ("runfiles_source_precedence", test_runfiles_source_precedence),

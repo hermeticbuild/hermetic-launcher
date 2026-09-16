@@ -3,6 +3,9 @@ name = "runfiles-stub"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+large = []
+
 [dependencies]
 # No external dependencies: the stub uses a small in-tree bump allocator
 # (see src/allocator.rs) instead of a general-purpose allocator crate.

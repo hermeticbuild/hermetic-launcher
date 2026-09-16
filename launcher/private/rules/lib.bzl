@@ -6,9 +6,9 @@ def _get_finalizer(ctx):
     toolchain = ctx.toolchains[_FINALIZER_TOOLCHAIN_TYPE]
     return toolchain.finalizer_info.finalizer
 
-def _get_template(ctx, *, cfg = "target", template_exec_group = None, template_file = None):
+def _get_templates(ctx, *, cfg = "target", template_exec_group = None, template_file = None):
     if template_file != None:
-        return template_file
+        return [template_file]
     toolchain_dict = ctx.toolchains if template_exec_group == None else ctx.exec_groups[template_exec_group].toolchains
     if cfg == "target":
         toolchain = toolchain_dict[_TEMPLATE_TOOLCHAIN_TYPE]
@@ -16,7 +16,8 @@ def _get_template(ctx, *, cfg = "target", template_exec_group = None, template_f
         toolchain = toolchain_dict[_TEMPLATE_EXEC_TOOLCHAIN_TYPE]
     else:
         fail("Invalid cfg '%s': must be 'target' or 'exec'" % cfg)
-    return toolchain.templatetoolchaininfo.template_exe
+    info = toolchain.templatetoolchaininfo
+    return getattr(info, "template_exes", [info.template_exe])
 
 def _to_rlocation_path(f):
     if f.short_path.startswith("../"):
@@ -44,9 +45,9 @@ def _append_raw_transformed_arg(*, arg, embedded_args, transformed_args):
     return embedded_args, transformed_args
 
 def _compile_stub(*, ctx, embedded_args, transformed_args, output_file, cfg = "target", template_exec_group = None, template_file = None):
-    template = _get_template(ctx, cfg = cfg, template_exec_group = template_exec_group, template_file = template_file)
+    templates = _get_templates(ctx, cfg = cfg, template_exec_group = template_exec_group, template_file = template_file)
     args = ctx.actions.args()
-    args.add("--template", template)
+    args.add_all(templates, before_each = "--template")
     args.add("-o", output_file)
     args.add_joined("--transform", transformed_args, join_with = ",")
     args.add("--")
@@ -55,7 +56,7 @@ def _compile_stub(*, ctx, embedded_args, transformed_args, output_file, cfg = "t
         outputs = [output_file],
         executable = _get_finalizer(ctx),
         arguments = [args],
-        inputs = [template],
+        inputs = templates,
         toolchain = _FINALIZER_TOOLCHAIN_TYPE,
     )
     return output_file

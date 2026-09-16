@@ -11,6 +11,10 @@ See https://bazel.build/extending/toolchains#defining-toolchains.
 """
 
 ATTRS = dict(
+    template_exes = attr.label_list(
+        doc = "Template binaries considered for automatic capacity selection.",
+        allow_files = True,
+    ),
     template_exe = attr.label(
         doc = "A template binary that can be finalized.",
         allow_single_file = True,
@@ -20,8 +24,14 @@ ATTRS = dict(
 TOOLCHAIN_TYPE = str(Label("//launcher:template_toolchain_type"))
 
 def _stub_template_toolchain_impl(ctx):
+    templates = ctx.files.template_exes
+    if ctx.file.template_exe:
+        templates = [ctx.file.template_exe] + templates
+    if not templates:
+        fail("At least one template binary is required")
     stub_template_toolchain_info = TemplateToolchainInfo(
-        template_exe = ctx.file.template_exe,
+        template_exes = templates,
+        template_exe = templates[0],
     )
     toolchain_info = platform_common.ToolchainInfo(
         templatetoolchaininfo = stub_template_toolchain_info,

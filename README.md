@@ -152,17 +152,39 @@ RUNFILES_MANIFEST_FILE=manifest.txt ./my_echo "hello" a b
 ```
 finalize-stub --template <PATH> [OPTIONS] -- <arg0> [arg1 ...]
 
--t, --template <PATH>            Template binary to patch (required)
+-t, --template <PATH>            Template candidate (required; repeatable)
 -o, --output <PATH>              Output path (default: stdout; chmod +x on Unix)
-    --transform <N>              Mark embedded arg N (0–9) for runfiles resolution.
+    --transform <N>              Mark embedded arg N (0–39) for runfiles resolution.
                                  Repeatable or comma-separated. Default: none.
     --export-runfiles-env <B>    Export RUNFILES_DIR/RUNFILES_MANIFEST_FILE/JAVA_RUNFILES
                                  to the child (default: true)
 -v, --verbose                    Verbose output
 ```
 
-Up to 10 embedded arguments (`arg0`–`arg9`), each ≤ 256 bytes. `arg0` is the program to
-execute; the rest are its leading arguments. Runtime arguments are unrestricted.
+The tiny template supports 10 embedded arguments, each ≤ 256 bytes. The large
+`runfiles-stub-large-<arch>-<os>` template supports 40 arguments, each ≤ 4096 bytes.
+Limits include `arg0` and count UTF-8 bytes; a full slot needs no spare NUL byte.
+Repeat `--template` to supply candidates: the finalizer selects the smallest file
+that can hold all arguments (ties keep command-line order). For example:
+
+```sh
+finalize-stub --template runfiles-stub-x86_64-linux \
+  --template runfiles-stub-large-x86_64-linux -o my_tool -- /usr/bin/echo hello
+```
+
+Both variants use the same source; the `large` Cargo feature / Bazel `crate_features`
+selects capacities at compile time. Each carries a 64-byte, NUL-padded ASCII record,
+`@@RUNFILES_CAPS@@v1;args=10;size=256;flags=32` or
+`@@RUNFILES_CAPS@@v1;args=40;size=4096;flags=64`. Templates without metadata retain
+the legacy 10 × 256 limits. The finalizer validates the metadata and placeholder
+storage before patching, and rejects requests that fit none of the candidates.
+
+Bazel toolchains supply all available variants automatically. Source-built
+toolchains already include both. The pinned prebuilt release currently has only
+the tiny variant; publishing new binaries and running `//tools:update-binaries`
+updates the finalizers, downloads, and prebuilt toolchains together.
+
+`arg0` is the program to execute; the rest are its leading arguments. Runtime arguments are unrestricted.
 
 ### Runfiles discovery
 
@@ -220,7 +242,7 @@ Requires [Bazel](https://bazel.build) (see `.bazelversion`; Bazelisk picks it up
 Cross-compilation is handled entirely by Bazel via `rules_rs` and LLVM toolchains.
 
 ```bash
-# Build every release binary (7 templates + 7 finalizers) into ./artifacts
+# Build every release binary (14 templates + 7 finalizers) into ./artifacts
 bash tools/build-release-binaries.sh artifacts
 
 # Tests
@@ -246,7 +268,7 @@ launcher as an external Bazel module, so it only exercises the prebuilt stubs.
    git tag binaries-$(date +%Y%m%d)
    git push origin binaries-$(date +%Y%m%d)
    ```
-2. The [release workflow](.github/workflows/release.yml) builds all 14 binaries and publishes a GitHub release with a `SHA256SUMS.txt`.
+2. The [release workflow](.github/workflows/release.yml) builds all 21 binaries and publishes a GitHub release with a `SHA256SUMS.txt`.
 3. Once the release is published, run the updater and commit:
    ```bash
    bazel run //tools:update-binaries
