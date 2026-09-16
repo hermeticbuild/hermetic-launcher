@@ -1724,8 +1724,11 @@ fn test_stub_capacities(config: &TestConfig) -> Result<(), String> {
         args[1] = if length == 4096 {
             long.clone()
         } else {
-            "x".repeat(length)
+            "é".repeat(length / 2) + &"x".repeat(length % 2)
         };
+        if count >= 10 {
+            args[2] = "漢😀".into(); // Three-byte UTF-8 and a UTF-16 surrogate pair.
+        }
         if count == 40 {
             args[31] = key.into();
             args[32] = key.into();
@@ -1787,9 +1790,20 @@ fn test_stub_capacities(config: &TestConfig) -> Result<(), String> {
                     } else {
                         args[i].clone()
                     };
-                    if actual[i] != expected {
+                    // Windows manifest resolution normalizes separators, while directory
+                    // resolution can retain a mixed-separator RUNFILES_DIR prefix.
+                    // Compare transformed paths as paths; literal arguments must be exact.
+                    let matches = if count == 40 && [31, 32, 39].contains(&i) {
+                        Path::new(actual[i]) == Path::new(&expected)
+                    } else {
+                        actual[i] == expected
+                    };
+                    if !matches {
                         return Err(format!(
-                            "Argument {i} was truncated or incorrectly transformed"
+                            "Argument {i} mismatch (count={count}, length={length}, reverse={reverse}, manifest={manifest}): expected {} bytes, got {} bytes; expected prefix {:?}, actual prefix {:?}",
+                            expected.len(), actual[i].len(),
+                            expected.chars().take(80).collect::<String>(),
+                            actual[i].chars().take(80).collect::<String>(),
                         ));
                     }
                 }
