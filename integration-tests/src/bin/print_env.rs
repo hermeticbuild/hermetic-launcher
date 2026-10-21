@@ -3,6 +3,7 @@
 //! Usage: print-env [args...]
 //! Outputs:
 //!   ARGS:<arg0>|<arg1>|...
+//!   EXE:<path of the running executable>
 //!   ENV:<key>=<value> (for each env var)
 //!
 //! This is useful for debugging and validating what the stub passes to child processes.
@@ -16,6 +17,12 @@ fn main() -> ExitCode {
     let args_str = args.join("|");
     println!("ARGS:{}", args_str);
     println!("ARGC:{}", args.len());
+
+    // The file this process was started as, which can differ from argv[0]
+    match env::current_exe() {
+        Ok(exe) => println!("EXE:{}", exe.display()),
+        Err(_) => println!("EXE:<unknown>"),
+    }
 
     // Print selected environment variables (runfiles-related and common ones)
     let interesting_vars = [
