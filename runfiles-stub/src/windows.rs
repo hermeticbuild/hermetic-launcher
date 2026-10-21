@@ -606,17 +606,42 @@ fn append_arg(cmdline: &mut Vec<u16>, arg: &[u16], force_quotes: bool) {
     }
 }
 
+// Widen a byte string, dropping a trailing NUL.
+// TODO: Decode UTF-8 here instead of widening each byte, which garbles
+// non-ASCII paths and arguments. Paths read from Windows are narrowed by
+// keeping each UTF-16 unit's low byte, and the environment block is widened
+// the same way, so all three need to change together.
+fn widen(arg: &[u8]) -> Vec<u16> {
+    let bytes = if arg.last() == Some(&0) { &arg[..arg.len() - 1] } else { arg };
+    bytes.iter().map(|&b| b as u16).collect()
+}
+
 pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
     unsafe {
         let argc = launch.resolved.len();
+
+        // As on Unix, the program sees its runfiles path as argv[0] while the
+        // resolved path selects the image, so programs that locate files from
+        // argv[0] (such as Python finding a venv's pyvenv.cfg) find them in the
+        // runfiles tree. Windows rarely materializes that tree, so the
+        // runfiles path is used only where it exists; otherwise argv[0] stays
+        // the resolved path, a path that works.
+        let argv0_override = launch.argv0_override.filter(|path| path_exists(path));
+        let application_name: Option<Vec<u16>> = argv0_override.map(|_| {
+            let mut wide = widen(&launch.resolved[0]);
+            wide.push(0);
+            wide
+        });
 
         // Build the UTF-16 command line: embedded args (widened) + runtime args (native).
         let mut cmdline_wide: Vec<u16> = Vec::with_capacity(8192);
 
         for (i, arg) in launch.resolved.iter().enumerate() {
             // Embedded args are NUL-terminated; widen without the trailing NUL.
-            let bytes = if arg.last() == Some(&0) { &arg[..arg.len() - 1] } else { &arg[..] };
-            let wide: Vec<u16> = bytes.iter().map(|&b| b as u16).collect();
+            let wide = match argv0_override {
+                Some(override0) if i == 0 => widen(override0),
+                _ => widen(arg),
+            };
 
             // Quote arg0 always (Bazel launcher.cc convention); others as needed.
             append_arg(&mut cmdline_wide, &wide, i == 0);
@@ -650,9 +675,11 @@ pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
         si.cb = core::mem::size_of::<STARTUPINFOW>() as DWORD;
         let mut pi: PROCESS_INFORMATION = core::mem::zeroed();
 
-        // NULL lpApplicationName + quoted executable in the command line (Bazel approach).
+        // Without a runfiles argv[0], a NULL lpApplicationName + quoted executable in
+        // the command line (Bazel approach), which keeps CreateProcessW's search for
+        // the executable and its default `.exe` extension.
         let success = CreateProcessW(
-            core::ptr::null(),
+            application_name.as_ref().map_or(core::ptr::null(), |name| name.as_ptr()),
             cmdline_wide.as_mut_ptr(),
             core::ptr::null_mut(),
             core::ptr::null_mut(),

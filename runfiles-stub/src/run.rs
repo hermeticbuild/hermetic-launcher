@@ -19,8 +19,8 @@ use crate::runfiles::Runfiles;
 /// `resolved[0]` is the program to execute; bytes are NUL-terminated.
 pub struct Launch<'a> {
     pub resolved: &'a [Vec<u8>],
-    /// Runfiles-relative argv[0] (used by Unix to preserve symlink walks; ignored on Windows).
-    #[allow(dead_code)] // unused on Windows (CreateProcessW derives argv[0] from the command line)
+    /// Runfiles-relative argv[0], preserving the program's runfiles path for
+    /// programs that locate files from argv[0].
     pub argv0_override: Option<&'a [u8]>,
     pub runfiles: Option<&'a Runfiles>,
     pub export_env: bool,
