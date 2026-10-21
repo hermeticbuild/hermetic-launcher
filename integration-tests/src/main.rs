@@ -67,13 +67,13 @@ fn resolve_runfile_path(runfiles: &Runfiles, path: PathBuf) -> PathBuf {
 }
 
 /// argv[0] as print-env reported it: the first `|`-separated field of `ARGS:`.
-#[cfg(unix)]
-fn reported_argv0(stdout: &str) -> Option<&str> {
+fn reported_argv0(stdout: &str) -> Option<&Path> {
     stdout
         .lines()
         .next()
         .and_then(|line| line.strip_prefix("ARGS:"))
         .and_then(|args| args.split('|').next())
+        .map(Path::new)
 }
 
 fn environment_path<'a>(stdout: &'a str, name: &str) -> Option<&'a Path> {
@@ -996,6 +996,7 @@ fn test_fallback_runfiles_manifest(config: &TestConfig) -> Result<(), String> {
 
     // The logical sibling tree intentionally does not exist. The manifest maps
     // execution elsewhere, while argv[0] retains the logical runfiles identity.
+    #[cfg(unix)]
     let runfiles_dir = test_dir.join(format!("manifest_stub{}.runfiles", EXE_EXT));
     let print_env_binary = config
         .test_binaries_dir
@@ -1047,16 +1048,18 @@ fn test_fallback_runfiles_manifest(config: &TestConfig) -> Result<(), String> {
         ));
     }
 
+    // Windows names argv[0] by its runfiles path only where that path exists,
+    // and this tree was never built.
     #[cfg(unix)]
-    {
-        let expected = runfiles_dir.join(&print_env_rlocation);
-        if reported_argv0(&stdout) != Some(expected.to_string_lossy().as_ref()) {
-            return Err(format!(
-                "Adjacent manifest did not preserve logical argv[0].\nexpected: {}\nstdout: {}",
-                expected.display(),
-                stdout
-            ));
-        }
+    let expected = runfiles_dir.join(&print_env_rlocation);
+    #[cfg(windows)]
+    let expected = print_env_binary;
+    if reported_argv0(&stdout) != Some(expected.as_path()) {
+        return Err(format!(
+            "Adjacent manifest did not preserve logical argv[0].\nexpected: {}\nstdout: {}",
+            expected.display(),
+            stdout
+        ));
     }
 
     println!("    PASS");
@@ -1332,21 +1335,17 @@ fn test_env_manifest_logical_argv0(config: &TestConfig) -> Result<(), String> {
             ));
         }
 
-        // Windows derives argv[0] from the command line; the override is Unix-only.
-        #[cfg(unix)]
-        {
-            let expected_argv0 = runfiles
-                .runfiles_dir
-                .join(entry_key.replace('/', &PATH_SEP.to_string()));
-            if reported_argv0(&stdout) != Some(expected_argv0.to_string_lossy().as_ref()) {
-                return Err(format!(
-                    "Environment manifest ({}) did not preserve logical argv[0]; the \
-                     child was launched as its physical path.\nexpected: {}\nstdout: {}",
-                    layout,
-                    expected_argv0.display(),
-                    stdout
-                ));
-            }
+        let expected_argv0 = runfiles
+            .runfiles_dir
+            .join(entry_key.replace('/', &PATH_SEP.to_string()));
+        if reported_argv0(&stdout) != Some(expected_argv0.as_path()) {
+            return Err(format!(
+                "Environment manifest ({}) did not preserve logical argv[0]; the \
+                 child was launched as its physical path.\nexpected: {}\nstdout: {}",
+                layout,
+                expected_argv0.display(),
+                stdout
+            ));
         }
     }
 
@@ -1385,19 +1384,16 @@ fn test_sparse_inferred_tree_keeps_physical_argv0(config: &TestConfig) -> Result
         ));
     }
 
-    #[cfg(unix)]
-    {
-        let physical = runfiles
-            .runfiles_dir
-            .join(format!("tool_repo/bin/print-env{}", EXE_EXT).replace('/', &PATH_SEP.to_string()));
-        if reported_argv0(&stdout) != Some(physical.to_string_lossy().as_ref()) {
-            return Err(format!(
-                "argv[0] was overridden from a tree that was never materialized.\n\
-                 expected the physical path: {}\nstdout: {}",
-                physical.display(),
-                stdout
-            ));
-        }
+    let physical = runfiles
+        .runfiles_dir
+        .join(format!("tool_repo/bin/print-env{}", EXE_EXT).replace('/', &PATH_SEP.to_string()));
+    if reported_argv0(&stdout) != Some(physical.as_path()) {
+        return Err(format!(
+            "argv[0] was overridden from a tree that was never materialized.\n\
+             expected the physical path: {}\nstdout: {}",
+            physical.display(),
+            stdout
+        ));
     }
 
     println!("    PASS (sparse inferred tree left argv[0] physical)");
@@ -1438,21 +1434,18 @@ fn test_relative_env_manifest_keeps_physical_argv0(config: &TestConfig) -> Resul
         ));
     }
 
-    #[cfg(unix)]
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let physical = runfiles
-            .runfiles_dir
-            .join(format!("tool_repo/bin/print-env{}", EXE_EXT).replace('/', &PATH_SEP.to_string()));
-        if reported_argv0(&stdout) != Some(physical.to_string_lossy().as_ref()) {
-            return Err(format!(
-                "argv[0] was overridden from a relative manifest path, so it only \
-                 resolves from the launcher's working directory.\n\
-                 expected the physical path: {}\nstdout: {}",
-                physical.display(),
-                stdout
-            ));
-        }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let physical = runfiles
+        .runfiles_dir
+        .join(format!("tool_repo/bin/print-env{}", EXE_EXT).replace('/', &PATH_SEP.to_string()));
+    if reported_argv0(&stdout) != Some(physical.as_path()) {
+        return Err(format!(
+            "argv[0] was overridden from a relative manifest path, so it only \
+             resolves from the launcher's working directory.\n\
+             expected the physical path: {}\nstdout: {}",
+            physical.display(),
+            stdout
+        ));
     }
 
     println!("    PASS (relative env manifest left argv[0] physical)");
@@ -1543,18 +1536,15 @@ fn test_print_env(config: &TestConfig) -> Result<(), String> {
         return Err(format!("Stub failed with exit code {}: {}", exit_code, stderr));
     }
 
-    #[cfg(unix)]
-    {
-        let expected = runfiles
-            .get_path(&print_env_rlocation)
-            .ok_or_else(|| format!("Missing manifest entry for {}", print_env_rlocation))?;
-        if reported_argv0(&stdout) != Some(expected.to_string_lossy().as_ref()) {
-            return Err(format!(
-                "Environment manifest changed argv[0].\nexpected: {}\nstdout: {}",
-                expected.display(),
-                stdout
-            ));
-        }
+    let expected = runfiles
+        .get_path(&print_env_rlocation)
+        .ok_or_else(|| format!("Missing manifest entry for {}", print_env_rlocation))?;
+    if reported_argv0(&stdout) != Some(expected.as_path()) {
+        return Err(format!(
+            "Environment manifest changed argv[0].\nexpected: {}\nstdout: {}",
+            expected.display(),
+            stdout
+        ));
     }
 
     // Verify embedded arguments are passed
