@@ -872,6 +872,62 @@ fn test_orchestrator_env_propagation(config: &TestConfig) -> Result<(), String> 
     Ok(())
 }
 
+/// Test: runtime arguments with embedded quotes, backslashes and spaces reach the child verbatim
+fn test_runtime_args_quoting(config: &TestConfig) -> Result<(), String> {
+    println!("  Running test: runtime_args_quoting");
+
+    let test_dir = config.work_dir.join("test_runtime_args_quoting");
+    fs::create_dir_all(&test_dir).map_err(|e| format!("Failed to create test dir: {}", e))?;
+
+    let mut runfiles = RunfilesSetup::new(&test_dir, "quoting_stub")
+        .map_err(|e| format!("Failed to create runfiles: {}", e))?;
+
+    let print_env_binary = config.test_binaries_dir.join(format!("print-env{}", EXE_EXT));
+    let rlocation = format!("{}/bin/print-env{}", WORKSPACE_NAME, EXE_EXT);
+    runfiles
+        .add_file(&rlocation, &print_env_binary)
+        .map_err(|e| format!("Failed to add print-env: {}", e))?;
+    runfiles
+        .write_manifest()
+        .map_err(|e| format!("Failed to write manifest: {}", e))?;
+
+    let stub_path = test_dir.join(format!("quoting_stub{}", EXE_EXT));
+    finalize_stub(config, &stub_path, &[&rlocation], &[0])?;
+
+    // Each argument must arrive exactly as given (print-env joins them with `|`).
+    let expected: [&str; 8] = [
+        r#"{"allow_js":false,"out_dir":"","root_dir":""}"#,
+        r#"{"a b":"c d"}"#,
+        r#"say "hi""#,
+        r#"C:\dir\"#,
+        r#"C:\my dir\"#,
+        r#"a\\"b"#,
+        "",
+        "plain",
+    ];
+    let (stdout, stderr, exit_code) = run_stub(&stub_path, &runfiles, &expected, true)?;
+    if exit_code != 0 {
+        return Err(format!("Stub failed with exit code {}: {}", exit_code, stderr));
+    }
+
+    let reported: Vec<&str> = stdout
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("ARGS:"))
+        .map(|args| args.split('|').skip(1).collect())
+        .unwrap_or_default();
+    if reported != expected {
+        return Err(format!(
+            "Runtime arguments were altered.\nexpected: {:?}\nactual:   {:?}\nstderr: {}",
+            expected, reported, stderr
+        ));
+    }
+
+    println!("    PASS");
+
+    Ok(())
+}
+
 /// Test: Mixed transformed and literal arguments
 fn test_mixed_arguments(config: &TestConfig) -> Result<(), String> {
     println!("  Running test: mixed_arguments");
@@ -1724,6 +1780,7 @@ fn main() -> ExitCode {
         ("merge_json", test_merge_json),
         ("orchestrator_env_propagation", test_orchestrator_env_propagation),
         ("mixed_arguments", test_mixed_arguments),
+        ("runtime_args_quoting", test_runtime_args_quoting),
         ("fallback_runfiles_dir", test_fallback_runfiles_dir),
         ("fallback_runfiles_manifest", test_fallback_runfiles_manifest),
         ("run_runfiles_discovery", test_run_runfiles_discovery),

@@ -435,75 +435,110 @@ fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> Vec<u16> {
 }
 
 // Parse a Windows command line into runtime arguments (excluding argv[0]).
-// We avoid CommandLineToArgvW to skip the shell32.dll dependency.
+// We avoid CommandLineToArgvW to skip the shell32.dll dependency, but follow its
+// (MSVCRT) rules so each argument is recovered exactly as the caller meant it:
+//   * arguments are separated by runs of spaces/tabs outside double quotes;
+//   * 2n backslashes followed by `"` yield n backslashes and toggle quoting;
+//   * 2n+1 backslashes followed by `"` yield n backslashes and a literal `"`;
+//   * backslashes not followed by `"` are literal;
+//   * inside a quoted section, `""` yields a literal `"` and stays quoted.
+// Unescaping needs to rewrite the text, so the arguments are copied back to back into
+// `storage` and `ranges[i]` holds the (offset, length) of argument i within it.
+// `storage` must not be reallocated after this returns.
 fn parse_command_line(
     cmdline: *const u16,
-    argv_out: &mut [*const u16; 128],
-    argv_len_out: &mut [usize; 128],
+    storage: &mut Vec<u16>,
+    ranges: &mut [(usize, usize); 128],
 ) -> usize {
+    const SPACE: u16 = b' ' as u16;
+    const TAB: u16 = b'\t' as u16;
+    const QUOTE: u16 = b'"' as u16;
+    const BACKSLASH: u16 = b'\\' as u16;
+
     unsafe {
         let mut pos = 0usize;
         let mut argc = 0usize;
 
         // Skip leading whitespace
-        while *cmdline.add(pos) != 0
-            && (*cmdline.add(pos) == b' ' as u16 || *cmdline.add(pos) == b'\t' as u16)
-        {
+        while *cmdline.add(pos) != 0 && (*cmdline.add(pos) == SPACE || *cmdline.add(pos) == TAB) {
             pos += 1;
         }
 
-        // Skip argv[0] (executable path)
-        let quoted = *cmdline.add(pos) == b'"' as u16;
+        // Skip argv[0] (executable path): no backslash escapes, quotes just group.
+        let quoted = *cmdline.add(pos) == QUOTE;
         if quoted {
             pos += 1;
-            while *cmdline.add(pos) != 0 && *cmdline.add(pos) != b'"' as u16 {
+            while *cmdline.add(pos) != 0 && *cmdline.add(pos) != QUOTE {
                 pos += 1;
             }
-            if *cmdline.add(pos) == b'"' as u16 {
+            if *cmdline.add(pos) == QUOTE {
                 pos += 1;
             }
         } else {
-            while *cmdline.add(pos) != 0
-                && *cmdline.add(pos) != b' ' as u16
-                && *cmdline.add(pos) != b'\t' as u16
-            {
+            while *cmdline.add(pos) != 0 && *cmdline.add(pos) != SPACE && *cmdline.add(pos) != TAB {
                 pos += 1;
             }
         }
 
+        // Unescaping never grows the text, so the remaining command line bounds the storage.
+        let mut remaining = 0usize;
+        while *cmdline.add(pos + remaining) != 0 {
+            remaining += 1;
+        }
+        storage.reserve(remaining);
+
         // Parse remaining arguments
         while *cmdline.add(pos) != 0 && argc < 128 {
-            while *cmdline.add(pos) != 0
-                && (*cmdline.add(pos) == b' ' as u16 || *cmdline.add(pos) == b'\t' as u16)
-            {
+            while *cmdline.add(pos) != 0 && (*cmdline.add(pos) == SPACE || *cmdline.add(pos) == TAB) {
                 pos += 1;
             }
             if *cmdline.add(pos) == 0 {
                 break;
             }
 
-            let arg_start = pos;
-            let in_quotes = *cmdline.add(pos) == b'"' as u16;
-            if in_quotes {
-                pos += 1;
-                while *cmdline.add(pos) != 0 && *cmdline.add(pos) != b'"' as u16 {
+            let arg_start = storage.len();
+            let mut in_quotes = false;
+            loop {
+                let c = *cmdline.add(pos);
+                if c == 0 || (!in_quotes && (c == SPACE || c == TAB)) {
+                    break;
+                }
+                if c == BACKSLASH {
+                    let mut backslashes = 0usize;
+                    while *cmdline.add(pos) == BACKSLASH {
+                        backslashes += 1;
+                        pos += 1;
+                    }
+                    if *cmdline.add(pos) == QUOTE {
+                        for _ in 0..backslashes / 2 {
+                            storage.push(BACKSLASH);
+                        }
+                        if backslashes % 2 == 1 {
+                            // Escaped quote: literal `"`.
+                            storage.push(QUOTE);
+                            pos += 1;
+                        }
+                        // Even run: the quote itself is handled on the next iteration.
+                    } else {
+                        for _ in 0..backslashes {
+                            storage.push(BACKSLASH);
+                        }
+                    }
+                } else if c == QUOTE {
+                    pos += 1;
+                    if in_quotes && *cmdline.add(pos) == QUOTE {
+                        // `""` inside quotes: literal `"`, still quoted.
+                        storage.push(QUOTE);
+                        pos += 1;
+                    } else {
+                        in_quotes = !in_quotes;
+                    }
+                } else {
+                    storage.push(c);
                     pos += 1;
                 }
-                argv_out[argc] = cmdline.add(arg_start + 1);
-                argv_len_out[argc] = pos - arg_start - 1;
-                if *cmdline.add(pos) == b'"' as u16 {
-                    pos += 1;
-                }
-            } else {
-                while *cmdline.add(pos) != 0
-                    && *cmdline.add(pos) != b' ' as u16
-                    && *cmdline.add(pos) != b'\t' as u16
-                {
-                    pos += 1;
-                }
-                argv_out[argc] = cmdline.add(arg_start);
-                argv_len_out[argc] = pos - arg_start;
             }
+            ranges[argc] = (arg_start, storage.len() - arg_start);
             argc += 1;
         }
         argc
@@ -512,6 +547,8 @@ fn parse_command_line(
 
 // --- runtime args & launch ---
 pub struct RuntimeArgs {
+    // Owns the unescaped argument text that `runtime_argv` points into.
+    _storage: Vec<u16>,
     runtime_argv: [*const u16; 128],
     runtime_argv_len: [usize; 128],
     runtime_count: usize,
@@ -643,10 +680,18 @@ pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
 #[no_mangle]
 pub extern "C" fn main() -> ! {
     let cmdline = unsafe { GetCommandLineW() };
+    let mut storage: Vec<u16> = Vec::new();
+    let mut ranges = [(0usize, 0usize); 128];
+    let runtime_count = parse_command_line(cmdline, &mut storage, &mut ranges);
+    // `storage` is fully built, so its heap buffer (and these pointers) stay put when it moves.
     let mut runtime_argv: [*const u16; 128] = [core::ptr::null(); 128];
     let mut runtime_argv_len: [usize; 128] = [0; 128];
-    let runtime_count = parse_command_line(cmdline, &mut runtime_argv, &mut runtime_argv_len);
+    for i in 0..runtime_count {
+        runtime_argv[i] = unsafe { storage.as_ptr().add(ranges[i].0) };
+        runtime_argv_len[i] = ranges[i].1;
+    }
     crate::run::main(RuntimeArgs {
+        _storage: storage,
         runtime_argv,
         runtime_argv_len,
         runtime_count,
