@@ -129,6 +129,21 @@ extern "system" {
         lpExeName: *mut u16,
         lpdwSize: *mut DWORD,
     ) -> BOOL;
+    fn CreateFileW(
+        lpFileName: *const u16,
+        dwDesiredAccess: DWORD,
+        dwShareMode: DWORD,
+        lpSecurityAttributes: LPVOID,
+        dwCreationDisposition: DWORD,
+        dwFlagsAndAttributes: DWORD,
+        hTemplateFile: HANDLE,
+    ) -> HANDLE;
+    fn GetFinalPathNameByHandleW(
+        hFile: HANDLE,
+        lpszFilePath: *mut u16,
+        cchFilePath: DWORD,
+        dwFlags: DWORD,
+    ) -> DWORD;
 }
 
 // --- path semantics ---
@@ -616,6 +631,49 @@ fn widen(arg: &[u8]) -> Vec<u16> {
     bytes.iter().map(|&b| b as u16).collect()
 }
 
+// The NUL-terminated path of the file that the NUL-terminated `path` names,
+// through any symlinks. None if `path` names no file.
+fn final_path(path: &[u16]) -> Option<Vec<u16>> {
+    const MAX_PATH: usize = 260;
+    unsafe {
+        let handle = CreateFileW(
+            path.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            core::ptr::null_mut(),
+            OPEN_EXISTING,
+            0,
+            core::ptr::null_mut(),
+        );
+        if handle == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut wide = vec![0u16; 4096];
+        // Flags 0: the normalized path with its drive letter, prefixed `\\?\`.
+        let size = GetFinalPathNameByHandleW(handle, wide.as_mut_ptr(), wide.len() as DWORD, 0);
+        CloseHandle(handle);
+        // `size` excludes the NUL when the path fits and includes it when it doesn't.
+        if size == 0 || size as usize >= wide.len() {
+            return None;
+        }
+        wide.truncate(size as usize);
+        // Drop the `\\?\` prefix from a drive path short enough not to need it,
+        // so the program sees the path it would have been started by.
+        let prefix: Vec<u16> = br"\\?\".iter().map(|&b| b as u16).collect();
+        let start = if wide.starts_with(&prefix)
+            && wide.get(prefix.len() + 1) == Some(&(b':' as u16))
+            && wide.len() - prefix.len() < MAX_PATH
+        {
+            prefix.len()
+        } else {
+            0
+        };
+        let mut result = wide.split_off(start);
+        result.push(0);
+        Some(result)
+    }
+}
+
 pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
     unsafe {
         let argc = launch.resolved.len();
@@ -627,11 +685,21 @@ pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
         // runfiles path is used only where it exists; otherwise argv[0] stays
         // the resolved path, a path that works.
         let argv0_override = launch.argv0_override.filter(|path| path_exists(path));
-        let application_name: Option<Vec<u16>> = argv0_override.map(|_| {
-            let mut wide = widen(&launch.resolved[0]);
-            wide.push(0);
-            wide
-        });
+
+        // Windows looks for a program's DLLs beside the path it was started by,
+        // so a program started through a runfiles symlink, such as a Python
+        // venv's python.exe, can't find its DLLs. Start the file the symlink
+        // points to, as Unix's execve does.
+        let resolved0: &[u8] = &launch.resolved[0];
+        let resolved0 = resolved0.strip_suffix(&[0]).unwrap_or(resolved0);
+        let mut program = widen(resolved0);
+        program.push(0);
+        let final_program = if core::str::from_utf8(resolved0).is_ok_and(is_absolute) {
+            final_path(&program)
+        } else {
+            None
+        };
+        let application_name = final_program.or_else(|| argv0_override.map(|_| program));
 
         // Build the UTF-16 command line: embedded args (widened) + runtime args (native).
         let mut cmdline_wide: Vec<u16> = Vec::with_capacity(8192);
@@ -675,9 +743,10 @@ pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
         si.cb = core::mem::size_of::<STARTUPINFOW>() as DWORD;
         let mut pi: PROCESS_INFORMATION = core::mem::zeroed();
 
-        // Without a runfiles argv[0], a NULL lpApplicationName + quoted executable in
-        // the command line (Bazel approach), which keeps CreateProcessW's search for
-        // the executable and its default `.exe` extension.
+        // Without an application name, a NULL lpApplicationName + quoted
+        // executable in the command line (Bazel approach), which keeps
+        // CreateProcessW's search for the executable and its default `.exe`
+        // extension.
         let success = CreateProcessW(
             application_name.as_ref().map_or(core::ptr::null(), |name| name.as_ptr()),
             cmdline_wide.as_mut_ptr(),

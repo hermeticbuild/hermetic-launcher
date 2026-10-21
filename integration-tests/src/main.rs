@@ -1039,6 +1039,63 @@ fn test_fallback_runfiles_dir(config: &TestConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Regression test: a program reached through a symlink in the runfiles tree must
+/// start as the file the symlink points to, as execve does, because Windows looks
+/// for a program's DLLs beside the path it was started by.
+fn test_symlinked_program_starts_target(config: &TestConfig) -> Result<(), String> {
+    println!("  Running test: symlinked_program_starts_target");
+
+    let test_dir = config.work_dir.join("test_symlinked_program");
+    fs::create_dir_all(&test_dir).map_err(|e| format!("Failed to create test dir: {}", e))?;
+
+    let runfiles = RunfilesSetup::new(&test_dir, "symlink_stub")
+        .map_err(|e| format!("Failed to create runfiles: {}", e))?;
+    let print_env_rlocation = format!("{}/bin/print-env{}", WORKSPACE_NAME, EXE_EXT);
+    let link = runfiles
+        .runfiles_dir
+        .join(print_env_rlocation.replace('/', &PATH_SEP.to_string()));
+    fs::create_dir_all(link.parent().unwrap())
+        .map_err(|e| format!("Failed to create link dir: {}", e))?;
+    let target = config.test_binaries_dir.join(format!("print-env{}", EXE_EXT));
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(&target, &link);
+    #[cfg(windows)]
+    let linked = std::os::windows::fs::symlink_file(&target, &link);
+    linked.map_err(|e| format!("Failed to create symlink: {}", e))?;
+
+    let stub_path = test_dir.join(format!("symlink_stub{}", EXE_EXT));
+    finalize_stub(config, &stub_path, &[&print_env_rlocation], &[0])?;
+
+    let (stdout, stderr, exit_code) = run_stub(&stub_path, &runfiles, &[], false)?;
+    if exit_code != 0 {
+        return Err(format!(
+            "Stub failed with exit code {}.\nstdout: {}\nstderr: {}",
+            exit_code, stdout, stderr
+        ));
+    }
+
+    // Unix starts the target in the kernel, and macOS reports the symlink as the
+    // executable regardless, so only Windows depends on the launcher here.
+    #[cfg(windows)]
+    {
+        let canonical = fs::canonicalize(&target)
+            .map_err(|e| format!("Failed to resolve {}: {}", target.display(), e))?;
+        let canonical = canonical.to_string_lossy();
+        let expected = canonical.strip_prefix(r"\\?\").unwrap_or(&canonical);
+        let reported = stdout.lines().find_map(|line| line.strip_prefix("EXE:"));
+        if reported != Some(expected) {
+            return Err(format!(
+                "Program was not started as its symlink's target.\nexpected: {}\nstdout: {}",
+                expected, stdout
+            ));
+        }
+    }
+
+    println!("    PASS");
+
+    Ok(())
+}
+
 /// Test: Fallback runfiles_manifest file discovery
 fn test_fallback_runfiles_manifest(config: &TestConfig) -> Result<(), String> {
     println!("  Running test: fallback_runfiles_manifest");
@@ -1772,6 +1829,7 @@ fn main() -> ExitCode {
         ("mixed_arguments", test_mixed_arguments),
         ("runtime_args_quoting", test_runtime_args_quoting),
         ("fallback_runfiles_dir", test_fallback_runfiles_dir),
+        ("symlinked_program_starts_target", test_symlinked_program_starts_target),
         ("fallback_runfiles_manifest", test_fallback_runfiles_manifest),
         ("run_runfiles_discovery", test_run_runfiles_discovery),
         ("relative_manifest_symlinks", test_relative_manifest_symlinks),
