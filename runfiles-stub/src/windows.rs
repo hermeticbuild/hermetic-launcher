@@ -25,6 +25,7 @@ const OPEN_EXISTING: DWORD = 3;
 const FILE_ATTRIBUTE_NORMAL: DWORD = 0x80;
 const INFINITE: DWORD = 0xFFFFFFFF;
 const CREATE_UNICODE_ENVIRONMENT: DWORD = 0x00000400;
+const MAX_PATH: usize = 260;
 
 // File sharing and memory-mapping parameters (for the runfiles manifest)
 const FILE_SHARE_READ: DWORD = 0x00000001;
@@ -631,47 +632,49 @@ fn widen(arg: &[u8]) -> Vec<u16> {
     bytes.iter().map(|&b| b as u16).collect()
 }
 
-// The NUL-terminated path of the file that the NUL-terminated `path` names,
+// The NUL-terminated UTF-16 path of the file that the UTF-16 `path` names,
 // through any symlinks. None if `path` names no file.
 fn final_path(path: &[u16]) -> Option<Vec<u16>> {
-    const MAX_PATH: usize = 260;
-    unsafe {
-        let handle = CreateFileW(
-            path.as_ptr(),
+    const CAPACITY: DWORD = 4096;
+    let mut terminated = path.to_vec();
+    terminated.push(0);
+    let handle = unsafe {
+        CreateFileW(
+            terminated.as_ptr(),
             0,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             core::ptr::null_mut(),
             OPEN_EXISTING,
             0,
             core::ptr::null_mut(),
-        );
-        if handle == INVALID_HANDLE_VALUE {
-            return None;
-        }
-        let mut wide = vec![0u16; 4096];
-        // Flags 0: the normalized path with its drive letter, prefixed `\\?\`.
-        let size = GetFinalPathNameByHandleW(handle, wide.as_mut_ptr(), wide.len() as DWORD, 0);
-        CloseHandle(handle);
-        // `size` excludes the NUL when the path fits and includes it when it doesn't.
-        if size == 0 || size as usize >= wide.len() {
-            return None;
-        }
-        wide.truncate(size as usize);
-        // Drop the `\\?\` prefix from a drive path short enough not to need it,
-        // so the program sees the path it would have been started by.
-        let prefix: Vec<u16> = br"\\?\".iter().map(|&b| b as u16).collect();
-        let start = if wide.starts_with(&prefix)
-            && wide.get(prefix.len() + 1) == Some(&(b':' as u16))
-            && wide.len() - prefix.len() < MAX_PATH
-        {
-            prefix.len()
-        } else {
-            0
-        };
-        let mut result = wide.split_off(start);
-        result.push(0);
-        Some(result)
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
     }
+    let mut wide = vec![0u16; CAPACITY as usize];
+    // Flags 0: the normalized path with its drive letter, prefixed `\\?\`.
+    let size = unsafe { GetFinalPathNameByHandleW(handle, wide.as_mut_ptr(), CAPACITY, 0) };
+    unsafe { CloseHandle(handle) };
+    // `size` excludes the NUL when the path fits and includes it when it doesn't.
+    if size == 0 || size >= CAPACITY {
+        return None;
+    }
+    wide.truncate(size as usize);
+    // Drop the `\\?\` prefix from a drive path short enough not to need it,
+    // so the program sees the path it would have been started by.
+    let prefix: Vec<u16> = br"\\?\".iter().map(|&b| u16::from(b)).collect();
+    let start = if wide.starts_with(&prefix)
+        && wide.get(prefix.len() + 1) == Some(&u16::from(b':'))
+        && wide.len() - prefix.len() < MAX_PATH
+    {
+        prefix.len()
+    } else {
+        0
+    };
+    let mut result = wide.split_off(start);
+    result.push(0);
+    Some(result)
 }
 
 pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
@@ -693,13 +696,17 @@ pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
         let resolved0: &[u8] = &launch.resolved[0];
         let resolved0 = resolved0.strip_suffix(&[0]).unwrap_or(resolved0);
         let mut program = widen(resolved0);
-        program.push(0);
         let final_program = if core::str::from_utf8(resolved0).is_ok_and(is_absolute) {
             final_path(&program)
         } else {
             None
         };
-        let application_name = final_program.or_else(|| argv0_override.map(|_| program));
+        let application_name = final_program.or_else(|| {
+            argv0_override.map(|_| {
+                program.push(0);
+                program
+            })
+        });
 
         // Build the UTF-16 command line: embedded args (widened) + runtime args (native).
         let mut cmdline_wide: Vec<u16> = Vec::with_capacity(8192);

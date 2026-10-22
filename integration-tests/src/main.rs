@@ -1074,8 +1074,9 @@ fn test_symlinked_program_starts_target(config: &TestConfig) -> Result<(), Strin
         ));
     }
 
-    // Unix starts the target in the kernel, and macOS reports the symlink as the
-    // executable regardless, so only Windows depends on the launcher here.
+    // On Unix, the kernel's execve chooses the symlink's target, not the
+    // launcher, so there the test only checks that a program reached through a
+    // symlink runs. Only Windows depends on the launcher to start the target.
     #[cfg(windows)]
     {
         let canonical = fs::canonicalize(&target)
