@@ -114,13 +114,7 @@ extern "system" {
     fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *mut DWORD) -> BOOL;
     fn GetEnvironmentStringsW() -> *mut u16;
     fn FreeEnvironmentStringsW(lpszEnvironmentBlock: *mut u16) -> BOOL;
-    fn GetCurrentProcess() -> HANDLE;
-    fn QueryFullProcessImageNameW(
-        hProcess: HANDLE,
-        dwFlags: DWORD,
-        lpExeName: *mut u16,
-        lpdwSize: *mut DWORD,
-    ) -> BOOL;
+    fn GetModuleFileNameW(hModule: HANDLE, lpFilename: *mut u16, nSize: DWORD) -> DWORD;
     fn CreateFileW(
         lpFileName: *const u16,
         dwDesiredAccess: DWORD,
@@ -228,24 +222,24 @@ pub fn path_exists(path: &str) -> bool {
     true
 }
 
-// Path used to launch this process, via QueryFullProcessImageNameW (the
-// documented API for a process's own image path). With dwFlags = 0 it returns a
-// fully-qualified Win32 path, i.e. already absolute. None on failure or if the
-// path is not valid UTF-16.
+// Path used to launch this process: the absolute path CreateProcess was given,
+// with symlinks unresolved, so a stub started through a symlink finds the
+// runfiles beside the symlink. (QueryFullProcessImageNameW would resolve them.)
+// None on failure, truncation, or if the path is not valid UTF-16.
 fn launch_path() -> Option<String> {
     let mut wide = vec![0u16; 4096];
-    let mut size: DWORD = wide.len() as DWORD;
-    let ok = unsafe {
-        QueryFullProcessImageNameW(GetCurrentProcess(), 0, wide.as_mut_ptr(), &mut size)
-    };
-    if ok == 0 || size == 0 || size as usize > wide.len() {
+    // A null module means the executable. The result is the number of
+    // characters written, excluding the NUL, or the buffer size if truncated.
+    let len = unsafe {
+        GetModuleFileNameW(core::ptr::null_mut(), wide.as_mut_ptr(), wide.len() as DWORD)
+    } as usize;
+    if len == 0 || len >= wide.len() {
         return None;
     }
-    // `size` is the number of characters written, excluding the NUL terminator.
-    from_wide(&wide[..size as usize])
+    from_wide(&wide[..len])
 }
 
-// QueryFullProcessImageNameW already yields an absolute path, so the cwd is
+// GetModuleFileNameW already yields an absolute path, so the cwd is
 // never needed to absolutize it; this exists only to satisfy the shared
 // `absolutize` seam and is not expected to be called on Windows.
 pub fn current_dir() -> Option<Vec<u8>> {
@@ -517,7 +511,7 @@ pub struct RuntimeArgs {
 }
 
 impl RuntimeArgs {
-    /// Absolute path of the launching executable (QueryFullProcessImageNameW),
+    /// Absolute path of the launching executable (`GetModuleFileNameW`),
     /// for runfiles self-location. Independent of the command-line argv[0].
     pub fn executable_path(&self) -> Option<Vec<u8>> {
         launch_path().map(|path| crate::common::absolutize(path.into_bytes()))

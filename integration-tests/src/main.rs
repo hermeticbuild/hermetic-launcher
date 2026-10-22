@@ -84,6 +84,15 @@ fn environment_path<'a>(stdout: &'a str, name: &str) -> Option<&'a Path> {
         .map(Path::new)
 }
 
+/// Create a symlink to a file at `link`.
+fn symlink_file(target: &Path, link: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    let linked = std::os::windows::fs::symlink_file(target, link);
+    linked.map_err(|e| format!("Failed to create symlink: {}", e))
+}
+
 impl TestConfig {
     fn from_args() -> Result<Self, String> {
         let args: Vec<String> = env::args().collect();
@@ -1057,11 +1066,7 @@ fn test_symlinked_program_starts_target(config: &TestConfig) -> Result<(), Strin
     fs::create_dir_all(link.parent().unwrap())
         .map_err(|e| format!("Failed to create link dir: {}", e))?;
     let target = config.test_binaries_dir.join(format!("print-env{}", EXE_EXT));
-    #[cfg(unix)]
-    let linked = std::os::unix::fs::symlink(&target, &link);
-    #[cfg(windows)]
-    let linked = std::os::windows::fs::symlink_file(&target, &link);
-    linked.map_err(|e| format!("Failed to create symlink: {}", e))?;
+    symlink_file(&target, &link)?;
 
     let stub_path = test_dir.join(format!("symlink_stub{}", EXE_EXT));
     finalize_stub(config, &stub_path, &[&print_env_rlocation], &[0])?;
@@ -1090,6 +1095,59 @@ fn test_symlinked_program_starts_target(config: &TestConfig) -> Result<(), Strin
                 expected, stdout
             ));
         }
+    }
+
+    println!("    PASS");
+
+    Ok(())
+}
+
+/// Regression test: a stub started through a symlink finds the runfiles beside
+/// the symlink, not beside the stub it points to, as on Unix, where a stub
+/// locates itself by the path it was executed as.
+fn test_symlinked_stub_finds_runfiles(config: &TestConfig) -> Result<(), String> {
+    println!("  Running test: symlinked_stub_finds_runfiles");
+
+    let test_dir = config.work_dir.join("test_symlinked_stub");
+    let real_dir = test_dir.join("real");
+    let link_dir = test_dir.join("link");
+    for dir in [&real_dir, &link_dir] {
+        fs::create_dir_all(dir).map_err(|e| format!("Failed to create test dir: {}", e))?;
+    }
+
+    let stub_path = real_dir.join(format!("stub{}", EXE_EXT));
+    let link = link_dir.join(format!("stub{}", EXE_EXT));
+    let manifest_path = link_dir.join(format!("stub{}.runfiles_manifest", EXE_EXT));
+    let rlocation = format!("{}/bin/print-env{}", WORKSPACE_NAME, EXE_EXT);
+    let print_env = config.test_binaries_dir.join(format!("print-env{}", EXE_EXT));
+    fs::write(&manifest_path, format!("{} {}\n", rlocation, print_env.display()))
+        .map_err(|e| format!("Failed to write manifest: {}", e))?;
+
+    finalize_stub(config, &stub_path, &[&rlocation], &[0])?;
+    symlink_file(&stub_path, &link)?;
+
+    let mut cmd = Command::new(&link);
+    cmd.env_remove("RUNFILES_DIR");
+    cmd.env_remove("RUNFILES_MANIFEST_FILE");
+    cmd.env_remove("JAVA_RUNFILES");
+
+    let output = cmd.output().map_err(|e| format!("Failed to run stub: {}", e))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let exit_code = output.status.code().unwrap_or(-1);
+
+    if exit_code != 0 {
+        return Err(format!(
+            "Stub started through a symlink failed with exit code {}.\nstdout: {}\nstderr: {}",
+            exit_code, stdout, stderr
+        ));
+    }
+    if environment_path(&stdout, "RUNFILES_MANIFEST_FILE") != Some(manifest_path.as_path()) {
+        return Err(format!(
+            "Stub did not use the manifest beside its symlink.\nexpected: {}\nstdout: {}",
+            manifest_path.display(),
+            stdout
+        ));
     }
 
     println!("    PASS");
@@ -1920,6 +1978,7 @@ fn main() -> ExitCode {
         ("runtime_args_quoting", test_runtime_args_quoting),
         ("fallback_runfiles_dir", test_fallback_runfiles_dir),
         ("symlinked_program_starts_target", test_symlinked_program_starts_target),
+        ("symlinked_stub_finds_runfiles", test_symlinked_stub_finds_runfiles),
         ("non_ascii_paths", test_non_ascii_paths),
         ("fallback_runfiles_manifest", test_fallback_runfiles_manifest),
         ("run_runfiles_discovery", test_run_runfiles_discovery),
