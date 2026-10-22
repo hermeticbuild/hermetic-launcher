@@ -39,15 +39,15 @@ impl Runfiles {
         // platform's directory-vs-manifest preference.
         if let Some(rf) = select_source(
             || {
-                platform::get_env_var(b"RUNFILES_DIR")
+                platform::get_env_var("RUNFILES_DIR")
                     .filter(|path| !path.is_empty() && dir_exists(path))
                     .map(|path| Self::Directory { path })
             },
             || {
-                platform::get_env_var(b"RUNFILES_MANIFEST_FILE")
+                platform::get_env_var("RUNFILES_MANIFEST_FILE")
                     .filter(|path| !path.is_empty())
                     .and_then(|path| {
-                        load_manifest(&path).map(|manifest| Self::Manifest {
+                        platform::load_manifest(&path).map(|manifest| Self::Manifest {
                             manifest,
                             // A manifest source does not imply the tree is
                             // absent; recover it so argv[0] stays logical.
@@ -79,7 +79,7 @@ impl Runfiles {
                         })
                     },
                     || {
-                        load_manifest(&manifest_path).map(|manifest| Self::Manifest {
+                        platform::load_manifest(&manifest_path).map(|manifest| Self::Manifest {
                             manifest,
                             path: manifest_path.clone(),
                             // Preserve the logical path even though the sibling
@@ -138,7 +138,7 @@ impl Runfiles {
                 // a sparse or unbuilt tree would name a path that does not exist.
                 LogicalDir::Inferred(dir) => {
                     let entry = join_runfiles_path(dir, path);
-                    exists(&entry).then_some(entry)
+                    platform::path_exists(&entry).then_some(entry)
                 }
             },
         }
@@ -178,12 +178,6 @@ fn select_source(
     }
 }
 
-fn exists(path: &str) -> bool {
-    let mut path_with_null = Vec::from(path.as_bytes());
-    path_with_null.push(0);
-    platform::path_exists(&path_with_null)
-}
-
 fn dir_exists(path: &str) -> bool {
     // A trailing separator makes the existing-path probe directory-specific on
     // Unix and Windows: regular files cannot be traversed as directories.
@@ -191,7 +185,7 @@ fn dir_exists(path: &str) -> bool {
     if !path.ends_with('/') && !path.ends_with(platform::SEP) {
         path_with_separator.push(platform::SEP);
     }
-    exists(&path_with_separator)
+    platform::path_exists(&path_with_separator)
 }
 
 /// The runfiles tree a manifest path names. Bazel writes the manifest as
@@ -218,12 +212,6 @@ fn manifest_dir(path: &str) -> Option<&str> {
         .strip_suffix('/')
         .or_else(|| parent.strip_suffix(platform::SEP))?;
     (!parent.is_empty()).then_some(parent)
-}
-
-fn load_manifest(path: &str) -> Option<Manifest> {
-    let mut path_with_null = Vec::from(path.as_bytes());
-    path_with_null.push(0);
-    platform::load_manifest(&path_with_null)
 }
 
 fn join_runfiles_path(dir: &str, path: &str) -> String {

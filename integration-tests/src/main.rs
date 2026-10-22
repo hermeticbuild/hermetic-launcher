@@ -1097,6 +1097,95 @@ fn test_symlinked_program_starts_target(config: &TestConfig) -> Result<(), Strin
     Ok(())
 }
 
+/// Regression test: non-ASCII text must reach Windows as UTF-16, not as bytes
+/// widened or narrowed one at a time. Everything the stub converts is non-ASCII
+/// here: its own path, the manifest path (discovered and from the
+/// environment), the program path, the exported environment, and the embedded
+/// and runtime arguments. A Latin-1 character, a non-Latin-1 character, and a
+/// character outside the BMP (a UTF-16 surrogate pair) are used, since each
+/// takes a different path through a broken conversion.
+fn test_non_ascii_paths(config: &TestConfig) -> Result<(), String> {
+    println!("  Running test: non_ascii_paths");
+
+    let test_dir = config.work_dir.join("test_non_ascii_\u{fc}\u{65e5}\u{1d11e}");
+    fs::create_dir_all(&test_dir).map_err(|e| format!("Failed to create test dir: {}", e))?;
+
+    let program = test_dir.join(format!("print-env-\u{fc}\u{65e5}\u{1d11e}{}", EXE_EXT));
+    fs::copy(config.test_binaries_dir.join(format!("print-env{}", EXE_EXT)), &program)
+        .map_err(|e| format!("Failed to copy print-env: {}", e))?;
+
+    let stub_path = test_dir.join(format!("stub_\u{fc}\u{65e5}\u{1d11e}{}", EXE_EXT));
+    let manifest_path =
+        test_dir.join(format!("stub_\u{fc}\u{65e5}\u{1d11e}{}.runfiles_manifest", EXE_EXT));
+    let rlocation = format!("{}/bin/print-env{}", WORKSPACE_NAME, EXE_EXT);
+    fs::write(&manifest_path, format!("{} {}\n", rlocation, program.display()))
+        .map_err(|e| format!("Failed to write manifest: {}", e))?;
+
+    finalize_stub(config, &stub_path, &[&rlocation, "embedded-\u{fc}\u{65e5}\u{1d11e}"], &[0])?;
+
+    // The program reports the path it was started as, which only some
+    // platforms canonicalize, so compare the files the two paths name.
+    let canonical = |path: &Path| {
+        fs::canonicalize(path).map_err(|e| format!("Failed to resolve {}: {}", path.display(), e))
+    };
+    let expected_exe = canonical(&program)?;
+
+    for from_env in [false, true] {
+        let mut cmd = Command::new(&stub_path);
+        cmd.arg("runtime-\u{fc}\u{65e5}\u{1d11e}");
+        cmd.env_remove("RUNFILES_DIR");
+        cmd.env_remove("JAVA_RUNFILES");
+        if from_env {
+            cmd.env("RUNFILES_MANIFEST_FILE", &manifest_path);
+        } else {
+            cmd.env_remove("RUNFILES_MANIFEST_FILE");
+        }
+
+        let output = cmd.output().map_err(|e| format!("Failed to run stub: {}", e))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let exit_code = output.status.code().unwrap_or(-1);
+        let source = if from_env { "environment" } else { "adjacent" };
+
+        if exit_code != 0 {
+            return Err(format!(
+                "Stub ({} manifest) failed with exit code {}.\nstdout: {}\nstderr: {}",
+                source, exit_code, stdout, stderr
+            ));
+        }
+        if !stdout.contains("|embedded-\u{fc}\u{65e5}\u{1d11e}|runtime-\u{fc}\u{65e5}\u{1d11e}\n") {
+            return Err(format!(
+                "Non-ASCII arguments were not passed intact ({} manifest).\nstdout: {}",
+                source, stdout
+            ));
+        }
+        if environment_path(&stdout, "RUNFILES_MANIFEST_FILE") != Some(manifest_path.as_path()) {
+            return Err(format!(
+                "Non-ASCII manifest path was not exported intact ({} manifest).\nexpected: {}\nstdout: {}",
+                source,
+                manifest_path.display(),
+                stdout
+            ));
+        }
+        let reported_exe =
+            stdout.lines().find_map(|line| line.strip_prefix("EXE:")).ok_or_else(|| {
+                format!("Missing EXE line ({} manifest).\nstdout: {}", source, stdout)
+            })?;
+        if canonical(Path::new(reported_exe))? != expected_exe {
+            return Err(format!(
+                "Non-ASCII program path was not started intact ({} manifest).\nexpected: {}\nstdout: {}",
+                source,
+                expected_exe.display(),
+                stdout
+            ));
+        }
+    }
+
+    println!("    PASS");
+
+    Ok(())
+}
+
 /// Test: Fallback runfiles_manifest file discovery
 fn test_fallback_runfiles_manifest(config: &TestConfig) -> Result<(), String> {
     println!("  Running test: fallback_runfiles_manifest");
@@ -1831,6 +1920,7 @@ fn main() -> ExitCode {
         ("runtime_args_quoting", test_runtime_args_quoting),
         ("fallback_runfiles_dir", test_fallback_runfiles_dir),
         ("symlinked_program_starts_target", test_symlinked_program_starts_target),
+        ("non_ascii_paths", test_non_ascii_paths),
         ("fallback_runfiles_manifest", test_fallback_runfiles_manifest),
         ("run_runfiles_discovery", test_run_runfiles_discovery),
         ("relative_manifest_symlinks", test_relative_manifest_symlinks),

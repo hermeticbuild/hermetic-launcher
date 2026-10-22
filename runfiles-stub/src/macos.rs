@@ -9,7 +9,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::common::{cstr_len, Manifest};
+use crate::common::{cstr_len, nul_terminated, Manifest};
 use crate::run::Launch;
 use crate::runfiles::Runfiles;
 
@@ -304,7 +304,8 @@ fn mmap_read(fd: i32, len: usize) -> *const u8 {
 }
 
 // Check if a path exists using access() with F_OK (0).
-pub fn path_exists(path: &[u8]) -> bool {
+pub fn path_exists(path: &str) -> bool {
+    let path = nul_terminated(path);
     unsafe { syscall2!(i32; SYS_ACCESS, path.as_ptr(), 0i32) == 0 }
 }
 
@@ -343,8 +344,8 @@ pub fn current_dir() -> Option<Vec<u8>> {
 }
 
 // Memory-map the manifest file read-only. None on open/empty/mmap failure.
-pub fn load_manifest(path: &[u8]) -> Option<Manifest> {
-    let fd = open(path);
+pub fn load_manifest(path: &str) -> Option<Manifest> {
+    let fd = open(&nul_terminated(path));
     if fd < 0 {
         return None;
     }
@@ -391,7 +392,7 @@ unsafe fn each_env(mut f: impl FnMut(&[u8])) {
 }
 
 // Environment variable lookup over the captured envp array.
-pub fn get_env_var(name: &[u8]) -> Option<String> {
+pub fn get_env_var(name: &str) -> Option<String> {
     let mut found: Option<String> = None;
     unsafe {
         each_env(|entry| {
@@ -399,7 +400,7 @@ pub fn get_env_var(name: &[u8]) -> Option<String> {
                 return;
             }
             if let Some(eq_pos) = entry.iter().position(|&b| b == b'=') {
-                if &entry[..eq_pos] == name {
+                if &entry[..eq_pos] == name.as_bytes() {
                     found = String::from_utf8(entry[eq_pos + 1..].to_vec()).ok();
                 }
             }

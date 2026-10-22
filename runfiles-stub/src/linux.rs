@@ -6,7 +6,7 @@ use alloc::vec;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::common::Manifest;
+use crate::common::{nul_terminated, Manifest};
 use crate::run::Launch;
 use crate::runfiles::Runfiles;
 
@@ -333,7 +333,8 @@ fn mmap_read(fd: i32, len: usize) -> *const u8 {
 }
 
 // Check if a path exists using access()/faccessat() with F_OK (0).
-pub fn path_exists(path: &[u8]) -> bool {
+pub fn path_exists(path: &str) -> bool {
+    let path = nul_terminated(path);
     #[cfg(target_arch = "x86_64")]
     {
         unsafe { syscall2!(i32; SYS_ACCESS, path.as_ptr(), 0i32) == 0 }
@@ -415,14 +416,14 @@ fn slurp_environ() -> Vec<u8> {
 }
 
 // Environment variable lookup by reading /proc/self/environ.
-pub fn get_env_var(name: &[u8]) -> Option<String> {
+pub fn get_env_var(name: &str) -> Option<String> {
     let environ_data = slurp_environ();
     for entry in environ_data.split(|&b| b == 0) {
         if entry.is_empty() {
             continue;
         }
         if let Some(eq_pos) = entry.iter().position(|&b| b == b'=') {
-            if &entry[..eq_pos] == name {
+            if &entry[..eq_pos] == name.as_bytes() {
                 return String::from_utf8(entry[eq_pos + 1..].to_vec()).ok();
             }
         }
@@ -431,8 +432,8 @@ pub fn get_env_var(name: &[u8]) -> Option<String> {
 }
 
 // Load the manifest by memory-mapping it read-only. None on open/empty/mmap failure.
-pub fn load_manifest(path: &[u8]) -> Option<Manifest> {
-    let fd = open(path);
+pub fn load_manifest(path: &str) -> Option<Manifest> {
+    let fd = open(&nul_terminated(path));
     if fd < 0 {
         return None;
     }

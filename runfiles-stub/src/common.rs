@@ -13,6 +13,12 @@ pub fn cstr_len(s: &[u8]) -> usize {
     s.iter().position(|&b| b == 0).unwrap_or(s.len())
 }
 
+/// `s` with a NUL appended, for system calls that take C strings.
+#[allow(dead_code)] // Windows passes UTF-16 instead
+pub fn nul_terminated(s: &str) -> Vec<u8> {
+    [s.as_bytes(), b"\0"].concat()
+}
+
 /// Make `path` absolute without resolving symlinks. An already-absolute path is
 /// returned unchanged; a relative one is joined onto the current working
 /// directory. Best-effort: if the cwd is unavailable, the path is returned as-is.

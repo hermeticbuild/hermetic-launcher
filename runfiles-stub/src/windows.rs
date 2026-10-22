@@ -1,10 +1,12 @@
 // Windows backend: kernel32 (Win32) primitives, a `main` entry that parses the
 // command line, and a CreateProcessW-based launch (spawn + wait + propagate exit code).
-// Runtime args stay UTF-16; embedded args are widened from UTF-8.
+// Runtime args stay UTF-16; text from the shared code is converted from UTF-8
+// at each Win32 call.
 
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::cmp::Ordering;
 
 use crate::common::Manifest;
 use crate::run::Launch;
@@ -15,8 +17,6 @@ type DWORD = u32;
 type BOOL = i32;
 type HANDLE = *mut core::ffi::c_void;
 type LPVOID = *mut core::ffi::c_void;
-type LPCSTR = *const u8;
-type LPSTR = *mut u8;
 
 const INVALID_HANDLE_VALUE: HANDLE = -1isize as HANDLE;
 const STD_OUTPUT_HANDLE: DWORD = 0xFFFFFFF5u32;
@@ -79,23 +79,14 @@ extern "system" {
         lpNumberOfBytesWritten: *mut DWORD,
         lpOverlapped: LPVOID,
     ) -> BOOL;
-    fn CreateFileA(
-        lpFileName: LPCSTR,
-        dwDesiredAccess: DWORD,
-        dwShareMode: DWORD,
-        lpSecurityAttributes: LPVOID,
-        dwCreationDisposition: DWORD,
-        dwFlagsAndAttributes: DWORD,
-        hTemplateFile: HANDLE,
-    ) -> HANDLE;
     fn GetFileSizeEx(hFile: HANDLE, lpFileSize: *mut i64) -> BOOL;
-    fn CreateFileMappingA(
+    fn CreateFileMappingW(
         hFile: HANDLE,
         lpFileMappingAttributes: LPVOID,
         flProtect: DWORD,
         dwMaximumSizeHigh: DWORD,
         dwMaximumSizeLow: DWORD,
-        lpName: LPCSTR,
+        lpName: *const u16,
     ) -> HANDLE;
     fn MapViewOfFile(
         hFileMappingObject: HANDLE,
@@ -105,7 +96,7 @@ extern "system" {
         dwNumberOfBytesToMap: usize,
     ) -> LPVOID;
     fn CloseHandle(hObject: HANDLE) -> BOOL;
-    fn GetEnvironmentVariableA(lpName: LPCSTR, lpBuffer: LPSTR, nSize: DWORD) -> DWORD;
+    fn GetEnvironmentVariableW(lpName: *const u16, lpBuffer: *mut u16, nSize: DWORD) -> DWORD;
     fn CreateProcessW(
         lpApplicationName: *const u16,
         lpCommandLine: *mut u16,
@@ -168,6 +159,37 @@ pub fn to_native_path(s: &str) -> String {
     s.replace('/', "\\")
 }
 
+// --- UTF-16 ---
+// The W APIs take UTF-16, while the shared code holds UTF-8 text.
+
+// ASCII command-line and path syntax, as UTF-16 units.
+const SPACE: u16 = b' ' as u16;
+const TAB: u16 = b'\t' as u16;
+const QUOTE: u16 = b'"' as u16;
+const BACKSLASH: u16 = b'\\' as u16;
+const EQUALS: u16 = b'=' as u16;
+
+// `s` as NUL-terminated UTF-16. No UTF-8 byte encodes more than one UTF-16
+// unit, so `s.len() + 1` units always suffice.
+fn to_wide(s: &str) -> Vec<u16> {
+    let mut wide = Vec::with_capacity(s.len() + 1);
+    wide.extend(s.encode_utf16());
+    wide.push(0);
+    wide
+}
+
+// UTF-16 from Windows as UTF-8. None if it holds an unpaired surrogate, which
+// UTF-8 cannot represent.
+fn from_wide(wide: &[u16]) -> Option<String> {
+    char::decode_utf16(wide.iter().copied()).collect::<Result<_, _>>().ok()
+}
+
+// The text of a byte string from the shared code, without its trailing NUL.
+// None if it is not UTF-8, as only text converts to UTF-16.
+fn utf8(s: &[u8]) -> Option<&str> {
+    core::str::from_utf8(s.strip_suffix(&[0]).unwrap_or(s)).ok()
+}
+
 // --- primitives ---
 pub fn print(s: &[u8]) {
     unsafe {
@@ -182,13 +204,14 @@ pub fn exit(code: i32) -> ! {
 }
 
 // Directory/file existence check by trying to open it (needs backup semantics for dirs).
-pub fn path_exists(path: &[u8]) -> bool {
+pub fn path_exists(path: &str) -> bool {
     const FILE_FLAG_BACKUP_SEMANTICS: DWORD = 0x02000000;
-    unsafe {
-        // Request no access and allow ordinary sharing: an existence probe
-        // should not fail merely because another process has the path open.
-        // https://learn.microsoft.com/windows/win32/api/fileapi/nf-fileapi-createfilea
-        let handle = CreateFileA(
+    let path = to_wide(path);
+    // Request no access and allow ordinary sharing: an existence probe
+    // should not fail merely because another process has the path open.
+    // https://learn.microsoft.com/windows/win32/api/fileapi/nf-fileapi-createfilew
+    let handle = unsafe {
+        CreateFileW(
             path.as_ptr(),
             0,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -196,21 +219,20 @@ pub fn path_exists(path: &[u8]) -> bool {
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS,
             core::ptr::null_mut(),
-        );
-        if handle != INVALID_HANDLE_VALUE {
-            CloseHandle(handle);
-            true
-        } else {
-            false
-        }
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return false;
     }
+    unsafe { CloseHandle(handle) };
+    true
 }
 
 // Path used to launch this process, via QueryFullProcessImageNameW (the
 // documented API for a process's own image path). With dwFlags = 0 it returns a
-// fully-qualified Win32 path, i.e. already absolute. UTF-16 is narrowed to bytes
-// the same way argv is elsewhere in this backend. None on failure.
-fn launch_path() -> Option<Vec<u8>> {
+// fully-qualified Win32 path, i.e. already absolute. None on failure or if the
+// path is not valid UTF-16.
+fn launch_path() -> Option<String> {
     let mut wide = vec![0u16; 4096];
     let mut size: DWORD = wide.len() as DWORD;
     let ok = unsafe {
@@ -220,7 +242,7 @@ fn launch_path() -> Option<Vec<u8>> {
         return None;
     }
     // `size` is the number of characters written, excluding the NUL terminator.
-    Some(wide[..size as usize].iter().map(|&w| (w & 0xFF) as u8).collect())
+    from_wide(&wide[..size as usize])
 }
 
 // QueryFullProcessImageNameW already yields an absolute path, so the cwd is
@@ -230,34 +252,30 @@ pub fn current_dir() -> Option<Vec<u8>> {
     None
 }
 
-// Environment variable lookup (two-call GetEnvironmentVariableA pattern).
-pub fn get_env_var(name: &[u8]) -> Option<String> {
-    unsafe {
-        let mut name_with_null = name.to_vec();
-        name_with_null.push(0);
-
-        let size = GetEnvironmentVariableA(name_with_null.as_ptr(), core::ptr::null_mut(), 0);
-        if size == 0 {
-            return None;
-        }
-        let mut buf = vec![0u8; size as usize];
-        let actual_size =
-            GetEnvironmentVariableA(name_with_null.as_ptr(), buf.as_mut_ptr(), buf.len() as DWORD);
-        if actual_size > 0 && actual_size < buf.len() as DWORD {
-            buf.truncate(actual_size as usize);
-            String::from_utf8(buf).ok()
-        } else {
-            None
-        }
+// Environment variable lookup (two-call GetEnvironmentVariableW pattern).
+pub fn get_env_var(name: &str) -> Option<String> {
+    let name = to_wide(name);
+    let size = unsafe { GetEnvironmentVariableW(name.as_ptr(), core::ptr::null_mut(), 0) };
+    if size == 0 {
+        return None;
+    }
+    let mut buf = vec![0u16; size as usize];
+    let actual_size =
+        unsafe { GetEnvironmentVariableW(name.as_ptr(), buf.as_mut_ptr(), buf.len() as DWORD) };
+    if actual_size > 0 && actual_size < buf.len() as DWORD {
+        from_wide(&buf[..actual_size as usize])
+    } else {
+        None
     }
 }
 
-// Memory-map the manifest read-only. `path` is NUL-terminated by the caller.
-pub fn load_manifest(path: &[u8]) -> Option<Manifest> {
-    unsafe {
-        // FILE_SHARE_READ lets the child process (which inherits
-        // RUNFILES_MANIFEST_FILE) open the same manifest for reading.
-        let file = CreateFileA(
+// Memory-map the manifest read-only.
+pub fn load_manifest(path: &str) -> Option<Manifest> {
+    let path = to_wide(path);
+    // FILE_SHARE_READ lets the child process (which inherits
+    // RUNFILES_MANIFEST_FILE) open the same manifest for reading.
+    let file = unsafe {
+        CreateFileW(
             path.as_ptr(),
             GENERIC_READ,
             FILE_SHARE_READ,
@@ -265,43 +283,41 @@ pub fn load_manifest(path: &[u8]) -> Option<Manifest> {
             OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL,
             core::ptr::null_mut(),
-        );
-        if file == INVALID_HANDLE_VALUE {
-            return None;
-        }
+        )
+    };
+    if file == INVALID_HANDLE_VALUE {
+        return None;
+    }
 
-        let mut size: i64 = 0;
-        if GetFileSizeEx(file, &mut size) == 0 || size <= 0 {
-            CloseHandle(file);
-            return None;
-        }
-        let len = size as usize;
+    let mut size: i64 = 0;
+    if unsafe { GetFileSizeEx(file, &mut size) } == 0 || size <= 0 {
+        unsafe { CloseHandle(file) };
+        return None;
+    }
+    let len = size as usize;
 
-        // CreateFileMappingA returns NULL (not INVALID_HANDLE_VALUE) on failure.
-        let mapping = CreateFileMappingA(
-            file,
-            core::ptr::null_mut(),
-            PAGE_READONLY,
-            0,
-            0,
-            core::ptr::null(),
-        );
-        if mapping.is_null() {
-            CloseHandle(file);
-            return None;
-        }
+    // CreateFileMappingW returns NULL (not INVALID_HANDLE_VALUE) on failure.
+    let mapping = unsafe {
+        CreateFileMappingW(file, core::ptr::null_mut(), PAGE_READONLY, 0, 0, core::ptr::null())
+    };
+    if mapping.is_null() {
+        unsafe { CloseHandle(file) };
+        return None;
+    }
 
+    // The view keeps its own reference to the section; both handles can be closed.
+    let view = unsafe {
         let view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
-        // The view keeps its own reference to the section; both handles can be closed.
         CloseHandle(mapping);
         CloseHandle(file);
-        if view.is_null() {
-            return None;
-        }
-
-        // Leak the view: ExitProcess reclaims it.
-        Some(Manifest::from_mapping(view as *const u8, len))
+        view
+    };
+    if view.is_null() {
+        return None;
     }
+
+    // Leak the view: ExitProcess reclaims it.
+    Some(unsafe { Manifest::from_mapping(view as *const u8, len) })
 }
 
 // Build the UTF-16 environment block (sorted, double-NUL terminated) with the runfiles
@@ -311,143 +327,78 @@ pub fn load_manifest(path: &[u8]) -> Option<Manifest> {
 // sorted-insertion ordering. Windows requires the block sorted alphabetically by name;
 // GetEnvironmentStringsW() already returns it sorted, so we insert our vars in place.
 fn build_runfiles_environ(runfiles: Option<&Runfiles>) -> Vec<u16> {
-    let mut buf: Vec<u16> = Vec::with_capacity(8192);
+    let dir = runfiles.and_then(Runfiles::dir_path);
+    let manifest = runfiles.and_then(Runfiles::manifest_path);
+    // In sorted order. Inherited values of these are removed; a var without a
+    // value for this launch is not exported at all.
+    let vars =
+        [("JAVA_RUNFILES", dir), ("RUNFILES_DIR", dir), ("RUNFILES_MANIFEST_FILE", manifest)];
+    let mut to_insert = vars.iter().peekable();
 
-    // Append "KEY=VALUE\0", widening bytes to UTF-16.
-    let push_var = |buf: &mut Vec<u16>, key: &[u8], value: &str| {
-        for &b in key {
-            buf.push(b as u16);
+    let mut buf: Vec<u16> = Vec::with_capacity(8192);
+    // Append "NAME=VALUE\0" for a var that has a value.
+    let push_var = |buf: &mut Vec<u16>, &(name, value): &(&str, Option<&str>)| {
+        if let Some(value) = value {
+            buf.extend(name.encode_utf16());
+            buf.push(EQUALS);
+            buf.extend(value.encode_utf16());
+            buf.push(0);
         }
-        buf.push(b'=' as u16);
-        for &b in value.as_bytes() {
-            buf.push(b as u16);
-        }
-        buf.push(0);
     };
 
-    unsafe {
-        let env_block = GetEnvironmentStringsW();
-        if env_block.is_null() {
-            // No parent environment: add runfiles vars in sorted order.
-            if let Some(rf) = runfiles {
-                if let Some(path) = rf.dir_path() {
-                    push_var(&mut buf, b"JAVA_RUNFILES", path);
-                    push_var(&mut buf, b"RUNFILES_DIR", path);
-                }
-                if let Some(path) = rf.manifest_path() {
-                    push_var(&mut buf, b"RUNFILES_MANIFEST_FILE", path);
-                }
-            }
-        } else {
-            let mut pos = 0;
-            let mut java_inserted = false;
-            let mut dir_inserted = false;
-            let mut manifest_inserted = false;
-
-            loop {
-                let entry_start = pos;
-                while *env_block.add(pos) != 0 {
-                    pos += 1;
-                }
-                let entry_len = pos - entry_start;
-                if entry_len == 0 {
-                    break;
-                }
-                let entry_ptr = env_block.add(entry_start);
-
-                // Remove inherited runfiles variables before optionally inserting
-                // the values selected for this launch.
-                let ascii_upper = |unit: u16| {
-                    if (b'a' as u16..=b'z' as u16).contains(&unit) {
-                        unit - 32
-                    } else {
-                        unit
-                    }
-                };
-                let prefixed_case_insensitive = |needle: &[u8]| -> bool {
-                    entry_len >= needle.len()
-                        && (0..needle.len()).all(|i| {
-                            ascii_upper(*entry_ptr.add(i)) == ascii_upper(needle[i] as u16)
-                        })
-                };
-                let should_skip = prefixed_case_insensitive(b"RUNFILES_MANIFEST_FILE=")
-                    || prefixed_case_insensitive(b"RUNFILES_DIR=")
-                    || prefixed_case_insensitive(b"JAVA_RUNFILES=");
-
-                if !should_skip {
-                    // Case-insensitive "does this entry sort after `target`?"
-                    let var_comes_after = |target: &[u8]| -> bool {
-                        for i in 0..target.len().min(entry_len) {
-                            let e = ascii_upper(*entry_ptr.add(i));
-                            let t = ascii_upper(target[i] as u16);
-                            if e != t {
-                                return e > t;
-                            }
-                        }
-                        entry_len > target.len()
-                    };
-
-                    if !java_inserted && var_comes_after(b"JAVA_RUNFILES") {
-                        if let Some(rf) = runfiles {
-                            if let Some(path) = rf.dir_path() {
-                                push_var(&mut buf, b"JAVA_RUNFILES", path);
-                            }
-                        }
-                        java_inserted = true;
-                    }
-                    if !dir_inserted && var_comes_after(b"RUNFILES_DIR") {
-                        if let Some(rf) = runfiles {
-                            if let Some(path) = rf.dir_path() {
-                                push_var(&mut buf, b"RUNFILES_DIR", path);
-                            }
-                        }
-                        dir_inserted = true;
-                    }
-                    if !manifest_inserted && var_comes_after(b"RUNFILES_MANIFEST_FILE") {
-                        if let Some(rf) = runfiles {
-                            if let Some(path) = rf.manifest_path() {
-                                push_var(&mut buf, b"RUNFILES_MANIFEST_FILE", path);
-                            }
-                        }
-                        manifest_inserted = true;
-                    }
-
-                    // Copy this environment variable.
-                    for i in 0..entry_len {
-                        buf.push(*entry_ptr.add(i));
-                    }
-                    buf.push(0);
-                }
-
-                pos += 1;
-            }
-
-            // Append any runfiles vars that sort after every existing entry.
-            if let Some(rf) = runfiles {
-                if !java_inserted {
-                    if let Some(path) = rf.dir_path() {
-                        push_var(&mut buf, b"JAVA_RUNFILES", path);
-                    }
-                }
-                if !dir_inserted {
-                    if let Some(path) = rf.dir_path() {
-                        push_var(&mut buf, b"RUNFILES_DIR", path);
-                    }
-                }
-                if !manifest_inserted {
-                    if let Some(path) = rf.manifest_path() {
-                        push_var(&mut buf, b"RUNFILES_MANIFEST_FILE", path);
-                    }
-                }
-            }
-
-            FreeEnvironmentStringsW(env_block);
+    let inherited = inherited_environment();
+    for entry in inherited.split(|&c| c == 0).filter(|entry| !entry.is_empty()) {
+        // The name ends at the first `=` after its first character, since
+        // hidden per-drive variables such as `=C:` start with one.
+        let name_len = entry[1..].iter().position(|&c| c == EQUALS).map_or(entry.len(), |i| i + 1);
+        let name = &entry[..name_len];
+        if vars.iter().any(|&(var, _)| cmp_env_name(name, var).is_eq()) {
+            continue;
         }
+        while let Some(var) = to_insert.next_if(|&&(var, _)| cmp_env_name(name, var).is_gt()) {
+            push_var(&mut buf, var);
+        }
+        buf.extend_from_slice(entry);
+        buf.push(0);
+    }
+    // Append any runfiles vars that sort after every existing entry.
+    for var in to_insert {
+        push_var(&mut buf, var);
     }
 
     // Final NUL: with the last entry's NUL this forms the double-NUL block terminator.
     buf.push(0);
     buf
+}
+
+// A copy of this process's environment block: `NAME=VALUE` entries, each
+// followed by a NUL. Empty if the environment is unavailable.
+fn inherited_environment() -> Vec<u16> {
+    // A pointer to a snapshot of the environment that we must free, laid out as
+    // `NAME=VALUE\0NAME=VALUE\0...\0`: each entry ends with a NUL, and one more
+    // NUL ends the block. NULL on failure.
+    let block = unsafe { GetEnvironmentStringsW() };
+    if block.is_null() {
+        return Vec::new();
+    }
+    // Skip entry by entry until an empty one, which ends the block.
+    let mut len = 0;
+    while unsafe { *block.add(len) } != 0 {
+        while unsafe { *block.add(len) } != 0 {
+            len += 1;
+        }
+        len += 1; // the entry's NUL
+    }
+    let copy = unsafe { core::slice::from_raw_parts(block, len) }.to_vec();
+    unsafe { FreeEnvironmentStringsW(block) };
+    copy
+}
+
+// Order an environment variable name against an ASCII `var` as Windows sorts
+// the environment block: by code unit, ignoring case.
+fn cmp_env_name(name: &[u16], var: &str) -> Ordering {
+    let upper = |c: u16| u8::try_from(c).map_or(c, |b| b.to_ascii_uppercase().into());
+    name.iter().map(|&c| upper(c)).cmp(var.encode_utf16().map(upper))
 }
 
 // Parse a Windows command line into runtime arguments (excluding argv[0]).
@@ -466,11 +417,6 @@ fn parse_command_line(
     storage: &mut Vec<u16>,
     ranges: &mut [(usize, usize); 128],
 ) -> usize {
-    const SPACE: u16 = b' ' as u16;
-    const TAB: u16 = b'\t' as u16;
-    const QUOTE: u16 = b'"' as u16;
-    const BACKSLASH: u16 = b'\\' as u16;
-
     unsafe {
         let mut pos = 0usize;
         let mut argc = 0usize;
@@ -574,7 +520,7 @@ impl RuntimeArgs {
     /// Absolute path of the launching executable (QueryFullProcessImageNameW),
     /// for runfiles self-location. Independent of the command-line argv[0].
     pub fn executable_path(&self) -> Option<Vec<u8>> {
-        launch_path().map(crate::common::absolutize)
+        launch_path().map(|path| crate::common::absolutize(path.into_bytes()))
     }
 }
 
@@ -587,26 +533,25 @@ impl RuntimeArgs {
 //     (including the closing quote we add), and escape embedded double quotes.
 // Without this, embedded `"` characters and trailing `\` (common in Windows paths
 // like `C:\dir\`) corrupt or merge arguments.
-fn append_arg(cmdline: &mut Vec<u16>, arg: &[u16], force_quotes: bool) {
+fn append_arg(cmdline: &mut Vec<u16>, arg: impl Iterator<Item = u16> + Clone, force_quotes: bool) {
     // Quote when the argument would otherwise re-split or vanish: any space or tab
     // (parse_command_line and the CRT both split on both), or an empty argument
     // (which would disappear entirely without surrounding quotes).
-    let quote = force_quotes
-        || arg.is_empty()
-        || arg.iter().any(|&c| c == b' ' as u16 || c == b'\t' as u16);
+    let quote =
+        force_quotes || arg.clone().next().is_none() || arg.clone().any(|c| c == SPACE || c == TAB);
     if quote {
-        cmdline.push(b'"' as u16);
+        cmdline.push(QUOTE);
     }
     let mut backslashes: usize = 0;
-    for &c in arg {
-        if c == b'\\' as u16 {
+    for c in arg {
+        if c == BACKSLASH {
             backslashes += 1;
         } else {
-            if c == b'"' as u16 {
+            if c == QUOTE {
                 // Emit 2*backslashes+1 backslashes (the run was already pushed below
                 // on prior iterations; push backslashes+1 more) to escape the quote.
                 for _ in 0..=backslashes {
-                    cmdline.push(b'\\' as u16);
+                    cmdline.push(BACKSLASH);
                 }
             }
             backslashes = 0;
@@ -616,31 +561,21 @@ fn append_arg(cmdline: &mut Vec<u16>, arg: &[u16], force_quotes: bool) {
     if quote {
         // Double any trailing backslashes so they don't escape the closing quote.
         for _ in 0..backslashes {
-            cmdline.push(b'\\' as u16);
+            cmdline.push(BACKSLASH);
         }
-        cmdline.push(b'"' as u16);
+        cmdline.push(QUOTE);
     }
 }
 
-// Widen a byte string, dropping a trailing NUL.
-// TODO: Decode UTF-8 here instead of widening each byte, which garbles
-// non-ASCII paths and arguments. Paths read from Windows are narrowed by
-// keeping each UTF-16 unit's low byte, and the environment block is widened
-// the same way, so all three need to change together.
-fn widen(arg: &[u8]) -> Vec<u16> {
-    let bytes = if arg.last() == Some(&0) { &arg[..arg.len() - 1] } else { arg };
-    bytes.iter().map(|&b| b as u16).collect()
-}
-
-// The NUL-terminated UTF-16 path of the file that the UTF-16 `path` names,
-// through any symlinks. None if `path` names no file.
-fn final_path(path: &[u16]) -> Option<Vec<u16>> {
+// The NUL-terminated UTF-16 path of the file that `path` names, through any
+// symlinks. None if `path` names no file.
+fn final_path(path: &str) -> Option<Vec<u16>> {
     const CAPACITY: DWORD = 4096;
-    let mut terminated = path.to_vec();
-    terminated.push(0);
+    const VERBATIM_PREFIX: [u16; 4] = [BACKSLASH, BACKSLASH, b'?' as u16, BACKSLASH];
+    let path = to_wide(path);
     let handle = unsafe {
         CreateFileW(
-            terminated.as_ptr(),
+            path.as_ptr(),
             0,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             core::ptr::null_mut(),
@@ -663,12 +598,11 @@ fn final_path(path: &[u16]) -> Option<Vec<u16>> {
     wide.truncate(size as usize);
     // Drop the `\\?\` prefix from a drive path short enough not to need it,
     // so the program sees the path it would have been started by.
-    let prefix: Vec<u16> = br"\\?\".iter().map(|&b| u16::from(b)).collect();
-    let start = if wide.starts_with(&prefix)
-        && wide.get(prefix.len() + 1) == Some(&u16::from(b':'))
-        && wide.len() - prefix.len() < MAX_PATH
+    let start = if wide.starts_with(&VERBATIM_PREFIX)
+        && wide.get(VERBATIM_PREFIX.len() + 1) == Some(&u16::from(b':'))
+        && wide.len() - VERBATIM_PREFIX.len() < MAX_PATH
     {
-        prefix.len()
+        VERBATIM_PREFIX.len()
     } else {
         0
     };
@@ -678,83 +612,76 @@ fn final_path(path: &[u16]) -> Option<Vec<u16>> {
 }
 
 pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
-    unsafe {
-        let argc = launch.resolved.len();
-
-        // As on Unix, the program sees its runfiles path as argv[0] while the
-        // resolved path selects the image, so programs that locate files from
-        // argv[0] (such as Python finding a venv's pyvenv.cfg) find them in the
-        // runfiles tree. Windows rarely materializes that tree, so the
-        // runfiles path is used only where it exists; otherwise argv[0] stays
-        // the resolved path, a path that works.
-        let argv0_override = launch.argv0_override.filter(|path| path_exists(path));
-
-        // Windows looks for a program's DLLs beside the path it was started by,
-        // so a program started through a runfiles symlink, such as a Python
-        // venv's python.exe, can't find its DLLs. Start the file the symlink
-        // points to, as Unix's execve does.
-        let resolved0: &[u8] = &launch.resolved[0];
-        let resolved0 = resolved0.strip_suffix(&[0]).unwrap_or(resolved0);
-        let mut program = widen(resolved0);
-        let final_program = if core::str::from_utf8(resolved0).is_ok_and(is_absolute) {
-            final_path(&program)
-        } else {
-            None
-        };
-        let application_name = final_program.or_else(|| {
-            argv0_override.map(|_| {
-                program.push(0);
-                program
+    // Windows takes arguments as UTF-16, so they must be text.
+    let args: Vec<&str> = launch
+        .resolved
+        .iter()
+        .enumerate()
+        .map(|(i, arg)| {
+            utf8(arg).unwrap_or_else(|| {
+                print(b"ERROR: Argument ");
+                print(&[b'0' + i as u8]);
+                print(b" is not valid UTF-8\r\n");
+                exit(1)
             })
-        });
+        })
+        .collect();
 
-        // Build the UTF-16 command line: embedded args (widened) + runtime args (native).
-        let mut cmdline_wide: Vec<u16> = Vec::with_capacity(8192);
+    // As on Unix, the program sees its runfiles path as argv[0] while the
+    // resolved path selects the image, so programs that locate files from
+    // argv[0] (such as Python finding a venv's pyvenv.cfg) find them in the
+    // runfiles tree. Windows rarely materializes that tree, so the
+    // runfiles path is used only where it exists; otherwise argv[0] stays
+    // the resolved path, a path that works.
+    let argv0_override = launch.argv0_override.and_then(utf8).filter(|path| path_exists(path));
 
-        for (i, arg) in launch.resolved.iter().enumerate() {
-            // Embedded args are NUL-terminated; widen without the trailing NUL.
-            let wide = match argv0_override {
-                Some(override0) if i == 0 => widen(override0),
-                _ => widen(arg),
-            };
+    // Windows looks for a program's DLLs beside the path it was started by,
+    // so a program started through a runfiles symlink, such as a Python
+    // venv's python.exe, can't find its DLLs. Start the file the symlink
+    // points to, as Unix's execve does.
+    let program = args[0];
+    let final_program = if is_absolute(program) { final_path(program) } else { None };
+    let application_name = final_program.or_else(|| argv0_override.map(|_| to_wide(program)));
 
-            // Quote arg0 always (Bazel launcher.cc convention); others as needed.
-            append_arg(&mut cmdline_wide, &wide, i == 0);
-            if i < argc - 1 || rt.runtime_count > 0 {
-                cmdline_wide.push(b' ' as u16);
-            }
-        }
+    // Build the UTF-16 command line: embedded args (encoded) + runtime args (native).
+    let mut cmdline_wide: Vec<u16> = Vec::with_capacity(8192);
 
-        for i in 0..rt.runtime_count {
-            let arg = core::slice::from_raw_parts(rt.runtime_argv[i], rt.runtime_argv_len[i]);
-            append_arg(&mut cmdline_wide, arg, false);
-            if i < rt.runtime_count - 1 {
-                cmdline_wide.push(b' ' as u16);
-            }
-        }
+    // Quote arg0 always (Bazel launcher.cc convention); others as needed.
+    append_arg(&mut cmdline_wide, argv0_override.unwrap_or(program).encode_utf16(), true);
+    for arg in &args[1..] {
+        cmdline_wide.push(SPACE);
+        append_arg(&mut cmdline_wide, arg.encode_utf16(), false);
+    }
+    for i in 0..rt.runtime_count {
+        let arg =
+            unsafe { core::slice::from_raw_parts(rt.runtime_argv[i], rt.runtime_argv_len[i]) };
+        cmdline_wide.push(SPACE);
+        append_arg(&mut cmdline_wide, arg.iter().copied(), false);
+    }
 
-        cmdline_wide.push(0);
+    cmdline_wide.push(0);
 
-        // Build the environment with runfiles vars if export is enabled.
-        // `env_storage` keeps the block alive while CreateProcessW reads it.
-        let env_storage: Vec<u16>;
-        let envp = if launch.export_env {
-            env_storage = build_runfiles_environ(launch.runfiles);
-            env_storage.as_ptr() as *mut core::ffi::c_void
-        } else {
-            core::ptr::null_mut()
-        };
-        let creation_flags = if launch.export_env { CREATE_UNICODE_ENVIRONMENT } else { 0 };
+    // Build the environment with runfiles vars if export is enabled.
+    // `env_storage` keeps the block alive while CreateProcessW reads it.
+    let env_storage: Vec<u16>;
+    let envp = if launch.export_env {
+        env_storage = build_runfiles_environ(launch.runfiles);
+        env_storage.as_ptr() as *mut core::ffi::c_void
+    } else {
+        core::ptr::null_mut()
+    };
+    let creation_flags = if launch.export_env { CREATE_UNICODE_ENVIRONMENT } else { 0 };
 
-        let mut si: STARTUPINFOW = core::mem::zeroed();
-        si.cb = core::mem::size_of::<STARTUPINFOW>() as DWORD;
-        let mut pi: PROCESS_INFORMATION = core::mem::zeroed();
+    let mut si: STARTUPINFOW = unsafe { core::mem::zeroed() };
+    si.cb = core::mem::size_of::<STARTUPINFOW>() as DWORD;
+    let mut pi: PROCESS_INFORMATION = unsafe { core::mem::zeroed() };
 
-        // Without an application name, a NULL lpApplicationName + quoted
-        // executable in the command line (Bazel approach), which keeps
-        // CreateProcessW's search for the executable and its default `.exe`
-        // extension.
-        let success = CreateProcessW(
+    // Without an application name, a NULL lpApplicationName + quoted
+    // executable in the command line (Bazel approach), which keeps
+    // CreateProcessW's search for the executable and its default `.exe`
+    // extension.
+    let success = unsafe {
+        CreateProcessW(
             application_name.as_ref().map_or(core::ptr::null(), |name| name.as_ptr()),
             cmdline_wide.as_mut_ptr(),
             core::ptr::null_mut(),
@@ -765,18 +692,20 @@ pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
             core::ptr::null(),
             &mut si,
             &mut pi,
-        );
-        if success == 0 {
-            print(b"ERROR: CreateProcess failed\r\n");
-            ExitProcess(1);
-        }
+        )
+    };
+    if success == 0 {
+        print(b"ERROR: CreateProcess failed\r\n");
+        exit(1);
+    }
 
+    unsafe {
         WaitForSingleObject(pi.hProcess, INFINITE);
         let mut exit_code: DWORD = 0;
         GetExitCodeProcess(pi.hProcess, &mut exit_code);
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
-        ExitProcess(exit_code);
+        ExitProcess(exit_code)
     }
 }
 
