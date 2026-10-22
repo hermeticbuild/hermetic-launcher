@@ -84,6 +84,15 @@ fn environment_path<'a>(stdout: &'a str, name: &str) -> Option<&'a Path> {
         .map(Path::new)
 }
 
+/// Create a symlink to a file at `link`.
+fn symlink_file(target: &Path, link: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    let linked = std::os::windows::fs::symlink_file(target, link);
+    linked.map_err(|e| format!("Failed to create symlink: {}", e))
+}
+
 impl TestConfig {
     fn from_args() -> Result<Self, String> {
         let args: Vec<String> = env::args().collect();
@@ -1057,11 +1066,7 @@ fn test_symlinked_program_starts_target(config: &TestConfig) -> Result<(), Strin
     fs::create_dir_all(link.parent().unwrap())
         .map_err(|e| format!("Failed to create link dir: {}", e))?;
     let target = config.test_binaries_dir.join(format!("print-env{}", EXE_EXT));
-    #[cfg(unix)]
-    let linked = std::os::unix::fs::symlink(&target, &link);
-    #[cfg(windows)]
-    let linked = std::os::windows::fs::symlink_file(&target, &link);
-    linked.map_err(|e| format!("Failed to create symlink: {}", e))?;
+    symlink_file(&target, &link)?;
 
     let stub_path = test_dir.join(format!("symlink_stub{}", EXE_EXT));
     finalize_stub(config, &stub_path, &[&print_env_rlocation], &[0])?;
@@ -1119,11 +1124,7 @@ fn test_symlinked_stub_finds_runfiles(config: &TestConfig) -> Result<(), String>
         .map_err(|e| format!("Failed to write manifest: {}", e))?;
 
     finalize_stub(config, &stub_path, &[&rlocation], &[0])?;
-    #[cfg(unix)]
-    let linked = std::os::unix::fs::symlink(&stub_path, &link);
-    #[cfg(windows)]
-    let linked = std::os::windows::fs::symlink_file(&stub_path, &link);
-    linked.map_err(|e| format!("Failed to create symlink: {}", e))?;
+    symlink_file(&stub_path, &link)?;
 
     let mut cmd = Command::new(&link);
     cmd.env_remove("RUNFILES_DIR");
