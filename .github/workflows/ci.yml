@@ -68,6 +68,22 @@ jobs:
           EOF
             echo "common --config=remote" >> ~/.bazelrc
           fi
+      # Older bases pin an llvm whose default macOS SDK snapshot (web.archive.org) no
+      # longer matches its checksum. Pin the same SDK as MODULE.bazel does so the base
+      # still builds. Not needed (and skipped) once the base pins its own.
+      - name: Pin macOS SDK for base build
+        run: |
+          grep -q 'osx.from_archive' MODULE.bazel && exit 0
+          cat >> MODULE.bazel << 'EOF'
+
+          osx_base_pin = use_extension("@llvm//extensions:osx.bzl", "osx", dev_dependency = True)
+          osx_base_pin.from_archive(
+              sha256 = "5f044578cd78a3a9b9c965a42d56bad609ee5d252e1d4e6aa7c42fc3f35fee7b",
+              strip_prefix = "Payload/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk",
+              type = "pkg",
+              urls = ["https://swcdn.apple.com/content/downloads/09/08/047-91568-A_Y1CFZWQCD4/4xekpyz43i26dbp4enxfro8eb1q7wiujh5/CLTools_macOSNMOS_SDK.pkg"],
+          )
+          EOF
       - name: Build base binaries
         run: bash tools/build-release-binaries.sh /tmp/artifacts-base
       - name: Record base sizes

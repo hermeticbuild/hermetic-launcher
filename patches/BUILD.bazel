@@ -1,5 +1,6 @@
 exports_files([
-    "rules-rust-skip-unused-cc-runtime.patch",
+    "llvm-avoid-sdk-case-overlays-on-windows-hosts.patch",
     "rules-rs-windows-rust-linker.patch",
+    "rules-rust-windows-gnu-cc-linker.patch",
     "xz-s390x-support.patch",
 ])

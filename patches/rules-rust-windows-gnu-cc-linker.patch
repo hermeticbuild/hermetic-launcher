@@ -1,0 +1,20 @@
+--- a/rust/private/rustc.bzl
++++ b/rust/private/rustc.bzl
+@@ -457,7 +457,16 @@
+         )
+ 
+     use_bpf_linker = toolchain.target_arch in ("bpfeb", "bpfel") and toolchain.linker
+-    use_rust_linker = not cc_linker or toolchain.linker_preference == "rust" or use_bpf_linker
++    prefer_rust_linker = toolchain.linker_preference == "rust"
++    if (
++        cc_toolchain and
++        toolchain.target_os == "windows" and
++        toolchain.target_abi in ("gnu", "gnullvm")
++    ):
++        # Windows GNU targets need the C/C++ linker driver for MinGW CRT startup objects.
++        prefer_rust_linker = False
++
++    use_rust_linker = not cc_linker or prefer_rust_linker or use_bpf_linker
+     if use_rust_linker and not toolchain.linker:
+         fail("No linker available for rustc. Either `rust_toolchain.linker` must be set or a `cc_toolchain` configured for the current configuration.")
+ 
