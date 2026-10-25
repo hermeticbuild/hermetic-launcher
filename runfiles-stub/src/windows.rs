@@ -130,6 +130,12 @@ extern "system" {
         cchFilePath: DWORD,
         dwFlags: DWORD,
     ) -> DWORD;
+    fn GetFullPathNameW(
+        lpFileName: *const u16,
+        nBufferLength: DWORD,
+        lpBuffer: *mut u16,
+        lpFilePart: *mut *mut u16,
+    ) -> DWORD;
 }
 
 // --- path semantics ---
@@ -172,6 +178,45 @@ fn to_wide(s: &str) -> Vec<u16> {
     wide
 }
 
+const VERBATIM_PREFIX: [u16; 4] = [BACKSLASH, BACKSLASH, b'?' as u16, BACKSLASH];
+
+// `path` as a NUL-terminated UTF-16 path that the file APIs accept at any
+// length. Without a long-path manifest, which the stub doesn't have, they
+// reject a path of MAX_PATH or more unless it has the `\\?\` prefix. The
+// prefix also turns off their normalization of `/`, `.` and `..`, so the path
+// is normalized first.
+fn long_path(path: &str) -> Vec<u16> {
+    let wide = to_wide(path);
+    let bytes = path.as_bytes();
+    if bytes.len() < MAX_PATH || !(bytes[0].is_ascii_alphabetic() && bytes[1] == b':') {
+        return wide;
+    }
+    // With too small a buffer, the result is the size needed, including the NUL.
+    let size = unsafe {
+        GetFullPathNameW(wide.as_ptr(), 0, core::ptr::null_mut(), core::ptr::null_mut())
+    };
+    if size == 0 {
+        return wide;
+    }
+    let mut full = vec![0u16; VERBATIM_PREFIX.len() + size as usize];
+    full[..VERBATIM_PREFIX.len()].copy_from_slice(&VERBATIM_PREFIX);
+    // With a large enough buffer, the result is the length, excluding the NUL.
+    let length = unsafe {
+        GetFullPathNameW(
+            wide.as_ptr(),
+            size,
+            full[VERBATIM_PREFIX.len()..].as_mut_ptr(),
+            core::ptr::null_mut(),
+        )
+    };
+    if length == 0 || length >= size {
+        return wide;
+    }
+    full.truncate(VERBATIM_PREFIX.len() + length as usize);
+    full.push(0);
+    full
+}
+
 // UTF-16 from Windows as UTF-8. None if it holds an unpaired surrogate, which
 // UTF-8 cannot represent.
 fn from_wide(wide: &[u16]) -> Option<String> {
@@ -200,7 +245,7 @@ pub fn exit(code: i32) -> ! {
 // Directory/file existence check by trying to open it (needs backup semantics for dirs).
 pub fn path_exists(path: &str) -> bool {
     const FILE_FLAG_BACKUP_SEMANTICS: DWORD = 0x02000000;
-    let path = to_wide(path);
+    let path = long_path(path);
     // Request no access and allow ordinary sharing: an existence probe
     // should not fail merely because another process has the path open.
     // https://learn.microsoft.com/windows/win32/api/fileapi/nf-fileapi-createfilew
@@ -565,8 +610,12 @@ fn append_arg(cmdline: &mut Vec<u16>, arg: impl Iterator<Item = u16> + Clone, fo
 // symlinks. None if `path` names no file.
 fn final_path(path: &str) -> Option<Vec<u16>> {
     const CAPACITY: DWORD = 4096;
-    const VERBATIM_PREFIX: [u16; 4] = [BACKSLASH, BACKSLASH, b'?' as u16, BACKSLASH];
-    let path = to_wide(path);
+    // Windows can start a program from a path of MAX_PATH or more only with
+    // the `\\?\` prefix. From 247 characters, it also fails to load DLLs with
+    // an embedded manifest, such as CPython's, from beside the program
+    // (STATUS_NAME_TOO_LONG) unless the program was started with the prefix.
+    const LONGEST_UNPREFIXED: usize = 246;
+    let path = long_path(path);
     let handle = unsafe {
         CreateFileW(
             path.as_ptr(),
@@ -594,7 +643,7 @@ fn final_path(path: &str) -> Option<Vec<u16>> {
     // so the program sees the path it would have been started by.
     let start = if wide.starts_with(&VERBATIM_PREFIX)
         && wide.get(VERBATIM_PREFIX.len() + 1) == Some(&u16::from(b':'))
-        && wide.len() - VERBATIM_PREFIX.len() < MAX_PATH
+        && wide.len() - VERBATIM_PREFIX.len() <= LONGEST_UNPREFIXED
     {
         VERBATIM_PREFIX.len()
     } else {
