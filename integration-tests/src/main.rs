@@ -1155,6 +1155,64 @@ fn test_symlinked_stub_finds_runfiles(config: &TestConfig) -> Result<(), String>
     Ok(())
 }
 
+/// Regression test: a program whose path is longer than MAX_PATH must start.
+/// Windows starts such a program only by its `\\?\` path, and the stub,
+/// which has no long-path manifest, can only open it by that path.
+fn test_long_program_path(config: &TestConfig) -> Result<(), String> {
+    println!("  Running test: long_program_path");
+
+    let test_dir = config.work_dir.join("test_long_program_path");
+    let program_dir = test_dir.join("d".repeat(120)).join("e".repeat(120));
+    fs::create_dir_all(&program_dir)
+        .map_err(|e| format!("Failed to create program dir: {}", e))?;
+    let program = program_dir.join(format!("print-env{}", EXE_EXT));
+    fs::copy(config.test_binaries_dir.join(format!("print-env{}", EXE_EXT)), &program)
+        .map_err(|e| format!("Failed to copy program: {}", e))?;
+
+    let stub_path = test_dir.join(format!("stub{}", EXE_EXT));
+    let manifest_path = test_dir.join(format!("stub{}.runfiles_manifest", EXE_EXT));
+    let rlocation = format!("{}/bin/print-env{}", WORKSPACE_NAME, EXE_EXT);
+    fs::write(&manifest_path, format!("{} {}\n", rlocation, program.display()))
+        .map_err(|e| format!("Failed to write manifest: {}", e))?;
+    finalize_stub(config, &stub_path, &[&rlocation], &[0])?;
+
+    let mut cmd = Command::new(&stub_path);
+    cmd.env_remove("RUNFILES_DIR");
+    cmd.env_remove("RUNFILES_MANIFEST_FILE");
+    cmd.env_remove("JAVA_RUNFILES");
+
+    let output = cmd.output().map_err(|e| format!("Failed to run stub: {}", e))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let exit_code = output.status.code().unwrap_or(-1);
+
+    if exit_code != 0 {
+        return Err(format!(
+            "Stub with a program at a long path failed with exit code {}.\nstdout: {}\nstderr: {}",
+            exit_code, stdout, stderr
+        ));
+    }
+
+    #[cfg(windows)]
+    {
+        // canonicalize gives the normalized path with the `\\?\` prefix.
+        let expected = fs::canonicalize(&program)
+            .map_err(|e| format!("Failed to resolve {}: {}", program.display(), e))?;
+        let expected = expected.to_string_lossy();
+        let reported = stdout.lines().find_map(|line| line.strip_prefix("EXE:"));
+        if reported != Some(&*expected) {
+            return Err(format!(
+                "Program was not started by its \\\\?\\ path.\nexpected: {}\nstdout: {}",
+                expected, stdout
+            ));
+        }
+    }
+
+    println!("    PASS");
+
+    Ok(())
+}
+
 /// Regression test: non-ASCII text must reach Windows as UTF-16, not as bytes
 /// widened or narrowed one at a time. Everything the stub converts is non-ASCII
 /// here: its own path, the manifest path (discovered and from the
@@ -1979,6 +2037,7 @@ fn main() -> ExitCode {
         ("fallback_runfiles_dir", test_fallback_runfiles_dir),
         ("symlinked_program_starts_target", test_symlinked_program_starts_target),
         ("symlinked_stub_finds_runfiles", test_symlinked_stub_finds_runfiles),
+        ("long_program_path", test_long_program_path),
         ("non_ascii_paths", test_non_ascii_paths),
         ("fallback_runfiles_manifest", test_fallback_runfiles_manifest),
         ("run_runfiles_discovery", test_run_runfiles_discovery),
