@@ -1,0 +1,111 @@
+diff --git a/toolchain/args/windows/msvc/BUILD.bazel b/toolchain/args/windows/msvc/BUILD.bazel
+index f71435d49..1f58d06ee 100644
+--- a/toolchain/args/windows/msvc/BUILD.bazel
++++ b/toolchain/args/windows/msvc/BUILD.bazel
+@@ -198,30 +198,49 @@ cc_args(
+         "@rules_cc//cc/toolchains/actions:link_actions",
+     ],
+     args = [
+-        "/clang:-Xlinker",
+-        "/clang:/vfsoverlay:{sdk_library_case_overlay}",
+         "/clang:-Xlinker",
+         "/clang:/LIBPATH:{winsdk_ucrt_lib}",
+         "/clang:-Xlinker",
+         "/clang:/LIBPATH:{winsdk_um_lib}",
+     ],
+     data = [
+-        "//runtimes/msvc:msvc_sdk_library_case_overlay",
+         "//runtimes/msvc:winsdk_ucrt_lib",
+         "//runtimes/msvc:winsdk_um_lib",
+     ],
+     format = {
+-        "sdk_library_case_overlay": "//runtimes/msvc:msvc_sdk_library_case_overlay",
+         "winsdk_ucrt_lib": "//runtimes/msvc:winsdk_ucrt_lib",
+         "winsdk_um_lib": "//runtimes/msvc:winsdk_um_lib",
+     },
+ )
+ 
++cc_args(
++    name = "sdk_library_case_overlay",
++    actions = ["@rules_cc//cc/toolchains/actions:link_actions"],
++    args = [
++        "/clang:-Xlinker",
++        "/clang:/vfsoverlay:{sdk_library_case_overlay}",
++    ],
++    data = ["//runtimes/msvc:msvc_sdk_library_case_overlay"],
++    format = {
++        "sdk_library_case_overlay": "//runtimes/msvc:msvc_sdk_library_case_overlay",
++    },
++)
++
++# Only case-sensitive execution hosts need these views. Windows toolchains
++# must not depend on the generator they would use to build their own overlays.
++cc_args_list(
++    name = "case_overlays",
++    args = ["sdk_header_case_overlay"] + select({
++        "//toolchain:runtimes_none": [],
++        "//conditions:default": ["sdk_library_case_overlay"],
++    }),
++    visibility = ["//visibility:public"],
++)
++
+ cc_args_list(
+     name = "normalized_sdk_compile_args",
+     args = [
+         "windows_sdk_compile_defines",
+-        "sdk_header_case_overlay",
+         "sdk_includes",
+     ],
+     visibility = ["//visibility:public"],
+diff --git a/toolchain/bootstrap/declare_toolchains.bzl b/toolchain/bootstrap/declare_toolchains.bzl
+index c23b5f49e..752d1b747 100644
+--- a/toolchain/bootstrap/declare_toolchains.bzl
++++ b/toolchain/bootstrap/declare_toolchains.bzl
+@@ -528,6 +528,7 @@ def declare_toolchains(*, execs = None, targets = SUPPORTED_TARGETS):
+         stage1_prefix = "stage1_" + exec_prefix
+         stage2_prefix = "stage2_" + exec_prefix
+         stage3_prefix = "stage3_" + exec_prefix
++        msvc_case_overlays = [] if exec_os == "windows" else ["@llvm//toolchain/args/windows/msvc:case_overlays"]
+ 
+         _declare_exec_platform(exec_os, exec_cpu)
+         declare_tool_map(
+@@ -577,11 +578,11 @@ def declare_toolchains(*, execs = None, targets = SUPPORTED_TARGETS):
+                     "@llvm//platforms/config:windows_x86_64_msvc": [
+                         "@llvm//toolchain/args/windows/msvc:normalized_default_libs_for_runtime",
+                         "@llvm//toolchain/args/windows/msvc:normalized_sdk_compile_args",
+-                    ],
++                    ] + msvc_case_overlays,
+                     "@llvm//platforms/config:windows_aarch64_msvc": [
+                         "@llvm//toolchain/args/windows/msvc:normalized_default_libs_for_runtime",
+                         "@llvm//toolchain/args/windows/msvc:normalized_sdk_compile_args",
+-                    ],
++                    ] + msvc_case_overlays,
+                     "//conditions:default": [],
+                 }),
+                 tool_map = select({
+diff --git a/toolchain/declare_toolchains.bzl b/toolchain/declare_toolchains.bzl
+index 636d845c2..a050a8d50 100644
+--- a/toolchain/declare_toolchains.bzl
++++ b/toolchain/declare_toolchains.bzl
+@@ -13,6 +13,7 @@ def declare_toolchains(*, execs = SUPPORTED_EXECS, targets = SUPPORTED_TARGETS):
+     """
+     for (exec_os, exec_cpu) in execs:
+         cc_toolchain_name = exec_os + "_" + exec_cpu + "_cc_toolchain"
++        msvc_case_overlays = [] if exec_os == "windows" else ["@llvm//toolchain/args/windows/msvc:case_overlays"]
+ 
+         # Bind the directory beside the tool map, before another rule's exec
+         # transition can select a different compiler installation.
+@@ -43,11 +44,11 @@ def declare_toolchains(*, execs = SUPPORTED_EXECS, targets = SUPPORTED_TARGETS):
+                 "@llvm//platforms/config:windows_x86_64_msvc": [
+                     "@llvm//toolchain/args/windows/msvc:normalized_default_libs_for_runtime",
+                     "@llvm//toolchain/args/windows/msvc:normalized_sdk_compile_args",
+-                ],
++                ] + msvc_case_overlays,
+                 "@llvm//platforms/config:windows_aarch64_msvc": [
+                     "@llvm//toolchain/args/windows/msvc:normalized_default_libs_for_runtime",
+                     "@llvm//toolchain/args/windows/msvc:normalized_sdk_compile_args",
+-                ],
++                ] + msvc_case_overlays,
+                 "//conditions:default": [],
+             }),
+         )
