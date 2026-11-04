@@ -99,6 +99,12 @@ rust_binary(
     edition = "2021",
 )
 
+rust_binary(
+    name = "spawn-child",
+    srcs = ["src/bin/spawn_child.rs"],
+    edition = "2021",
+)
+
 copy_to_directory(
     name = "test-binaries",
     srcs = [
@@ -107,6 +113,7 @@ copy_to_directory(
         ":merge-json",
         ":orchestrator",
         ":print-env",
+        ":spawn-child",
     ],
 )
 

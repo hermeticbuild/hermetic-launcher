@@ -351,6 +351,92 @@ fn run_stub(
 }
 
 /// Test: Basic hash-file invocation
+#[cfg(windows)]
+mod job {
+    use std::ffi::c_void;
+
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const WAIT_TIMEOUT: u32 = 0x102;
+
+    extern "system" {
+        pub fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+        pub fn WaitForSingleObject(handle: *mut c_void, millis: u32) -> u32;
+        pub fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+
+    /// Wait up to `millis` for the process to exit. A process that cannot be
+    /// opened is already gone.
+    pub fn exited_within(pid: u32, millis: u32) -> bool {
+        unsafe {
+            let handle = OpenProcess(SYNCHRONIZE, 0, pid);
+            if handle.is_null() {
+                return true;
+            }
+            let exited = WaitForSingleObject(handle, millis) != WAIT_TIMEOUT;
+            CloseHandle(handle);
+            exited
+        }
+    }
+}
+
+/// Killing the stub must also kill the process it started.
+#[cfg(windows)]
+fn test_kill_stub_kills_child(config: &TestConfig) -> Result<(), String> {
+    println!("  Running test: kill_stub_kills_child");
+
+    let test_dir = config.work_dir.join("test_kill_stub");
+    fs::create_dir_all(&test_dir).map_err(|e| format!("Failed to create test dir: {}", e))?;
+
+    let mut runfiles = RunfilesSetup::new(&test_dir, "kill_stub")
+        .map_err(|e| format!("Failed to create runfiles: {}", e))?;
+    let binary = config.test_binaries_dir.join(format!("spawn-child{}", EXE_EXT));
+    runfiles
+        .add_file(&format!("{}/bin/spawn-child{}", WORKSPACE_NAME, EXE_EXT), &binary)
+        .map_err(|e| format!("Failed to add spawn-child: {}", e))?;
+    runfiles.write_manifest().map_err(|e| format!("Failed to write manifest: {}", e))?;
+
+    let pid_file = test_dir.join("child.pid");
+    let _ = fs::remove_file(&pid_file);
+    let stub_path = test_dir.join(format!("kill_stub{}", EXE_EXT));
+    let rlocation_path = format!("{}/bin/spawn-child{}", WORKSPACE_NAME, EXE_EXT);
+    let pid_file_arg = pid_file.to_string_lossy().to_string();
+    finalize_stub(config, &stub_path, &[&rlocation_path, &pid_file_arg], &[0])?;
+
+    let mut stub = Command::new(&stub_path)
+        .env("RUNFILES_MANIFEST_FILE", &runfiles.manifest_path)
+        .env_remove("RUNFILES_DIR")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to start stub: {}", e))?;
+
+    let mut child_pid = None;
+    for _ in 0..100 {
+        if let Some(pid) = fs::read_to_string(&pid_file).ok().and_then(|s| s.trim().parse::<u32>().ok()) {
+            child_pid = Some(pid);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let Some(child_pid) = child_pid else {
+        let _ = stub.kill();
+        return Err("Payload did not write its child pid".to_string());
+    };
+
+    if job::exited_within(child_pid, 0) {
+        let _ = stub.kill();
+        return Err("Child exited before the stub was killed".to_string());
+    }
+    stub.kill().map_err(|e| format!("Failed to kill stub: {}", e))?;
+    let _ = stub.wait();
+
+    if !job::exited_within(child_pid, 10_000) {
+        return Err(format!("Child {} still running after the stub was killed", child_pid));
+    }
+    Ok(())
+}
+
 fn test_hash_file(config: &TestConfig) -> Result<(), String> {
     println!("  Running test: hash_file");
 
@@ -2026,7 +2112,8 @@ fn main() -> ExitCode {
     println!("  Work dir:      {}", config.work_dir.display());
     println!();
 
-    let tests: Vec<(&str, fn(&TestConfig) -> Result<(), String>)> = vec![
+    #[allow(unused_mut)]
+    let mut tests: Vec<(&str, fn(&TestConfig) -> Result<(), String>)> = vec![
         ("hash_file", test_hash_file),
         ("add_numbers_runtime_args", test_add_numbers_runtime_args),
         ("runfiles_source_precedence", test_runfiles_source_precedence),
@@ -2058,6 +2145,9 @@ fn main() -> ExitCode {
         ("print_env", test_print_env),
         ("large_manifest", test_large_manifest),
     ];
+
+    #[cfg(windows)]
+    tests.push(("kill_stub_kills_child", test_kill_stub_kills_child));
 
     let mut passed = 0;
     let mut failed = 0;

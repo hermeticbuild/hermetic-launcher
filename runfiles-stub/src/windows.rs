@@ -25,6 +25,9 @@ const OPEN_EXISTING: DWORD = 3;
 const FILE_ATTRIBUTE_NORMAL: DWORD = 0x80;
 const INFINITE: DWORD = 0xFFFFFFFF;
 const CREATE_UNICODE_ENVIRONMENT: DWORD = 0x00000400;
+const CREATE_SUSPENDED: DWORD = 0x00000004;
+const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: DWORD = 0x00002000;
+const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: i32 = 9;
 const MAX_PATH: usize = 260;
 
 // File sharing and memory-mapping parameters (for the runfiles manifest)
@@ -68,6 +71,25 @@ struct PROCESS_INFORMATION {
     dwThreadId: DWORD,
 }
 
+// JOBOBJECT_EXTENDED_LIMIT_INFORMATION, laid out for SetInformationJobObject.
+#[repr(C)]
+struct JobObjectExtendedLimitInformation {
+    per_process_user_time_limit: i64,
+    per_job_user_time_limit: i64,
+    limit_flags: DWORD,
+    minimum_working_set_size: usize,
+    maximum_working_set_size: usize,
+    active_process_limit: DWORD,
+    affinity: usize,
+    priority_class: DWORD,
+    scheduling_class: DWORD,
+    io_counters: [u64; 6],
+    process_memory_limit: usize,
+    job_memory_limit: usize,
+    peak_process_memory_used: usize,
+    peak_job_memory_used: usize,
+}
+
 // External Windows API functions (kernel32.dll)
 extern "system" {
     fn ExitProcess(exit_code: u32) -> !;
@@ -109,6 +131,15 @@ extern "system" {
         lpStartupInfo: *mut STARTUPINFOW,
         lpProcessInformation: *mut PROCESS_INFORMATION,
     ) -> BOOL;
+    fn CreateJobObjectW(lpJobAttributes: LPVOID, lpName: *const u16) -> HANDLE;
+    fn SetInformationJobObject(
+        hJob: HANDLE,
+        JobObjectInformationClass: i32,
+        lpJobObjectInformation: LPVOID,
+        cbJobObjectInformationLength: DWORD,
+    ) -> BOOL;
+    fn AssignProcessToJobObject(hJob: HANDLE, hProcess: HANDLE) -> BOOL;
+    fn ResumeThread(hThread: HANDLE) -> DWORD;
     fn GetCommandLineW() -> *const u16;
     fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: DWORD) -> DWORD;
     fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *mut DWORD) -> BOOL;
@@ -713,7 +744,8 @@ pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
     } else {
         core::ptr::null_mut()
     };
-    let creation_flags = if launch.export_env { CREATE_UNICODE_ENVIRONMENT } else { 0 };
+    let creation_flags =
+        CREATE_SUSPENDED | if launch.export_env { CREATE_UNICODE_ENVIRONMENT } else { 0 };
 
     let mut si: STARTUPINFOW = unsafe { core::mem::zeroed() };
     si.cb = core::mem::size_of::<STARTUPINFOW>() as DWORD;
@@ -742,14 +774,48 @@ pub fn launch(launch: &Launch, rt: &RuntimeArgs) -> ! {
         exit(1);
     }
 
+    // Kill the child if this stub dies before it does. Best effort: without a
+    // job (creation or assignment failed) the child runs as it always did.
+    let job = unsafe { create_kill_on_close_job(pi.hProcess) };
     unsafe {
+        ResumeThread(pi.hThread);
         WaitForSingleObject(pi.hProcess, INFINITE);
         let mut exit_code: DWORD = 0;
         GetExitCodeProcess(pi.hProcess, &mut exit_code);
+        // A normal exit must not kill background processes the child left behind.
+        if !job.is_null() {
+            set_job_limit_flags(job, 0);
+        }
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
         ExitProcess(exit_code)
     }
+}
+
+unsafe fn set_job_limit_flags(job: HANDLE, flags: DWORD) -> bool {
+    let mut info: JobObjectExtendedLimitInformation = core::mem::zeroed();
+    info.limit_flags = flags;
+    SetInformationJobObject(
+        job,
+        JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+        &mut info as *mut _ as LPVOID,
+        core::mem::size_of::<JobObjectExtendedLimitInformation>() as DWORD,
+    ) != 0
+}
+
+// Returns a job handle holding `process`, or null when that is not possible.
+unsafe fn create_kill_on_close_job(process: HANDLE) -> HANDLE {
+    let job = CreateJobObjectW(core::ptr::null_mut(), core::ptr::null());
+    if job.is_null() {
+        return core::ptr::null_mut();
+    }
+    if !set_job_limit_flags(job, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+        || AssignProcessToJobObject(job, process) == 0
+    {
+        CloseHandle(job);
+        return core::ptr::null_mut();
+    }
+    job
 }
 
 #[no_mangle]
