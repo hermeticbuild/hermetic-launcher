@@ -209,8 +209,8 @@ re-signed automatically by the finalizer.
 ### Supported platforms
 
 Templates and finalizers are released for all seven targets above. Bazel toolchains are
-auto-registered for **Linux x86_64/aarch64, macOS x86_64/aarch64, and Windows x86_64**;
-the **s390x** and **Windows/aarch64** binaries ship in releases for standalone use.
+auto-registered for **Linux x86_64/aarch64, macOS x86_64/aarch64, and Windows x86_64/aarch64**;
+the **s390x** binaries ship in releases for standalone use.
 
 ---
 
