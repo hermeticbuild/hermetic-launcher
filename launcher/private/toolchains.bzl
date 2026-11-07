@@ -22,14 +22,14 @@ _executable_file = rule(
     attrs = {"src": attr.label(mandatory = True)},
 )
 
-# The platforms toolchains are registered for. Windows/aarch64 ships for
-# standalone use but has no auto-registered Bazel toolchain (see README
-# "Supported platforms").
+# The platforms toolchains are registered for. A platform missing from the
+# templates or finalizers dict of a stub source is skipped for that source.
 #
 # (name, cpu, os)
 PLATFORMS = [
     ("aarch64_linux", "aarch64", "linux"),
     ("aarch64_macos", "aarch64", "macos"),
+    ("aarch64_windows", "aarch64", "windows"),
     ("s390x_linux", "s390x", "linux"),
     ("x86_64_linux", "x86_64", "linux"),
     ("x86_64_macos", "x86_64", "macos"),
@@ -45,9 +45,9 @@ def launcher_stub_toolchains(name, *, templates, finalizers):
             `//launcher/private:stub_source_<name>` config_setting via
             `target_settings`, so exactly one source's toolchains resolve for a
             given value of the `//launcher/private:stub_source` flag.
-        templates: dict mapping each platform name in `PLATFORMS` to the template
+        templates: dict mapping platform names in `PLATFORMS` to the template
             (runfiles-stub) label for that platform.
-        finalizers: dict mapping each platform name in `PLATFORMS` to the finalizer
+        finalizers: dict mapping platform names in `PLATFORMS` to the finalizer
             (finalize-stub) label for that platform.
     """
     if name not in ("prebuilt", "source_built"):
@@ -56,6 +56,9 @@ def launcher_stub_toolchains(name, *, templates, finalizers):
     target_settings = ["//launcher/private:stub_source_" + name]
 
     for (platform, cpu, os) in PLATFORMS:
+        if platform not in templates or platform not in finalizers:
+            continue
+
         constraints = [
             "@platforms//cpu:" + cpu,
             "@platforms//os:" + os,
