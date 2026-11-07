@@ -28,6 +28,10 @@ path = "src/bin/orchestrator.rs"
 name = "print-env"
 path = "src/bin/print_env.rs"
 
+[[bin]]
+name = "spawn-child"
+path = "src/bin/spawn_child.rs"
+
 [dependencies]
 sha2 = "0.10"
 serde_json = "1.0"
