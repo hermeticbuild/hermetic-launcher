@@ -93,13 +93,19 @@ pub fn main(rt: platform::RuntimeArgs) -> ! {
     // Decide whether runfiles are needed at all.
     let argc_mask = if argc >= 32 { 0xFFFFFFFF } else { (1u32 << argc) - 1 };
     let needs_transform = (transform_flags & argc_mask) != 0;
-    let needs_runfiles = needs_transform || export_runfiles_env;
+    let required = placeholders::required_runfile();
+    let needs_runfiles = needs_transform || export_runfiles_env || required.is_some();
 
     let runfiles = if needs_runfiles {
-        match Runfiles::create(&rt) {
+        match Runfiles::create(&rt, required) {
             Some(rf) => Some(rf),
             None => {
-                eline(b"ERROR: Failed to initialize runfiles");
+                if let Some(key) = required {
+                    platform::print(b"ERROR: No runfiles source contains ");
+                    eline(key.as_bytes());
+                } else {
+                    eline(b"ERROR: Failed to initialize runfiles");
+                }
                 eline(b"Set RUNFILES_DIR or RUNFILES_MANIFEST_FILE, or ensure <executable>.runfiles/ directory exists");
                 platform::exit(1);
             }

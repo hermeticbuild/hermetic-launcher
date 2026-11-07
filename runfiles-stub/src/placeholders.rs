@@ -23,6 +23,15 @@ macro_rules! define_placeholders {
         #[link_section = $section]
         static mut EXPORT_RUNFILES_ENV: [u8; 32] = *b"@@RUNFILES_EXPORT_ENV@@\0\0\0\0\0\0\0\0\0";
 
+        #[used]
+        #[link_section = $section]
+        static mut REQUIRED_RUNFILE: [u8; ARG_SIZE] = {
+            let marker = b"@@RUNFILES_REQUIRED@@";
+            let mut field = [0; ARG_SIZE];
+            field.split_at_mut(marker.len()).0.copy_from_slice(marker);
+            field
+        };
+
         // The ten argument placeholders as one contiguous 2D array rather than ten
         // separate statics. `arg()` indexes it with pointer arithmetic, which lowers
         // to a single PC-relative `adrp+add`; ten distinct statics made the compiler
@@ -62,6 +71,14 @@ pub fn transform_flags() -> &'static [u8] {
 }
 pub fn export_runfiles_env() -> &'static [u8] {
     read(core::ptr::addr_of!(EXPORT_RUNFILES_ENV) as *const u8, 32)
+}
+
+pub fn required_runfile() -> Option<&'static str> {
+    let field = read(core::ptr::addr_of!(REQUIRED_RUNFILE) as *const u8, ARG_SIZE);
+    if is_template_placeholder(field) {
+        return None;
+    }
+    core::str::from_utf8(&field[..crate::common::cstr_len(field)]).ok()
 }
 
 pub fn arg(i: usize) -> &'static [u8] {

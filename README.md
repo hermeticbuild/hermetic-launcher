@@ -156,6 +156,7 @@ finalize-stub --template <PATH> [OPTIONS] -- <arg0> [arg1 ...]
 -o, --output <PATH>              Output path (default: stdout; chmod +x on Unix)
     --transform <N>              Mark embedded arg N (0–9) for runfiles resolution.
                                  Repeatable or comma-separated. Default: none.
+    --required-runfile <PATH>    Choose a source where this runfiles-relative path exists.
     --export-runfiles-env <B>    Export RUNFILES_DIR/RUNFILES_MANIFEST_FILE/JAVA_RUNFILES
                                  to the child (default: true)
 -v, --verbose                    Verbose output

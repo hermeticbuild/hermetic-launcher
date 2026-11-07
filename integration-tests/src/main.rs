@@ -459,6 +459,79 @@ fn test_add_numbers_runtime_args(config: &TestConfig) -> Result<(), String> {
     Ok(())
 }
 
+fn test_required_runfile(config: &TestConfig) -> Result<(), String> {
+    println!("  Running test: required_runfile");
+    let root = config.work_dir.join("test_required_runfile");
+    let name = format!("child{}", EXE_EXT);
+    let stub = root.join(&name);
+    let program = format!("{}/bin/tool{}", WORKSPACE_NAME, EXE_EXT);
+    let bootstrap = format!("{}/child/bootstrap", WORKSPACE_NAME);
+    let binary = config.test_binaries_dir.join(format!("print-env{}", EXE_EXT));
+    let mut child = RunfilesSetup::new(&root, &name).map_err(|e| e.to_string())?;
+    // Windows reads <executable>.manifest as XML before starting the program.
+    child.manifest_path = root.join("program-only.runfiles_manifest");
+    let mut parent = RunfilesSetup::new(&root, "parent").map_err(|e| e.to_string())?;
+    for files in [&mut child, &mut parent] {
+        files.add_file(&program, &binary).map_err(|e| e.to_string())?;
+        files.write_manifest().map_err(|e| e.to_string())?;
+        files.add_file_content(&bootstrap, b"bootstrap").map_err(|e| e.to_string())?;
+    }
+    // Only the parent's manifest lists the bootstrap. The other manifest
+    // remains a valid source for the program alone.
+    parent.write_manifest().map_err(|e| e.to_string())?;
+    let output = Command::new(&config.finalizer_path)
+        .arg("--template").arg(&config.template_path)
+        .arg("--output").arg(&stub)
+        .args(["--required-runfile", &bootstrap, "--transform", "0,1", "--", &program, &bootstrap])
+        .output().map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(format!("Finalizing the child failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+
+    // The child has its own complete tree. A parent can supply either kind
+    // of source, and even a manifest entry can point to a missing file.
+    let parent_bootstrap = parent.runfiles_dir.join(&bootstrap);
+    fs::remove_file(&parent_bootstrap).map_err(|e| e.to_string())?;
+    for parent_has_bootstrap in [false, true] {
+        if parent_has_bootstrap {
+            fs::write(&parent_bootstrap, b"parent bootstrap").map_err(|e| e.to_string())?;
+        }
+        // Offer both inherited sources. A complete one must win even when the
+        // platform normally prefers the incomplete one.
+        for (dir, manifest, var, path) in [
+            (&parent.runfiles_dir, &child.manifest_path, "RUNFILES_DIR", &parent.runfiles_dir),
+            (&root, &parent.manifest_path, "RUNFILES_MANIFEST_FILE", &parent.manifest_path),
+        ] {
+            let output = Command::new(&stub)
+                .env("RUNFILES_DIR", dir).env("RUNFILES_MANIFEST_FILE", manifest)
+                .output().map_err(|e| e.to_string())?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let (export, owner, arg) = if parent_has_bootstrap {
+                (var, path, &parent_bootstrap)
+            } else {
+                ("RUNFILES_DIR", &child.runfiles_dir, &child.entries[&bootstrap])
+            };
+            let reported_arg = stdout.lines().find_map(|s| s.strip_prefix("ARGS:"))
+                .and_then(|args| args.split('|').nth(1)).map(Path::new);
+            let reported_owner = environment_path(&stdout, export);
+            if !output.status.success() || reported_arg != Some(arg.as_path())
+                || reported_owner != Some(owner.as_path())
+            {
+                return Err(format!("Expected {export}={} and argument {}, got {reported_owner:?} and {reported_arg:?}\n{}",
+                    owner.display(), arg.display(), String::from_utf8_lossy(&output.stderr)));
+            }
+        }
+    }
+    fs::remove_file(&child.entries[&bootstrap]).map_err(|e| e.to_string())?;
+    let output = Command::new(&stub)
+        .env_remove("RUNFILES_DIR").env_remove("RUNFILES_MANIFEST_FILE")
+        .output().map_err(|e| e.to_string())?;
+    if output.status.success() || !String::from_utf8_lossy(&output.stdout).contains(bootstrap.as_str()) {
+        return Err(format!("Expected an error naming the missing runfile {bootstrap}"));
+    }
+    Ok(())
+}
+
 /// Test: runfiles source selection respects provenance, then prefers directories.
 fn test_runfiles_source_precedence(config: &TestConfig) -> Result<(), String> {
     println!("  Running test: runfiles_source_precedence");
@@ -2030,6 +2103,7 @@ fn main() -> ExitCode {
         ("hash_file", test_hash_file),
         ("add_numbers_runtime_args", test_add_numbers_runtime_args),
         ("runfiles_source_precedence", test_runfiles_source_precedence),
+        ("required_runfile", test_required_runfile),
         ("merge_json", test_merge_json),
         ("orchestrator_env_propagation", test_orchestrator_env_propagation),
         ("mixed_arguments", test_mixed_arguments),

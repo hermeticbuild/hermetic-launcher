@@ -33,11 +33,12 @@ pub enum LogicalDir {
 }
 
 impl Runfiles {
-    pub fn create(rt: &platform::RuntimeArgs) -> Option<Self> {
+    pub fn create(rt: &platform::RuntimeArgs, required: Option<&str>) -> Option<Self> {
         // Environment-provided sources take precedence over sources discovered
         // next to the executable. Within a tier, `select_source` applies the
         // platform's directory-vs-manifest preference.
         if let Some(rf) = select_source(
+            required,
             || {
                 platform::get_env_var("RUNFILES_DIR")
                     .filter(|path| !path.is_empty() && dir_exists(path))
@@ -73,6 +74,7 @@ impl Runfiles {
                 let manifest_path = String::from(exe_str) + ".runfiles_manifest";
 
                 if let Some(rf) = select_source(
+                    required,
                     || {
                         dir_exists(&runfiles_dir).then(|| Self::Directory {
                             path: runfiles_dir.clone(),
@@ -161,16 +163,24 @@ impl Runfiles {
 
 /// Choose between a directory and a manifest source at equal precedence.
 ///
-/// Both are evaluated lazily — we never probe a directory or open a manifest we
-/// do not end up selecting. The directory is preferred where the platform
+/// Stop at the first source that supplies the required file.
+/// The directory is preferred where the platform
 /// materializes the runfiles tree; on Windows the tree is not materialized by
 /// default, so the sibling directory is sparse and the manifest must win
 /// (otherwise `rlocation`s resolve to files that do not exist). See
 /// `platform::PREFER_DIRECTORY_SOURCE`.
 fn select_source(
+    required: Option<&str>,
     directory: impl FnOnce() -> Option<Runfiles>,
     manifest: impl FnOnce() -> Option<Runfiles>,
 ) -> Option<Runfiles> {
+    let contains_required = |rf: &Runfiles| {
+        required.is_none_or(|key| {
+            rf.rlocation(key).is_some_and(|path| platform::path_exists(&path))
+        })
+    };
+    let directory = || directory().filter(&contains_required);
+    let manifest = || manifest().filter(&contains_required);
     if platform::PREFER_DIRECTORY_SOURCE {
         directory().or_else(manifest)
     } else {

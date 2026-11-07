@@ -39,6 +39,10 @@ struct Cli {
     #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
     export_runfiles_env: bool,
 
+    /// Runfiles-relative path that must exist in the chosen directory or manifest
+    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    required_runfile: Option<String>,
+
     /// Enable verbose output
     #[arg(short, long)]
     verbose: bool,
@@ -92,7 +96,15 @@ fn replace_at(data: &mut [u8], offset: usize, new_value: &[u8], fixed_size: usiz
     Ok(())
 }
 
-fn finalize_stub(template_path: &str, output_path: Option<&str>, argv: &[String], transform_flags: u32, export_runfiles_env: bool, verbose: bool) -> Result<(), String> {
+fn finalize_stub(
+    template_path: &str,
+    output_path: Option<&str>,
+    argv: &[String],
+    transform_flags: u32,
+    export_runfiles_env: bool,
+    required_runfile: Option<&str>,
+    verbose: bool,
+) -> Result<(), String> {
     if argv.is_empty() {
         return Err("At least one argument (argv[0]) is required".to_string());
     }
@@ -161,6 +173,12 @@ fn finalize_stub(template_path: &str, output_path: Option<&str>, argv: &[String]
         let arg_pos = find_nth_pattern(&data, arg_pattern, i)
             .ok_or(format!("ARG{} placeholder not found in template", i))?;
         arg_positions.push(arg_pos);
+    }
+
+    if let Some(key) = required_runfile {
+        let offset = find_pattern(&data, b"@@RUNFILES_REQUIRED@@")
+            .ok_or("Template does not support --required-runfile")?;
+        replace_at(&mut data, offset, key.as_bytes(), ARG_SIZE)?;
     }
 
     // Now do the replacements
@@ -288,7 +306,15 @@ fn main() {
         flags
     };
 
-    match finalize_stub(&cli.template, cli.output.as_deref(), &cli.args, transform_flags, cli.export_runfiles_env, cli.verbose) {
+    match finalize_stub(
+        &cli.template,
+        cli.output.as_deref(),
+        &cli.args,
+        transform_flags,
+        cli.export_runfiles_env,
+        cli.required_runfile.as_deref(),
+        cli.verbose,
+    ) {
         Ok(()) => {
             if cli.verbose {
                 if let Some(output) = cli.output {
